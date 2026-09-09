@@ -759,6 +759,7 @@ if (validSessionId && socketPath) {
     }
 
     async function refreshForegroundAuthority() {
+        const generation = conversationGeneration;
         const observedAt = Date.now();
         let timeout = null;
         let shouldActivate = false;
@@ -774,10 +775,17 @@ if (validSessionId && socketPath) {
                 session.connection.sendRequest("session.getForeground", {}),
                 timeoutPromise,
             ]);
-            if (typeof response?.sessionId !== "string") return;
+            if (generation !== conversationGeneration) {
+                return;
+            }
             const wasActive = foregroundSessionActive;
-            foregroundSessionActive = response.sessionId === copilotSessionId;
-            foregroundObservationStartedAt = observedAt;
+            foregroundSessionActive = response?.sessionId === copilotSessionId;
+            // Confirming polls are not new foreground transitions. A stale
+            // connection must not outbid the conversation that replaced it
+            // every time its heartbeat runs.
+            if (foregroundSessionActive && !wasActive) {
+                foregroundObservationStartedAt = observedAt;
+            }
             shouldActivate = foregroundHandlingReady
                 && foregroundSessionActive
                 && (!wasActive || !isRecordedOwner());
@@ -786,6 +794,9 @@ if (validSessionId && socketPath) {
             // owner election remains authoritative in that compatibility mode.
         } finally {
             if (timeout) clearTimeout(timeout);
+            if (generation !== conversationGeneration) {
+                refreshForegroundAuthoritySoon();
+            }
         }
         if (shouldActivate) activateForegroundSharedFiles();
     }
@@ -2844,6 +2855,8 @@ if (validSessionId && socketPath) {
     // re-registering interest when the conversation rotates.
     function resetConversationState(transitionAt) {
         conversationEpoch = `${trackerInstanceId}:${conversationGeneration}`;
+        foregroundSessionActive = false;
+        foregroundObservationStartedAt = 0;
         operationReceipts.clear();
         activeOperationKeys.clear();
         activeSubagents.clear();
