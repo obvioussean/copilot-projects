@@ -88,7 +88,7 @@ final class BackgroundHookTests: XCTestCase {
         }
     }
 
-    func testChildToolHooksDoNotChangeForegroundStateOrClocks() throws {
+    func testChildActivityHooksDoNotChangeForegroundStateOrClocks() throws {
         let fixture = try Fixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         for status in ["idle", "running", "waiting"] {
@@ -101,10 +101,13 @@ final class BackgroundHookTests: XCTestCase {
             try Data(status.utf8).write(to: fixture.file("status"))
             let before = try fixture.markerContents()
             let calls = try Data(contentsOf: fixture.capture)
-            for action in ["pre", "post"] {
+            for action in ["running", "pre", "post"] {
+                let fields = action == "running"
+                    ? #","prompt":"background child task""#
+                    : #","toolCalls":[{"name":"read_bash","result":null}]"#
                 for timestamp in ["", ",\"timestamp\":200"] {
                     try fixture.run(action, payload:
-                        #"{"sessionId":"\#(fixture.childId)"\#(timestamp),"toolCalls":[{"name":"read_bash","result":null}]}"#)
+                        #"{"sessionId":"\#(fixture.childId)"\#(timestamp)\#(fields)}"#)
                     XCTAssertEqual(try fixture.markerContents(), before, "\(status), \(action)")
                     XCTAssertEqual(try Data(contentsOf: fixture.capture), calls)
                 }
@@ -112,11 +115,13 @@ final class BackgroundHookTests: XCTestCase {
         }
     }
 
-    func testChildToolHooksCannotInvalidateBackgroundPromptEvidence() throws {
+    func testChildActivityHooksCannotInvalidateBackgroundPromptEvidence() throws {
         let fixture = try Fixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         try fixture.run("running", payload:
             #"{"sessionId":"\#(fixture.ownerId)","timestamp":100}"#)
+        try fixture.run("running", payload:
+            #"{"sessionId":"\#(fixture.childId)","timestamp":300,"prompt":"background child task"}"#)
         try fixture.run("pre", payload:
             #"{"sessionId":"\#(fixture.childId)","timestamp":300}"#)
         let record = try JSONDecoder().decode(
@@ -159,17 +164,42 @@ final class BackgroundHookTests: XCTestCase {
             clockMs: foregroundRecord.promptStatusTimestamp))
     }
 
-    func testOwnerToolHooksStillAdvanceForegroundClock() throws {
+    func testChildPromptDoesNotBlockAnIdleForeground() throws {
         let fixture = try Fixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
-        for action in ["pre", "post"] {
+        try fixture.run("running", payload:
+            #"{"sessionId":"\#(fixture.ownerId)","timestamp":100}"#)
+        try fixture.run("idle", payload:
+            #"{"sessionId":"\#(fixture.ownerId)","timestamp":200}"#)
+        let before = try fixture.markerContents()
+        let calls = try Data(contentsOf: fixture.capture)
+
+        try fixture.run("running", payload:
+            #"{"sessionId":"\#(fixture.childId)","timestamp":300,"prompt":"background child task"}"#)
+
+        XCTAssertEqual(try fixture.markerContents(), before)
+        XCTAssertEqual(try Data(contentsOf: fixture.capture), calls)
+        let record = try JSONDecoder().decode(
+            SessionStatusRecord.self,
+            from: Data(contentsOf: fixture.file("status-record.json")))
+        XCTAssertEqual(record.status, .idle)
+        XCTAssertEqual(record.promptStatusTimestamp, 200)
+        XCTAssertEqual(AppModel.remotePromptEligibility(
+            status: record.status, hasLiveAgent: true, footerActivity: .idle), .sent)
+    }
+
+    func testOwnerActivityHooksStillAdvanceForegroundClock() throws {
+        let fixture = try Fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        for (index, action) in ["running", "pre", "post"].enumerated() {
+            let timestamp = Int64(300 + index)
             try fixture.run(action, payload:
-                #"{"sessionId":"\#(fixture.ownerId.uppercased())","timestamp":300,"toolCalls":[{"result":null}]}"#)
+                #"{"sessionId":"\#(fixture.ownerId.uppercased())","timestamp":\#(timestamp),"prompt":"foreground prompt","toolCalls":[{"result":null}]}"#)
             let record = try JSONDecoder().decode(
                 SessionStatusRecord.self,
                 from: Data(contentsOf: fixture.file("status-record.json")))
             XCTAssertEqual(record.status, .running)
-            XCTAssertEqual(record.promptStatusTimestamp, 300)
+            XCTAssertEqual(record.promptStatusTimestamp, timestamp)
         }
         try Data("idle".utf8).write(to: fixture.file("status"))
         try fixture.run("pre", payload:
@@ -180,7 +210,32 @@ final class BackgroundHookTests: XCTestCase {
             "set-status running --session \(fixture.tabId)")
     }
 
-    func testChildToolHooksLeaveScheduledAndCompletionMarkersUntouched() throws {
+    func testOwnerScheduledPromptStillUsesBackgroundStatus() throws {
+        let fixture = try Fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try fixture.run("running", payload:
+            #"{"sessionId":"\#(fixture.ownerId)","timestamp":100,"prompt":"[Scheduled prompt #2] check"}"#)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: fixture.file("scheduled-turn").path))
+        XCTAssertEqual(
+            try String(contentsOf: fixture.capture).split(separator: "\n").last,
+            "set-status idle --session \(fixture.tabId) --timestamp 100 --source scheduled-start")
+        for (index, action) in ["pre", "post"].enumerated() {
+            let timestamp = Int64(200 + index)
+            try fixture.run(action, payload:
+                #"{"sessionId":"\#(fixture.ownerId)","timestamp":\#(timestamp)}"#)
+            let record = try JSONDecoder().decode(
+                SessionStatusRecord.self,
+                from: Data(contentsOf: fixture.file("status-record.json")))
+            XCTAssertEqual(record.status, .idle)
+            XCTAssertEqual(record.statusTimestamp, timestamp)
+            XCTAssertEqual(record.promptStatusTimestamp, 100)
+            XCTAssertFalse(FileManager.default.fileExists(
+                atPath: fixture.file("active-turn").path))
+        }
+    }
+
+    func testChildActivityHooksLeaveScheduledAndCompletionMarkersUntouched() throws {
         let fixture = try Fixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         for suffix in ["scheduled-turn", "background-agents", "session-idle-hook",
@@ -188,6 +243,11 @@ final class BackgroundHookTests: XCTestCase {
             try Data("preserve".utf8).write(to: fixture.file(suffix))
         }
         let before = try fixture.markerContents()
+        for prompt in ["background child task", "[Scheduled prompt #1] background child task"] {
+            try fixture.run("running", payload:
+                #"{"sessionId":"\#(fixture.childId)","timestamp":500,"prompt":"\#(prompt)"}"#)
+            XCTAssertEqual(try fixture.markerContents(), before)
+        }
         for action in ["pre", "post"] {
             try fixture.run(action, payload:
                 #"{"sessionId":"\#(fixture.childId)","timestamp":500}"#)
@@ -220,37 +280,43 @@ final class BackgroundHookTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: fixture.file("status")), "idle")
     }
 
-    func testMissingOrInvalidIdentityKeepsLegacyToolStatus() throws {
+    func testMissingOrInvalidIdentityKeepsLegacyActivityStatus() throws {
         let fixture = try Fixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
-        let payloads = [
-            #"{"timestamp":301}"#,
-            #"{"sessionId":"invalid","timestamp":302}"#,
-            #"{"timestamp":303,"toolArgs":{"sessionId":"\#(fixture.childId)"}}"#,
-            #"{"toolArgs":{"sessionId":"\#(fixture.childId)"},"sessionId":"\#(fixture.ownerId)","timestamp":304}"#,
+        let identities = [
+            "",
+            #","sessionId":"invalid""#,
+            #","toolArgs":{"sessionId":"\#(fixture.childId)"}"#,
+            #","toolArgs":{"sessionId":"\#(fixture.childId)"},"sessionId":"\#(fixture.ownerId)""#,
         ]
-        for (index, payload) in payloads.enumerated() {
-            try fixture.run("pre", payload: payload)
-            let record = try JSONDecoder().decode(
-                SessionStatusRecord.self,
-                from: Data(contentsOf: fixture.file("status-record.json")))
-            XCTAssertEqual(record.status, .running)
-            XCTAssertEqual(record.promptStatusTimestamp, Int64(301 + index))
+        var timestamp: Int64 = 300
+        for identity in identities {
+            for action in ["running", "pre", "post"] {
+                timestamp += 1
+                try fixture.run(action, payload:
+                    #"{"timestamp":\#(timestamp)\#(identity)}"#)
+                let record = try JSONDecoder().decode(
+                    SessionStatusRecord.self,
+                    from: Data(contentsOf: fixture.file("status-record.json")))
+                XCTAssertEqual(record.status, .running)
+                XCTAssertEqual(record.promptStatusTimestamp, timestamp)
+            }
         }
-        for (index, marker) in ["", "not-a-session", String(repeating: "-", count: 36)]
-            .enumerated() {
-            let timestamp = 401 + index
+        for marker in ["", "not-a-session", String(repeating: "-", count: 36)] {
             try Data(marker.utf8).write(to: fixture.file("copilot-session"))
-            try fixture.run("post", payload:
-                #"{"sessionId":"\#(fixture.childId)","timestamp":\#(timestamp)}"#)
-            let record = try JSONDecoder().decode(
-                SessionStatusRecord.self,
-                from: Data(contentsOf: fixture.file("status-record.json")))
-            XCTAssertEqual(record.promptStatusTimestamp, Int64(timestamp))
+            for action in ["running", "pre", "post"] {
+                timestamp += 1
+                try fixture.run(action, payload:
+                    #"{"sessionId":"\#(fixture.childId)","timestamp":\#(timestamp)}"#)
+                let record = try JSONDecoder().decode(
+                    SessionStatusRecord.self,
+                    from: Data(contentsOf: fixture.file("status-record.json")))
+                XCTAssertEqual(record.promptStatusTimestamp, timestamp)
+            }
         }
     }
 
-    func testOwnerRotationDoesNotFilterSessionStartOrNewOwnerTools() throws {
+    func testOwnerRotationDoesNotFilterSessionStartOrNewOwnerActivity() throws {
         let fixture = try Fixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let nextOwner = UUID().uuidString.lowercased()
@@ -258,18 +324,23 @@ final class BackgroundHookTests: XCTestCase {
             #"{"sessionId":"\#(nextOwner)","timestamp":300}"#)
         XCTAssertEqual(try String(contentsOf: fixture.file("status")), "idle")
         let beforeRotation = try fixture.markerContents()
-        try fixture.run("pre", payload:
-            #"{"sessionId":"\#(nextOwner)","timestamp":350}"#)
-        XCTAssertEqual(try fixture.markerContents(), beforeRotation)
+        for action in ["running", "pre"] {
+            try fixture.run(action, payload:
+                #"{"sessionId":"\#(nextOwner)","timestamp":350,"prompt":"new foreground prompt"}"#)
+            XCTAssertEqual(try fixture.markerContents(), beforeRotation)
+        }
         try Data("  \(nextOwner.uppercased()) \n".utf8)
             .write(to: fixture.file("copilot-session"))
-        try fixture.run("pre", payload:
-            #"{"sessionId":"\#(nextOwner)","timestamp":400}"#)
-        let record = try JSONDecoder().decode(
-            SessionStatusRecord.self,
-            from: Data(contentsOf: fixture.file("status-record.json")))
-        XCTAssertEqual(record.status, .running)
-        XCTAssertEqual(record.promptStatusTimestamp, 400)
+        for (index, action) in ["running", "pre"].enumerated() {
+            let timestamp = Int64(400 + index)
+            try fixture.run(action, payload:
+                #"{"sessionId":"\#(nextOwner)","timestamp":\#(timestamp),"prompt":"new foreground prompt"}"#)
+            let record = try JSONDecoder().decode(
+                SessionStatusRecord.self,
+                from: Data(contentsOf: fixture.file("status-record.json")))
+            XCTAssertEqual(record.status, .running)
+            XCTAssertEqual(record.promptStatusTimestamp, timestamp)
+        }
     }
 
     func testRootIdleClearsPreviouslyPoisonedStatusWithoutClockRollback() throws {
