@@ -2057,6 +2057,18 @@ final class CoreLogicTests: XCTestCase {
     }
 
     func testCopilotExtensionDoesNotRenewUnchangedForegroundClaim() throws {
+        try assertCopilotExtensionForegroundClaim(rotationQueryOutcome: "resolved")
+    }
+
+    func testCopilotExtensionRearmsRejectedForegroundQueryAfterRotation() throws {
+        try assertCopilotExtensionForegroundClaim(rotationQueryOutcome: "rejected")
+    }
+
+    func testCopilotExtensionRearmsTimedOutForegroundQueryAfterRotation() throws {
+        try assertCopilotExtensionForegroundClaim(rotationQueryOutcome: "timed-out")
+    }
+
+    private func assertCopilotExtensionForegroundClaim(rotationQueryOutcome: String) throws {
         try requireNodeForJavaScriptTests()
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent(".build/copilot-extension-foreground-epoch-\(UUID().uuidString)")
@@ -2073,6 +2085,7 @@ final class CoreLogicTests: XCTestCase {
         let foregroundId = SESSION_A;
         let queries = 0;
         let pollPaused = false;
+        let nextForegroundQueryOutcome;
         let transcriptListener;
         const namedListeners = new Map();
         const fakeSession = {
@@ -2082,6 +2095,10 @@ final class CoreLogicTests: XCTestCase {
               if (name !== "session.getForeground") throw new Error(name);
               queries += 1;
               now += 5_000;
+              const outcome = nextForegroundQueryOutcome;
+              nextForegroundQueryOutcome = undefined;
+              if (outcome === "rejected") throw new Error("foreground query rejected");
+              if (outcome === "timed-out") return new Promise(() => {});
               return {sessionId: foregroundId};
             }
           },
@@ -2114,6 +2131,7 @@ final class CoreLogicTests: XCTestCase {
                 of: "timer = setInterval(() => {",
                 with: "timer = setInterval(() => {\n        if (pollPaused) return;"
             )
+            .replacingOccurrences(of: "10_000", with: "50")
         let epilogue = #"""
 
         const base = `${process.env.COPILOT_PROJECTS_ROOT}/sessions/`
@@ -2183,6 +2201,7 @@ final class CoreLogicTests: XCTestCase {
         }
         fakeSession.sessionId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
         foregroundId = fakeSession.sessionId;
+        nextForegroundQueryOutcome = rotationQueryOutcome;
         emit({
           id:"rotate",type:"session.resume",timestamp:new Date().toISOString(),
           data:{sessionId:fakeSession.sessionId}
@@ -2207,7 +2226,8 @@ final class CoreLogicTests: XCTestCase {
             root: root,
             copilotHome: copilotHome,
             appSessionId: "12345678-1234-1234-1234-123456789abc",
-            source: prelude + extensionScript + epilogue,
+            source: "const rotationQueryOutcome = \"\(rotationQueryOutcome)\";\n"
+                + prelude + extensionScript + epilogue,
             environment: ["COPILOT_EXTENSION_PARENT_PID": "4444"]
         )
         XCTAssertEqual(summary["originalOwner"] as? String, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")

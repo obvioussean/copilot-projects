@@ -776,7 +776,6 @@ if (validSessionId && socketPath) {
                 timeoutPromise,
             ]);
             if (generation !== conversationGeneration) {
-                refreshForegroundAuthoritySoon();
                 return;
             }
             const wasActive = foregroundSessionActive;
@@ -795,6 +794,9 @@ if (validSessionId && socketPath) {
             // owner election remains authoritative in that compatibility mode.
         } finally {
             if (timeout) clearTimeout(timeout);
+            if (generation !== conversationGeneration) {
+                refreshForegroundAuthoritySoon();
+            }
         }
         if (shouldActivate) activateForegroundSharedFiles();
     }
