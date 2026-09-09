@@ -191,7 +191,7 @@ public enum CopilotHooks {
       esac
     }
 
-    tool_hook_has_other_owner() {
+    hook_has_other_owner() {
       local owner caller uuid
       uuid='^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
       owner="$(cat "$state_dir/sessions/$session_id.copilot-session" 2>/dev/null \
@@ -218,6 +218,8 @@ public enum CopilotHooks {
         ;;
       running)
         payload="$(cat 2>/dev/null || true)"
+        # Child prompts must not start a foreground turn or advance its clock.
+        if hook_has_other_owner "$payload"; then emit; exit 0; fi
         if is_scheduled_prompt "$payload"; then
           mkdir -p "$state_dir/sessions" 2>/dev/null || true
           : > "$scheduled_turn"
@@ -252,7 +254,7 @@ public enum CopilotHooks {
       pre|post)
         payload="$(cat 2>/dev/null || true)"
         # A child shares the terminal, not its foreground prompt or status clock.
-        if tool_hook_has_other_owner "$payload"; then emit; exit 0; fi
+        if hook_has_other_owner "$payload"; then emit; exit 0; fi
         if [ -f "$scheduled_turn" ]; then
           : > "$scheduled_turn"
           status idle "$(payload_timestamp "$payload")" scheduled-active
