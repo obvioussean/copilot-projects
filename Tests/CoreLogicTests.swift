@@ -2056,6 +2056,166 @@ final class CoreLogicTests: XCTestCase {
         XCTAssertEqual(summary["staleOwnerSessionId"] as? String, previousSessionId)
     }
 
+    func testCopilotExtensionDoesNotRenewUnchangedForegroundClaim() throws {
+        try requireNodeForJavaScriptTests()
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/copilot-extension-foreground-epoch-\(UUID().uuidString)")
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        let copilotHome = root.appendingPathComponent(".copilot", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let prelude = #"""
+        const SESSION_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        const SESSION_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let now = Date.now();
+        Date.now = () => now;
+        let foregroundId = SESSION_A;
+        let queries = 0;
+        let pollPaused = false;
+        let transcriptListener;
+        const namedListeners = new Map();
+        const fakeSession = {
+          sessionId: SESSION_A,
+          connection: {
+            async sendRequest(name) {
+              if (name !== "session.getForeground") throw new Error(name);
+              queries += 1;
+              now += 5_000;
+              return {sessionId: foregroundId};
+            }
+          },
+          rpc: {
+            schedule: {list: async () => ({entries:[]})},
+            permissions: {getAllowAll: async () => ({enabled:false})},
+            model: {list: async () => ({list:[]})},
+            eventLog: {
+              registerInterest: async ({eventType}) => ({handle:eventType}),
+              releaseInterest: async () => ({success:true})
+            }
+          },
+          on(name, handler) {
+            if (typeof name === "function") transcriptListener = name;
+            else namedListeners.set(name, handler);
+          },
+          async getEvents() { return []; }
+        };
+        """#
+        let extensionScript = CopilotExtension.script
+            .replacingOccurrences(
+                of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
+                with: "const joinSession = async () => fakeSession;"
+            )
+            .replacingOccurrences(
+                of: "const DURABLE_RECONCILE_POLL_MS = 5_000;",
+                with: "const DURABLE_RECONCILE_POLL_MS = 10;"
+            )
+            .replacingOccurrences(
+                of: "timer = setInterval(() => {",
+                with: "timer = setInterval(() => {\n        if (pollPaused) return;"
+            )
+        let epilogue = #"""
+
+        const base = `${process.env.COPILOT_PROJECTS_ROOT}/sessions/`
+          + process.env.COPILOT_PROJECTS_SESSION;
+        const ownerPath = `${base}.transcript-owner.json`;
+        const transcriptPath = `${base}.transcript.json`;
+        const readOwner = () => JSON.parse(readFileSync(ownerPath, "utf8"));
+        const emit = (event) => {
+          transcriptListener(event);
+          namedListeners.get(event.type)?.(event);
+        };
+        async function waitForQueries(count) {
+          const target = queries + count;
+          for (let attempt = 0; attempt < 200; attempt += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            if (queries >= target) return;
+          }
+          throw new Error("foreground polling did not run");
+        }
+        await waitForQueries(2);
+        const originalOwner = readOwner();
+        now += 1_000;
+        const nextOwner = {
+          copilotSessionId:SESSION_B,pid:1,
+          parentPid:Number(process.env.COPILOT_EXTENSION_PARENT_PID),
+          claimedAt:now
+        };
+        writeFileSync(ownerPath, JSON.stringify(nextOwner));
+        const nextTranscript = JSON.stringify({
+          schemaVersion:3,copilotSessionId:SESSION_B,ownerPid:1,turns:[]
+        });
+        writeFileSync(transcriptPath, nextTranscript);
+        now += 1_000;
+        // Repeated affirmative replies from A's stale connection are not new
+        // foreground transitions and must not overtake B's newer claim.
+        await waitForQueries(6);
+        const afterStalePolls = readOwner();
+        const staleTranscriptUnchanged = readFileSync(transcriptPath, "utf8") === nextTranscript;
+        emit({
+          id:"scheduled",type:"user.message",timestamp:new Date().toISOString(),
+          data:{content:"background tick",source:"schedule-test"}
+        });
+        await waitForQueries(2);
+        const scheduledOwner = readOwner();
+
+        // A real foreground switch can return to an already-live conversation;
+        // an empty getForeground reply also means the host has deselected it.
+        foregroundId = SESSION_B;
+        await waitForQueries(2);
+        foregroundId = undefined;
+        await waitForQueries(2);
+        now += 1_000;
+        foregroundId = SESSION_A;
+        await waitForQueries(2);
+        const afterReactivation = readOwner();
+
+        now += 1_000;
+        writeFileSync(ownerPath, JSON.stringify({...nextOwner,claimedAt:now}));
+        writeFileSync(transcriptPath, nextTranscript);
+        // A discarded old-generation reply must re-arm immediately rather than
+        // leaving the resumed conversation waiting for the fallback heartbeat.
+        pollPaused = true;
+        fakeSession.sessionId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        foregroundId = fakeSession.sessionId;
+        emit({
+          id:"rotate",type:"session.resume",timestamp:new Date().toISOString(),
+          data:{sessionId:fakeSession.sessionId}
+        });
+        await waitForQueries(1);
+        const afterRotation = readOwner();
+        console.log(JSON.stringify({
+          originalOwner:originalOwner.copilotSessionId,
+          staleOwner:afterStalePolls.copilotSessionId,
+          staleClaimUnchanged:afterStalePolls.claimedAt === nextOwner.claimedAt,
+          staleTranscriptUnchanged,
+          scheduledOwner:scheduledOwner.copilotSessionId,
+          reactivatedOwner:afterReactivation.copilotSessionId,
+          reactivatedClaimIsNew:afterReactivation.claimedAt > nextOwner.claimedAt,
+          rotatedOwner:afterRotation.copilotSessionId,
+          rotatedTranscript:JSON.parse(readFileSync(transcriptPath, "utf8")).copilotSessionId
+        }));
+        process.exit(0);
+        """#
+        let summary = try runExtensionHarness(
+            name: "foreground-epoch",
+            root: root,
+            copilotHome: copilotHome,
+            appSessionId: "12345678-1234-1234-1234-123456789abc",
+            source: prelude + extensionScript + epilogue,
+            environment: ["COPILOT_EXTENSION_PARENT_PID": "4444"]
+        )
+        XCTAssertEqual(summary["originalOwner"] as? String, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        XCTAssertEqual(summary["staleOwner"] as? String, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        XCTAssertEqual(summary["staleClaimUnchanged"] as? Bool, true)
+        XCTAssertEqual(summary["staleTranscriptUnchanged"] as? Bool, true)
+        XCTAssertEqual(summary["scheduledOwner"] as? String, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        XCTAssertEqual(summary["reactivatedOwner"] as? String, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        XCTAssertEqual(summary["reactivatedClaimIsNew"] as? Bool, true)
+        XCTAssertEqual(summary["rotatedOwner"] as? String, "cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+        XCTAssertEqual(summary["rotatedTranscript"] as? String, "cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+    }
+
     /// A same-tab helper (a spawned `copilot -p` classifier) shares the app
     /// session id but runs in its own process. When it rotates its own Copilot
     /// conversation it must NOT take over the tab: the interactive owner is
