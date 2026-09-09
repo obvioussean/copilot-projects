@@ -2176,6 +2176,11 @@ final class CoreLogicTests: XCTestCase {
         // A discarded old-generation reply must re-arm immediately rather than
         // leaving the resumed conversation waiting for the fallback heartbeat.
         pollPaused = true;
+        const pausedQueries = queries;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        if (queries !== pausedQueries) {
+          throw new Error("foreground polling did not pause");
+        }
         fakeSession.sessionId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
         foregroundId = fakeSession.sessionId;
         emit({
