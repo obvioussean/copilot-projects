@@ -26,7 +26,8 @@ enum SessionSemanticsAdapter {
         hasPendingQuestions: Bool,
         hasLiveAgent: Bool,
         backgroundOnly: Bool,
-        footerActivity: FooterActivity
+        footerActivity: FooterActivity,
+        foregroundActivity: ForegroundActivity? = nil
     ) -> RemotePromptResult {
         switch SessionSemantics.promptEligibility(PromptabilityInput(
             status: status,
@@ -34,7 +35,8 @@ enum SessionSemanticsAdapter {
             hasPendingQuestions: hasPendingQuestions,
             hasLiveAgent: hasLiveAgent,
             hasBackgroundOnlyEvidence: backgroundOnly,
-            footerActivity: footerActivity
+            footerActivity: footerActivity,
+            foregroundActivity: foregroundActivity
         )) {
         case .send:
             return .sent

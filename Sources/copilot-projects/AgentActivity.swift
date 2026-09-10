@@ -10,6 +10,13 @@ private enum AgentTimestamp {
     }
 }
 
+struct RuntimeActivitySnapshot: Codable, Equatable {
+    var processing: Bool?
+    var observedAtMilliseconds: Int64?
+    var idleAtMilliseconds: Int64?
+    var error: String?
+}
+
 struct AgentActivitySnapshot: Codable, Equatable {
     static let currentSchemaVersion = 1
 
@@ -17,8 +24,8 @@ struct AgentActivitySnapshot: Codable, Equatable {
     var updatedAt: String
     var foregroundTurnActive: Bool
     /// Wall-clock time (ISO8601) of the most recent `foregroundTurnActive`
-    /// transition — set by the extension only at root turn_start/turn_end/
-    /// session.idle, unlike `updatedAt` which every publish() rewrites. Carries
+    /// transition — set at root user input/turn_start/assistant.idle/session.idle,
+    /// not at each model iteration's turn_end or each heartbeat. Carries
     /// the CLI event's causal timestamp (`normalizedTimestamp(event.timestamp)`),
     /// the same time base the status hooks use, so it's directly comparable to
     /// the status-event clock. Optional (nil default) so snapshots written before
@@ -60,16 +67,53 @@ struct AgentActivitySnapshot: Codable, Equatable {
     /// Tracker-published operation outcomes. `payloadFingerprint` remains private
     /// host/tracker idempotency metadata and is stripped from remote DTOs.
     var operationReceipts: [TrackedOperationReceipt]? = nil
+    /// Absent for older trackers; a present but incomplete observation
+    /// is unknown, not evidence that the foreground is idle.
+    var runtimeActivity: RuntimeActivitySnapshot? = nil
+    var inputCompletions: [String: Int64]? = nil
+    var sessionIdleAtMilliseconds: Int64? = nil
+
+    func runtimeForegroundActivity(
+        expectedSessionId: String?,
+        now: Date,
+        minimumObservationMilliseconds: Int64?
+    ) -> ForegroundActivity? {
+        guard let runtimeActivity else { return nil }
+        let nowMs = Int64(now.timeIntervalSince1970 * 1_000)
+        guard let expectedSessionId, !expectedSessionId.isEmpty,
+              copilotSessionId?.lowercased() == expectedSessionId.lowercased(),
+              isFresh(at: now), !reportsTerminalDisconnect else {
+            return .unknown
+        }
+        if runtimeActivity.error == "unsupported" || runtimeActivity.error == "remote" {
+            return nil
+        }
+        guard runtimeActivity.error == nil,
+              let processing = runtimeActivity.processing,
+              let observed = runtimeActivity.observedAtMilliseconds,
+              observed <= nowMs, nowMs - observed <= 15_000,
+              observed > (minimumObservationMilliseconds ?? .min) else {
+            return .unknown
+        }
+        return processing ? .working : .idle
+    }
+
+    var hasPendingInput: Bool {
+        trackedUserInputs?.isEmpty == false
+            || trackedElicitations?.isEmpty == false
+            || pendingPermissionRequestIds?.isEmpty == false
+    }
 
     func isFresh(at now: Date = Date(), ttl: TimeInterval = 15) -> Bool {
         guard schemaVersion == Self.currentSchemaVersion,
               let updated = AgentTimestamp.parse(updatedAt) else { return false }
-        return now.timeIntervalSince(updated) <= ttl
+        let age = now.timeIntervalSince(updated)
+        return age >= 0 && age <= ttl
     }
 
     /// True when the last heartbeat carried a terminal RPC-connection error
     /// (closed/disposed). A disconnected extension can no longer observe
-    /// `assistant.turn_end`/`session.idle`, so its `foregroundTurnActive` (and
+    /// `assistant.idle`/`session.idle`, so its `foregroundTurnActive` (and
     /// other in-flight) claims are stale and must not be treated as authoritative
     /// evidence that a foreground turn is still running — otherwise the 5s
     /// heartbeat republishes the stuck snapshot fresh and the tab reads "working"
@@ -83,7 +127,7 @@ struct AgentActivitySnapshot: Codable, Equatable {
 
     /// `foregroundTransitionAt` as epoch milliseconds, matching the status-event
     /// clock's units. This is the causal time of the current foreground state
-    /// (turn_start → active, turn_end/session.idle → inactive), so recovery and
+    /// (turn_start → active, assistant.idle/session.idle → inactive), so recovery and
     /// demotion seed the status clock from it rather than `updatedAt` — otherwise
     /// an unrelated republish (heartbeat, question, model/subagent event) could
     /// advance the clock past a delayed status hook and silently drop it. Older

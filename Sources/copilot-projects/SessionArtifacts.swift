@@ -2,6 +2,12 @@ import Foundation
 import Darwin
 import CopilotProjectsCore
 
+struct InputWaitContext: Codable, Equatable {
+    let senderSessionId: String
+    let rootSessionId: String
+    let conversationEpoch: String
+}
+
 struct SessionStatusRecord: Codable, Equatable {
     static let currentSchemaVersion = 1
 
@@ -9,12 +15,19 @@ struct SessionStatusRecord: Codable, Equatable {
     let status: SessionStatus
     let statusTimestamp: Int64
     let promptStatusTimestamp: Int64
+    let inputWait: InputWaitContext?
 
-    init(status: SessionStatus, statusTimestamp: Int64, promptStatusTimestamp: Int64) {
+    init(
+        status: SessionStatus,
+        statusTimestamp: Int64,
+        promptStatusTimestamp: Int64,
+        inputWait: InputWaitContext? = nil
+    ) {
         schemaVersion = Self.currentSchemaVersion
         self.status = status
         self.statusTimestamp = statusTimestamp
         self.promptStatusTimestamp = promptStatusTimestamp
+        self.inputWait = inputWait
     }
 }
 

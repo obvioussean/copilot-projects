@@ -397,6 +397,18 @@ final class AppModel: ObservableObject {
     private let persistPermissionStatus:
         (_ sessionId: String, _ status: SessionStatus, _ timestamp: Int64,
          _ promptStatusTimestamp: Int64) -> Void
+    private struct InputWaitState {
+        let context: InputWaitContext
+        let timestamp: Int64
+    }
+    private struct RemotePromptFence: Equatable {
+        let submittedAt: Int64
+        let rootSessionId: String
+        let conversationEpoch: String
+    }
+    private var inputWaits: [String: InputWaitState] = [:]
+    private var remotePromptFences: [String: RemotePromptFence] = [:]
+    private var runtimeTrackedOwners: [String: String] = [:]
     private struct PermissionStatusRestore {
         let status: SessionStatus
         let statusText: String?
@@ -406,8 +418,11 @@ final class AppModel: ObservableObject {
         let backgroundAgentsSuppressed: Bool
         let completionPending: Bool
         let foregroundIdleGenerationBaseline: Int?
-        let statusTimestamp: Int64
-        let promptStatusTimestamp: Int64
+        var statusTimestamp: Int64
+        var promptStatusTimestamp: Int64
+        var observedRootSessionId: String? = nil
+        var observedConversationEpoch: String? = nil
+        var observedPendingRequestIds: Set<String> = []
     }
     private struct PendingSessionDestroy {
         let task: Task<Void, Never>
@@ -1189,6 +1204,9 @@ final class AppModel: ObservableObject {
         completionSummaryContexts[sid] = nil
         permissionNotificationTokens[sid] = nil
         permissionStatusRestores[sid] = nil
+        inputWaits[sid] = nil
+        remotePromptFences[sid] = nil
+        runtimeTrackedOwners[sid] = nil
         scheduledSnapshotsSuppressed.remove(sid)
         foregroundIdleGenerationBaselines.removeValue(forKey: sid)
         let closedIndex = projects[pi].sessions.firstIndex { $0.id == sid }
@@ -1446,6 +1464,7 @@ final class AppModel: ObservableObject {
     func remoteWorkspaceSnapshot() -> RemoteWorkspaceSnapshot {
         let promptNow = Date()
         let promptNowMs = SessionArtifacts.currentStatusTimestamp()
+        let promptLiveSessions = remotePromptLiveSessions?(agentProcessNames) ?? liveAgentSessions
         return RemoteWorkspaceSnapshot(
             projects: projects.map { project in
                 RemoteProjectSnapshot(
@@ -1456,20 +1475,26 @@ final class AppModel: ObservableObject {
                         let operation = session.agentActivity?
                             .remoteOperationProjection(at: promptNow)
                             ?? .unavailable
+                        let foreground = runtimeForegroundActivity(
+                            for: session, now: promptNow
+                        )
+                        let status = projectedStatus(
+                            for: session, foreground: foreground, now: promptNow
+                        )
                         return RemoteSessionSnapshot(
                             id: session.id,
                             title: session.title,
-                            status: session.status.rawValue,
+                            status: status.rawValue,
                             statusText: session.statusText,
                             unread: session.hasUnread,
                             ready: session.finishedUnseen,
                             background: session.hasBackgroundWork,
                             scheduled: !session.schedules.isEmpty,
                             promptable: Self.remotePromptEligibility(
-                                status: session.status,
+                                status: status,
                                 scheduledTurnActive: session.scheduledTurnActive,
-                                hasPendingQuestions: session.hasPendingQuestions,
-                                hasLiveAgent: liveAgentSessions.contains(session.id),
+                                hasPendingQuestions: session.hasPendingInput,
+                                hasLiveAgent: promptLiveSessions.contains(session.id),
                                 backgroundOnly: Self.backgroundOnlyPromptEvidence(
                                     status: session.status,
                                     snapshot: session.agentActivity,
@@ -1480,8 +1505,10 @@ final class AppModel: ObservableObject {
                                         for: session.id
                                     )
                                 ),
-                                footerActivity: controllers[session.id]?.agentActivity
-                                    ?? .unknown
+                                footerActivity: remotePromptTarget?(session.id)?.activity
+                                    ?? controllers[session.id]?.agentActivity
+                                    ?? .unknown,
+                                foregroundActivity: foreground
                             ) == .sent,
                             pendingUserInputs: session.agentActivity?
                                 .remoteUserInputRequests(),
@@ -1651,10 +1678,11 @@ final class AppModel: ObservableObject {
         }
         let promptNow = Date()
         let promptNowMs = SessionArtifacts.currentStatusTimestamp()
+        let foreground = runtimeForegroundActivity(for: session, now: promptNow)
         let eligibility = Self.remotePromptEligibility(
-            status: session.status,
+            status: projectedStatus(for: session, foreground: foreground, now: promptNow),
             scheduledTurnActive: session.scheduledTurnActive,
-            hasPendingQuestions: session.hasPendingQuestions,
+            hasPendingQuestions: session.hasPendingInput,
             hasLiveAgent: liveSessions.contains(sessionId),
             backgroundOnly: Self.backgroundOnlyPromptEvidence(
                 status: session.status,
@@ -1664,15 +1692,34 @@ final class AppModel: ObservableObject {
                 nowMs: promptNowMs,
                 clockMs: sessionSemantics.promptSafetyClock.timestamp(for: sessionId)
             ),
-            footerActivity: target?.activity ?? .unknown
+            footerActivity: target?.activity ?? .unknown,
+            foregroundActivity: foreground
         )
         if eligibility == .busy { return .busy }
         guard liveSessions.contains(sessionId),
-              let target,
-              target.activity == .idle else {
+              let target else {
             return .noLiveCopilot
         }
-        return target.send(value) ? .sent : .invalid
+        let fence: RemotePromptFence?
+        if foreground == .idle,
+           let root = session.agentActivity?.copilotSessionId,
+           let epoch = session.agentActivity?.conversationEpoch {
+            fence = RemotePromptFence(
+                submittedAt: promptNowMs,
+                rootSessionId: root,
+                conversationEpoch: epoch
+            )
+            remotePromptFences[sessionId] = fence
+        } else {
+            fence = nil
+        }
+        guard target.send(value) else {
+            if remotePromptFences[sessionId] == fence {
+                remotePromptFences[sessionId] = nil
+            }
+            return .invalid
+        }
+        return .sent
     }
 
     /// Whether a remote message may be sent to a session right now. Readiness of the
@@ -1697,7 +1744,8 @@ final class AppModel: ObservableObject {
         hasPendingQuestions: Bool = false,
         hasLiveAgent: Bool,
         backgroundOnly: Bool = false,
-        footerActivity: FooterActivity
+        footerActivity: FooterActivity,
+        foregroundActivity: ForegroundActivity? = nil
     ) -> RemotePromptResult {
         SessionSemanticsAdapter.remotePromptResult(
             status: status,
@@ -1705,8 +1753,162 @@ final class AppModel: ObservableObject {
             hasPendingQuestions: hasPendingQuestions,
             hasLiveAgent: hasLiveAgent,
             backgroundOnly: backgroundOnly,
-            footerActivity: footerActivity
+            footerActivity: footerActivity,
+            foregroundActivity: foregroundActivity
         )
+    }
+
+    private func runtimeForegroundActivity(
+        for session: Session,
+        now: Date
+    ) -> ForegroundActivity? {
+        let owner = resumeMarkerValue(sessionId: session.id, suffix: "copilot-session")
+        guard let snapshot = session.agentActivity else {
+            return runtimeTrackedOwners[session.id] == owner?.lowercased()
+                && owner != nil ? .unknown : nil
+        }
+        let activity = snapshot.runtimeForegroundActivity(
+            expectedSessionId: owner,
+            now: now,
+            minimumObservationMilliseconds:
+                sessionSemantics.promptSafetyClock.timestamp(for: session.id)
+        )
+        guard let fence = remotePromptFences[session.id] else { return activity }
+        if let currentRoot = snapshot.copilotSessionId,
+           let epoch = snapshot.conversationEpoch,
+           currentRoot.lowercased() == owner?.lowercased(),
+           (currentRoot != fence.rootSessionId || epoch != fence.conversationEpoch) {
+            remotePromptFences[session.id] = nil
+            return activity
+        }
+        if SessionSemantics.acknowledgesSubmittedPrompt(
+            foreground: activity,
+            observedAt: snapshot.runtimeActivity?.observedAtMilliseconds,
+            idleAt: snapshot.runtimeActivity?.idleAtMilliseconds,
+            submittedAt: fence.submittedAt
+        ) {
+            remotePromptFences[session.id] = nil
+            return activity
+        }
+        return .unknown
+    }
+
+    private func inputWaitWasResolved(
+        for session: Session,
+        foreground: ForegroundActivity?,
+        now: Date
+    ) -> Bool {
+        let nowMs = Int64(now.timeIntervalSince1970 * 1_000)
+        guard foreground != .unknown,
+              let wait = inputWaits[session.id],
+              let snapshot = session.agentActivity,
+              snapshot.isFresh(at: now),
+              snapshot.copilotSessionId?.lowercased() == wait.context.rootSessionId.lowercased(),
+              snapshot.copilotSessionId?.lowercased() == resumeMarkerValue(
+                sessionId: session.id, suffix: "copilot-session"
+              )?.lowercased(),
+              snapshot.conversationEpoch == wait.context.conversationEpoch,
+              snapshot.trackedUserInputs?.isEmpty == true,
+              snapshot.trackedElicitations?.isEmpty == true,
+              snapshot.pendingPermissionRequestIds?.isEmpty == true,
+              let observed = foreground == nil
+                ? snapshot.updatedAtMilliseconds
+                : snapshot.runtimeActivity?.observedAtMilliseconds,
+              observed > wait.timestamp,
+              observed <= nowMs else {
+            return false
+        }
+        if snapshot.runtimeActivity == nil, snapshot.inputCompletions == nil,
+           snapshot.sessionIdleAtMilliseconds == nil {
+            return true
+        }
+        if let completed = snapshot.inputCompletions?[wait.context.senderSessionId.lowercased()],
+           completed >= wait.timestamp, completed <= nowMs, completed <= observed {
+            return true
+        }
+        // Whole-session idle is stronger than a child completion and also covers
+        // cancellation, where an individual input-completed event can be absent.
+        if let idleAt = snapshot.sessionIdleAtMilliseconds,
+           idleAt > wait.timestamp, idleAt <= nowMs, idleAt <= observed {
+            return true
+        }
+        return false
+    }
+
+    private func projectedStatus(
+        for session: Session,
+        foreground: ForegroundActivity?,
+        now: Date
+    ) -> SessionStatus {
+        if session.hasPendingInput { return .waiting }
+        if session.status == .waiting, !session.statusIsRuntimeDerived {
+            guard inputWaitWasResolved(for: session, foreground: foreground, now: now) else {
+                return .waiting
+            }
+            if foreground == nil {
+                return session.agentActivity?.foregroundTurnActive == true
+                    && !session.scheduledTurnActive ? .running : .idle
+            }
+        }
+        switch foreground {
+        case .working:
+            return session.scheduledTurnActive ? .idle : .running
+        case .idle:
+            return .idle
+        case .unknown, nil:
+            return session.status
+        }
+    }
+
+    private func reconcileRuntimeActivity(now: Date) {
+        restoreCompletedPermissionWaits(now: now)
+        var changed = false
+        for pi in projects.indices {
+            for si in projects[pi].sessions.indices {
+                let session = projects[pi].sessions[si]
+                let foreground = runtimeForegroundActivity(for: session, now: now)
+                guard foreground == .working || foreground == .idle
+                    || (session.status == .waiting
+                        && inputWaitWasResolved(for: session, foreground: foreground, now: now))
+                else { continue }
+                let status = projectedStatus(for: session, foreground: foreground, now: now)
+                if status != session.status {
+                    if session.status == .waiting, !session.statusIsRuntimeDerived,
+                       status != .waiting, permissionStatusRestores[session.id] == nil,
+                       let timestamp = sessionSemantics.statusClock.timestamp(for: session.id),
+                       let promptTimestamp = sessionSemantics.promptSafetyClock.timestamp(for: session.id) {
+                        // Certified resolution must survive restart even when no
+                        // pre-wait permission snapshot survived with it.
+                        persistPermissionStatus(session.id, status, timestamp, promptTimestamp)
+                    }
+                    projects[pi].sessions[si].status = status
+                    projects[pi].sessions[si].statusIsRuntimeDerived = true
+                    projects[pi].sessions[si].statusText = nil
+                    sessionSemantics.activityTracker.reset(sessionId: session.id)
+                    if status == .running {
+                        projects[pi].sessions[si].finishedUnseen = false
+                        projects[pi].sessions[si].turnCompleted = false
+                        completionPending.remove(session.id)
+                        completionSummaryContexts[session.id] = nil
+                    }
+                    if status != .waiting, permissionStatusRestores[session.id] == nil {
+                        cancelPermissionNotification(sessionId: session.id)
+                    }
+                    changed = true
+                }
+                if let idleAt = session.agentActivity?.sessionIdleAtMilliseconds,
+                   idleAt <= Int64(now.timeIntervalSince1970 * 1_000),
+                   idleAt >= (sessionSemantics.statusClock.timestamp(for: session.id) ?? .min),
+                   session.agentActivity?.foregroundTurnActive == false,
+                   session.agentActivity?.activeSubagents.isEmpty == true {
+                    setBackgroundAgentsActive(sessionId: session.id, active: false)
+                }
+                if status == .idle {
+                    postCompletionIfReady(sessionId: session.id)
+                }
+            }
+        }
+        if changed { updateDockBadge() }
     }
 
     /// Evidence that a session is only busy because scheduled, subagent, or CLI
@@ -2518,6 +2720,36 @@ final class AppModel: ObservableObject {
             timestamp: timestamp,
             source: source
         ) else { return }
+        projects[loc.p].sessions[loc.s].statusIsRuntimeDerived = false
+        if status == .waiting {
+            if case .loaded(let record) = SessionArtifacts.loadStatusRecord(
+                sessionId: sessionId, sessionsDirectory: agentActivityDirectory
+            ), record.status == .waiting, record.statusTimestamp == timestamp,
+               let context = record.inputWait {
+                inputWaits[sessionId] = InputWaitState(
+                    context: context, timestamp: record.statusTimestamp
+                )
+            } else if let copilotSessionId, let timestamp,
+                      let snapshot = projects[loc.p].sessions[loc.s].agentActivity,
+                      let root = snapshot.copilotSessionId,
+                      let epoch = snapshot.conversationEpoch,
+                      root.lowercased() == resumeMarkerValue(
+                        sessionId: sessionId, suffix: "copilot-session"
+                      )?.lowercased() {
+                inputWaits[sessionId] = InputWaitState(
+                    context: InputWaitContext(
+                        senderSessionId: copilotSessionId,
+                        rootSessionId: root,
+                        conversationEpoch: epoch
+                    ),
+                    timestamp: timestamp
+                )
+            } else {
+                inputWaits[sessionId] = nil
+            }
+        } else {
+            inputWaits[sessionId] = nil
+        }
         // sessionEnd is also emitted during graceful macOS shutdown. Only a live,
         // non-terminating app can treat it as an explicit user exit.
         if source == "session-end", !isTerminating, !isPoweringOff,
@@ -2529,7 +2761,10 @@ final class AppModel: ObservableObject {
             }
         }
         let previous = projects[loc.p].sessions[loc.s].status
-        let permissionRestoreState: (
+        if status == .waiting, previous == .waiting, notification == nil {
+            refreshRetainedPermissionClocks(sessionId: sessionId, previousTimestamp: previousTimestamp)
+        }
+        var permissionRestoreState: (
             status: SessionStatus,
             statusText: String?,
             scheduledTurnActive: Bool,
@@ -2539,7 +2774,6 @@ final class AppModel: ObservableObject {
             completionPending: Bool,
             foregroundIdleGenerationBaseline: Int?
         )? = notification == .permission
-            && permissionNotificationTokens[sessionId] == nil
             ? (
                 previous,
                 projects[loc.p].sessions[loc.s].statusText,
@@ -2551,6 +2785,18 @@ final class AppModel: ObservableObject {
                 foregroundIdleGenerationBaselines[sessionId]
             )
             : nil
+        if permissionRestoreState != nil,
+           previous == .waiting,
+           let retained = permissionStatusRestores[sessionId],
+           retained.statusTimestamp == previousTimestamp,
+           retained.status != .waiting {
+            permissionRestoreState = (
+                retained.status, retained.statusText, retained.scheduledTurnActive,
+                retained.finishedUnseen, retained.turnCompleted,
+                retained.backgroundAgentsSuppressed, retained.completionPending,
+                retained.foregroundIdleGenerationBaseline
+            )
+        }
         let startsScheduledTurn = source == "scheduled-start" || source == "scheduled-active"
         let endsScheduledTurn = source == "scheduled-idle"
         let scheduledStateChanges = startsScheduledTurn
@@ -2628,6 +2874,9 @@ final class AppModel: ObservableObject {
                 timestamp: clocks.status,
                 promptStatusTimestamp: clocks.promptSafety
             )
+            if status == .waiting, previous == .waiting, notification == nil {
+                refreshRetainedPermissionClocks(sessionId: sessionId, previousTimestamp: previousTimestamp)
+            }
         }
 
         if status == .idle {
@@ -2706,14 +2955,26 @@ final class AppModel: ObservableObject {
         )
     }
 
+    private func refreshRetainedPermissionClocks(sessionId: String, previousTimestamp: Int64?) {
+        guard var restore = permissionStatusRestores[sessionId],
+              restore.statusTimestamp == previousTimestamp,
+              let statusTimestamp = sessionSemantics.statusClock.timestamp(for: sessionId),
+              let promptTimestamp = sessionSemantics.promptSafetyClock.timestamp(for: sessionId) else {
+            return
+        }
+        restore.statusTimestamp = statusTimestamp
+        restore.promptStatusTimestamp = promptTimestamp
+        permissionStatusRestores[sessionId] = restore
+    }
+
     private func schedulePermissionNotification(
         sessionId: String,
         restore: PermissionStatusRestore
     ) {
+        permissionStatusRestores[sessionId] = restore
         guard permissionNotificationTokens[sessionId] == nil else { return }
         let token = UUID()
         permissionNotificationTokens[sessionId] = token
-        permissionStatusRestores[sessionId] = restore
         let delay = permissionNotificationDelayNanoseconds
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: delay)
@@ -2727,12 +2988,9 @@ final class AppModel: ObservableObject {
     }
 
     private func resolvePermissionNotification(sessionId: String, token: UUID) {
-        guard permissionNotificationTokens[sessionId] == token,
-              let restore = permissionStatusRestores[sessionId] else {
-            return
-        }
+        guard permissionNotificationTokens[sessionId] == token else { return }
         permissionNotificationTokens[sessionId] = nil
-        permissionStatusRestores[sessionId] = nil
+        guard let restore = permissionStatusRestores[sessionId] else { return }
         guard let loc = locateIndex(sessionId) else { return }
 
         let fm = FileManager.default
@@ -2745,7 +3003,13 @@ final class AppModel: ObservableObject {
             decoder: decoder,
             fm: fm
         )
-        let snapshot = loaded?.isFresh() == true ? loaded : nil
+        var snapshot = loaded?.isFresh() == true ? loaded : nil
+        if let wait = inputWaits[sessionId],
+           (snapshot?.copilotSessionId?.lowercased() != wait.context.rootSessionId.lowercased()
+            || snapshot?.conversationEpoch != wait.context.conversationEpoch
+            || (snapshot?.updatedAtMilliseconds ?? .min) < wait.timestamp) {
+            snapshot = nil
+        }
         let session = projects[loc.p].sessions[loc.s]
         let hasPendingQuestions = snapshot.map {
             $0.trackedUserInputs?.isEmpty == false
@@ -2757,8 +3021,19 @@ final class AppModel: ObservableObject {
             pendingPermissionRequestIds: snapshot?.pendingPermissionRequestIds
         ) {
         case .cancel:
+            permissionStatusRestores[sessionId] = nil
             return
         case .post:
+            if let snapshot,
+               let root = snapshot.copilotSessionId,
+               let epoch = snapshot.conversationEpoch,
+               let pending = snapshot.pendingPermissionRequestIds, !pending.isEmpty {
+                var retained = restore
+                retained.observedRootSessionId = root
+                retained.observedConversationEpoch = epoch
+                retained.observedPendingRequestIds = Set(pending)
+                permissionStatusRestores[sessionId] = retained
+            }
             postNotification(
                 projectId: projects[loc.p].id,
                 sessionId: sessionId,
@@ -2770,7 +3045,39 @@ final class AppModel: ObservableObject {
             restoreStatusAfterTransientPermission(
                 sessionId: sessionId,
                 location: loc,
-                restore: restore
+                restore: restore,
+                now: Date()
+            )
+        }
+    }
+
+    private func restoreCompletedPermissionWaits(now: Date) {
+        for (sessionId, restore) in permissionStatusRestores {
+            guard let loc = locateIndex(sessionId),
+                  projects[loc.p].sessions[loc.s].status == .waiting,
+                  sessionSemantics.statusClock.timestamp(for: sessionId) == restore.statusTimestamp else {
+                continue
+            }
+            if inputWaits[sessionId] == nil {
+                guard permissionNotificationTokens[sessionId] == nil,
+                      restore.status != .waiting,
+                      !restore.observedPendingRequestIds.isEmpty,
+                      let snapshot = projects[loc.p].sessions[loc.s].agentActivity,
+                      snapshot.isFresh(at: now),
+                      snapshot.copilotSessionId?.lowercased() == restore.observedRootSessionId?.lowercased(),
+                      snapshot.conversationEpoch == restore.observedConversationEpoch,
+                      snapshot.copilotSessionId?.lowercased() == resumeMarkerValue(
+                        sessionId: sessionId, suffix: "copilot-session"
+                      )?.lowercased(),
+                      (snapshot.updatedAtMilliseconds ?? .min) > restore.statusTimestamp,
+                      snapshot.pendingPermissionRequestIds?.isEmpty == true,
+                      snapshot.trackedUserInputs?.isEmpty == true,
+                      snapshot.trackedElicitations?.isEmpty == true else {
+                    continue
+                }
+            }
+            restoreStatusAfterTransientPermission(
+                sessionId: sessionId, location: loc, restore: restore, now: now
             )
         }
     }
@@ -2778,10 +3085,27 @@ final class AppModel: ObservableObject {
     private func restoreStatusAfterTransientPermission(
         sessionId: String,
         location: (p: Int, s: Int),
-        restore: PermissionStatusRestore
+        restore: PermissionStatusRestore,
+        now: Date
     ) {
+        guard sessionSemantics.statusClock.timestamp(for: sessionId) == restore.statusTimestamp else {
+            return
+        }
         var session = projects[location.p].sessions[location.s]
-        session.status = restore.status
+        let foreground = runtimeForegroundActivity(for: session, now: now)
+        if inputWaits[sessionId] != nil {
+            guard inputWaitWasResolved(
+                for: session,
+                foreground: foreground,
+                now: now
+            ) else { return }
+        }
+        let restoredStatus = restore.status == .waiting
+            ? projectedStatus(for: session, foreground: foreground, now: now)
+            : restore.status
+        guard restoredStatus != .waiting else { return }
+        session.status = restoredStatus
+        session.statusIsRuntimeDerived = restore.status == .waiting
         session.statusText = restore.statusText
         session.scheduledTurnActive = restore.scheduledTurnActive
         session.finishedUnseen = restore.finishedUnseen
@@ -2814,10 +3138,11 @@ final class AppModel: ObservableObject {
         )
         persistPermissionStatus(
             sessionId,
-            restore.status,
+            restoredStatus,
             restore.statusTimestamp,
             restore.promptStatusTimestamp
         )
+        cancelPermissionNotification(sessionId: sessionId)
         updateDockBadge()
         if restore.completionPending {
             postCompletionIfReady(sessionId: sessionId)
@@ -2975,9 +3300,19 @@ final class AppModel: ObservableObject {
                     sessionId: sessionId, path: path, decoder: decoder, fm: fm
                 )
                 let fresh = snapshot?.isFresh(at: now) == true ? snapshot : nil
+                if snapshot?.runtimeActivity != nil, let owner = snapshot?.copilotSessionId,
+                   owner.lowercased() == resumeMarkerValue(
+                    sessionId: sessionId, suffix: "copilot-session"
+                   )?.lowercased() {
+                    runtimeTrackedOwners[sessionId] = owner.lowercased()
+                }
                 if nextProjects[pi].sessions[si].agentActivity != fresh {
                     var previous = nextProjects[pi].sessions[si].agentActivity
-                    if let fresh { previous?.updatedAt = fresh.updatedAt }
+                    if let fresh {
+                        previous?.updatedAt = fresh.updatedAt
+                        previous?.runtimeActivity?.observedAtMilliseconds =
+                            fresh.runtimeActivity?.observedAtMilliseconds
+                    }
                     activityChanged = activityChanged || previous != fresh
                     nextProjects[pi].sessions[si].agentActivity = fresh
                 }
@@ -3011,6 +3346,8 @@ final class AppModel: ObservableObject {
         // isn't written yet) is opened, leaving the count unchanged but a stale entry.
         agentActivitySnapshotCache = agentActivitySnapshotCache
             .filter { seenSessionIds.contains($0.key) }
+        runtimeTrackedOwners = runtimeTrackedOwners.filter { seenSessionIds.contains($0.key) }
+        reconcileRuntimeActivity(now: now)
     }
 
     /// Load a session's agent-activity snapshot, skipping the `Data(contentsOf:)`
@@ -3089,14 +3426,21 @@ final class AppModel: ObservableObject {
     /// prompt (which reads as `working`) can never clear a genuinely-active session.
     /// Includes `waiting`, so an Esc-cancel of an ask_user/permission wait — which
     /// also fires no stop hook — is caught too.
-    private func reconcileAgentFooters() {
+    func reconcileAgentFooters() {
+        reconcileRuntimeActivity(now: Date())
         var tracked: Set<String> = []
         for pi in projects.indices {
             for si in projects[pi].sessions.indices {
                 let status = projects[pi].sessions[si].status
                 let sid = projects[pi].sessions[si].id
-                guard let controller = controllers[sid] else { continue }
-                let activity = controller.agentActivity
+                let runtime = runtimeForegroundActivity(
+                    for: projects[pi].sessions[si], now: Date()
+                )
+                if runtime == .working || runtime == .idle {
+                    continue
+                }
+                guard let activity = remotePromptTarget?(sid)?.activity
+                    ?? controllers[sid]?.agentActivity else { continue }
                 let supportsSessionIdleHook = FileManager.default.fileExists(
                     atPath: Paths.sessionIdleHookMarkerPath(sessionId: sid)
                 )
@@ -3298,6 +3642,7 @@ final class AppModel: ObservableObject {
     private func clearStatusToIdle(pi: Int, si: Int, markFinished: Bool, effectiveTime: Int64? = nil) {
         let sid = projects[pi].sessions[si].id
         sessionSemantics.activityTracker.reset(sessionId: sid)
+        cancelPermissionNotification(sessionId: sid)
         projects[pi].sessions[si].status = .idle
         projects[pi].sessions[si].statusText = nil
         if markFinished, !isVisible(projectIndex: pi, sessionIndex: si) {
@@ -3799,6 +4144,10 @@ final class AppModel: ObservableObject {
                 let status = restored.status
                 let statusTimestamp = restored.statusTimestamp
                 projects[pi].sessions[si].status = status
+                if let context = restored.inputWait, let timestamp = statusTimestamp,
+                   status == .waiting {
+                    inputWaits[sid] = InputWaitState(context: context, timestamp: timestamp)
+                }
                 sessionSemantics.statusClock.seed(
                     sessionId: sid,
                     timestamp: statusTimestamp
@@ -3825,21 +4174,30 @@ final class AppModel: ObservableObject {
 
     private func restoredStatusState(
         forSession sessionId: String
-    ) -> (status: SessionStatus, statusTimestamp: Int64?, promptStatusTimestamp: Int64?) {
-        switch SessionArtifacts.loadStatusRecord(sessionId: sessionId) {
+    ) -> (
+        status: SessionStatus, statusTimestamp: Int64?,
+        promptStatusTimestamp: Int64?, inputWait: InputWaitContext?
+    ) {
+        switch SessionArtifacts.loadStatusRecord(
+            sessionId: sessionId, sessionsDirectory: agentActivityDirectory
+        ) {
         case .loaded(let record):
-            return (record.status, record.statusTimestamp, record.promptStatusTimestamp)
+            return (
+                record.status, record.statusTimestamp,
+                record.promptStatusTimestamp, record.inputWait
+            )
         case .invalid:
             // A present but unreadable atomic record must never fall back to a possibly
             // torn set of legacy files. Restore busy and put the prompt clock at app
             // startup time, so only fresh post-recovery background evidence can bypass it.
             NSLog("copilot-projects: invalid status record for \(sessionId); restoring busy")
-            return (.running, nil, SessionArtifacts.currentStatusTimestamp())
+            return (.running, nil, SessionArtifacts.currentStatusTimestamp(), nil)
         case .missing:
             return (
                 restoredLegacyStatus(forSession: sessionId),
                 restoredLegacyStatusTimestamp(forSession: sessionId),
-                restoredLegacyPromptStatusTimestamp(forSession: sessionId)
+                restoredLegacyPromptStatusTimestamp(forSession: sessionId),
+                nil
             )
         }
     }

@@ -10,6 +10,7 @@ struct Session: Identifiable, Codable, Equatable {
 
     // Transient (not persisted): reset on load.
     var status: SessionStatus = .idle
+    var statusIsRuntimeDerived = false
     var statusText: String? = nil
     var hasUnread: Bool = false
     /// The agent went active → idle while you weren't looking at this session, so it
@@ -35,6 +36,7 @@ struct Session: Identifiable, Codable, Equatable {
         (agentActivity?.trackedUserInputs?.isEmpty == false)
             || (agentActivity?.trackedElicitations?.isEmpty == false)
     }
+    var hasPendingInput: Bool { agentActivity?.hasPendingInput == true }
 
     private enum CodingKeys: String, CodingKey { case id, title, cwd }
 
