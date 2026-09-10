@@ -384,6 +384,10 @@ sender-scoped completion check before restoring status. Terminal footer checks s
 including when a draft or autopilot changes the visible shortcut hints; unknown and modal
 footers do not become permission to inject text.
 
+Confirmed input-wait resolution is persisted at the existing ordering clocks before runtime
+reconciliation clears the live wait. Notification debounce controls banner timing, not whether a
+completed wait can be saved; suppressed repeat notifications still refresh the retained clocks.
+
 Older trackers and explicitly unsupported/remote CLI runtimes retain the legacy path.
 During a mixed-version upgrade, same-conversation snapshots with all pending-input fields
 known empty can release legacy waits; missing fields or a changed conversation do not.

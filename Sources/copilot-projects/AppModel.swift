@@ -418,8 +418,8 @@ final class AppModel: ObservableObject {
         let backgroundAgentsSuppressed: Bool
         let completionPending: Bool
         let foregroundIdleGenerationBaseline: Int?
-        let statusTimestamp: Int64
-        let promptStatusTimestamp: Int64
+        var statusTimestamp: Int64
+        var promptStatusTimestamp: Int64
         var observedRootSessionId: String? = nil
         var observedConversationEpoch: String? = nil
         var observedPendingRequestIds: Set<String> = []
@@ -1798,6 +1798,7 @@ final class AppModel: ObservableObject {
         foreground: ForegroundActivity?,
         now: Date
     ) -> Bool {
+        let nowMs = Int64(now.timeIntervalSince1970 * 1_000)
         guard foreground != .unknown,
               let wait = inputWaits[session.id],
               let snapshot = session.agentActivity,
@@ -1813,10 +1814,10 @@ final class AppModel: ObservableObject {
               let observed = foreground == nil
                 ? snapshot.updatedAtMilliseconds
                 : snapshot.runtimeActivity?.observedAtMilliseconds,
-              observed > wait.timestamp else {
+              observed > wait.timestamp,
+              observed <= nowMs else {
             return false
         }
-        let nowMs = Int64(now.timeIntervalSince1970 * 1_000)
         if snapshot.runtimeActivity == nil, snapshot.inputCompletions == nil,
            snapshot.sessionIdleAtMilliseconds == nil {
             return true
@@ -1860,6 +1861,7 @@ final class AppModel: ObservableObject {
     }
 
     private func reconcileRuntimeActivity(now: Date) {
+        restoreCompletedPermissionWaits(now: now)
         var changed = false
         for pi in projects.indices {
             for si in projects[pi].sessions.indices {
@@ -1871,6 +1873,14 @@ final class AppModel: ObservableObject {
                 else { continue }
                 let status = projectedStatus(for: session, foreground: foreground, now: now)
                 if status != session.status {
+                    if session.status == .waiting, !session.statusIsRuntimeDerived,
+                       status != .waiting, permissionStatusRestores[session.id] == nil,
+                       let timestamp = sessionSemantics.statusClock.timestamp(for: session.id),
+                       let promptTimestamp = sessionSemantics.promptSafetyClock.timestamp(for: session.id) {
+                        // Certified resolution must survive restart even when no
+                        // pre-wait permission snapshot survived with it.
+                        persistPermissionStatus(session.id, status, timestamp, promptTimestamp)
+                    }
                     projects[pi].sessions[si].status = status
                     projects[pi].sessions[si].statusIsRuntimeDerived = true
                     projects[pi].sessions[si].statusText = nil
@@ -1881,7 +1891,7 @@ final class AppModel: ObservableObject {
                         completionPending.remove(session.id)
                         completionSummaryContexts[session.id] = nil
                     }
-                    if status != .waiting {
+                    if status != .waiting, permissionStatusRestores[session.id] == nil {
                         cancelPermissionNotification(sessionId: session.id)
                     }
                     changed = true
@@ -2751,6 +2761,9 @@ final class AppModel: ObservableObject {
             }
         }
         let previous = projects[loc.p].sessions[loc.s].status
+        if status == .waiting, previous == .waiting, notification == nil {
+            refreshRetainedPermissionClocks(sessionId: sessionId, previousTimestamp: previousTimestamp)
+        }
         var permissionRestoreState: (
             status: SessionStatus,
             statusText: String?,
@@ -2861,6 +2874,9 @@ final class AppModel: ObservableObject {
                 timestamp: clocks.status,
                 promptStatusTimestamp: clocks.promptSafety
             )
+            if status == .waiting, previous == .waiting, notification == nil {
+                refreshRetainedPermissionClocks(sessionId: sessionId, previousTimestamp: previousTimestamp)
+            }
         }
 
         if status == .idle {
@@ -2939,6 +2955,18 @@ final class AppModel: ObservableObject {
         )
     }
 
+    private func refreshRetainedPermissionClocks(sessionId: String, previousTimestamp: Int64?) {
+        guard var restore = permissionStatusRestores[sessionId],
+              restore.statusTimestamp == previousTimestamp,
+              let statusTimestamp = sessionSemantics.statusClock.timestamp(for: sessionId),
+              let promptTimestamp = sessionSemantics.promptSafetyClock.timestamp(for: sessionId) else {
+            return
+        }
+        restore.statusTimestamp = statusTimestamp
+        restore.promptStatusTimestamp = promptTimestamp
+        permissionStatusRestores[sessionId] = restore
+    }
+
     private func schedulePermissionNotification(
         sessionId: String,
         restore: PermissionStatusRestore
@@ -2960,11 +2988,9 @@ final class AppModel: ObservableObject {
     }
 
     private func resolvePermissionNotification(sessionId: String, token: UUID) {
-        guard permissionNotificationTokens[sessionId] == token,
-              let restore = permissionStatusRestores[sessionId] else {
-            return
-        }
+        guard permissionNotificationTokens[sessionId] == token else { return }
         permissionNotificationTokens[sessionId] = nil
+        guard let restore = permissionStatusRestores[sessionId] else { return }
         guard let loc = locateIndex(sessionId) else { return }
 
         let fm = FileManager.default
@@ -3027,15 +3053,15 @@ final class AppModel: ObservableObject {
 
     private func restoreCompletedPermissionWaits(now: Date) {
         for (sessionId, restore) in permissionStatusRestores {
-            guard permissionNotificationTokens[sessionId] == nil,
-                  restore.status != .waiting,
-                  let loc = locateIndex(sessionId),
+            guard let loc = locateIndex(sessionId),
                   projects[loc.p].sessions[loc.s].status == .waiting,
                   sessionSemantics.statusClock.timestamp(for: sessionId) == restore.statusTimestamp else {
                 continue
             }
             if inputWaits[sessionId] == nil {
-                guard !restore.observedPendingRequestIds.isEmpty,
+                guard permissionNotificationTokens[sessionId] == nil,
+                      restore.status != .waiting,
+                      !restore.observedPendingRequestIds.isEmpty,
                       let snapshot = projects[loc.p].sessions[loc.s].agentActivity,
                       snapshot.isFresh(at: now),
                       snapshot.copilotSessionId?.lowercased() == restore.observedRootSessionId?.lowercased(),
@@ -3066,14 +3092,20 @@ final class AppModel: ObservableObject {
             return
         }
         var session = projects[location.p].sessions[location.s]
+        let foreground = runtimeForegroundActivity(for: session, now: now)
         if inputWaits[sessionId] != nil {
             guard inputWaitWasResolved(
                 for: session,
-                foreground: runtimeForegroundActivity(for: session, now: now),
+                foreground: foreground,
                 now: now
             ) else { return }
         }
-        session.status = restore.status
+        let restoredStatus = restore.status == .waiting
+            ? projectedStatus(for: session, foreground: foreground, now: now)
+            : restore.status
+        guard restoredStatus != .waiting else { return }
+        session.status = restoredStatus
+        session.statusIsRuntimeDerived = restore.status == .waiting
         session.statusText = restore.statusText
         session.scheduledTurnActive = restore.scheduledTurnActive
         session.finishedUnseen = restore.finishedUnseen
@@ -3106,15 +3138,15 @@ final class AppModel: ObservableObject {
         )
         persistPermissionStatus(
             sessionId,
-            restore.status,
+            restoredStatus,
             restore.statusTimestamp,
             restore.promptStatusTimestamp
         )
+        cancelPermissionNotification(sessionId: sessionId)
         updateDockBadge()
         if restore.completionPending {
             postCompletionIfReady(sessionId: sessionId)
         }
-        permissionStatusRestores[sessionId] = nil
     }
 
     /// Scheduled pre/post hooks reaffirm background activity but do not describe
@@ -3315,7 +3347,6 @@ final class AppModel: ObservableObject {
         agentActivitySnapshotCache = agentActivitySnapshotCache
             .filter { seenSessionIds.contains($0.key) }
         runtimeTrackedOwners = runtimeTrackedOwners.filter { seenSessionIds.contains($0.key) }
-        restoreCompletedPermissionWaits(now: now)
         reconcileRuntimeActivity(now: now)
     }
 

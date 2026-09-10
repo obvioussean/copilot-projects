@@ -49,14 +49,18 @@ final class ForegroundActivityTests: XCTestCase {
                 projects: [Project(name: "activity", cwd: root.path, sessions: [session])],
                 selectedProjectId: nil))
             let sid = session.id
+            let sessionsDirectory = directory
             model = AppModel(
                 stateRepository: repository,
                 permissionNotificationDelayNanoseconds: permissionDelayNanoseconds,
-                persistPermissionStatus: { _, status, timestamp, promptTimestamp in
+                persistPermissionStatus: { sessionId, status, timestamp, promptTimestamp in
                     sends.permissionRestores.append(
                         SessionStatusRecord(
                             status: status, statusTimestamp: timestamp,
                             promptStatusTimestamp: promptTimestamp))
+                    XCTAssertTrue(SessionArtifacts.persistStatus(
+                        sessionId: sessionId, status: status, timestamp: timestamp,
+                        promptStatusTimestamp: promptTimestamp, sessionsDirectory: sessionsDirectory))
                 },
                 isAppActive: { false },
                 agentActivityDirectory: directory,
@@ -345,9 +349,142 @@ final class ForegroundActivityTests: XCTestCase {
     @MainActor
     private final class PermissionNotificationSpy: NotificationPosting {
         var onPost: (() -> Void)?
+        var permissionCount = 0
 
         func post(_ event: NotificationEvent) {
-            if event.kind == .permission { onPost?() }
+            if event.kind == .permission {
+                permissionCount += 1
+                onPost?()
+            }
+        }
+    }
+
+    @MainActor
+    func testBlankRepeatedPermissionHookRefreshesPersistenceWithoutAnotherBanner() async throws {
+        let hook = try BackgroundHookTests.Fixture()
+        let fixture = try Fixture(
+            root: hook.root, sessionId: hook.tabId, owner: hook.ownerId,
+            permissionDelayNanoseconds: 5_000_000)
+        defer { fixture.cleanup() }
+        let child = hook.childId
+        let waitAt = fixture.baseMs + 100
+        var snapshot = fixture.snapshot()
+        snapshot.pendingPermissionRequestIds = ["permission"]
+        snapshot.updatedAt = Date().formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true))
+        snapshot.runtimeActivity?.observedAtMilliseconds = waitAt + 300
+        try fixture.publish(snapshot)
+        let notifications = PermissionNotificationSpy()
+        let posted = expectation(description: "first permission banner")
+        notifications.onPost = { posted.fulfill() }
+        fixture.model.attach(notifications: notifications)
+        try hook.run("notify", payload:
+            #"{"sessionId":"\#(child)","timestamp":\#(waitAt),"notificationType":"permission_prompt"}"#)
+        fixture.model.setStatus(
+            sessionId: fixture.session.id, status: .waiting, text: nil,
+            timestamp: waitAt, copilotSessionId: child, notification: .permission)
+        await fulfillment(of: [posted], timeout: 1)
+        notifications.onPost = nil
+
+        try hook.run("notify", payload:
+            #"{"sessionId":"\#(child)","timestamp":\#(waitAt + 10),"notificationType":"permission_prompt"}"#)
+        let repeatedIPC = try XCTUnwrap(
+            String(contentsOf: hook.capture, encoding: .utf8).split(separator: "\n").last)
+        XCTAssertFalse(repeatedIPC.contains("--notification"))
+        fixture.model.setStatus(
+            sessionId: fixture.session.id, status: .waiting, text: nil,
+            timestamp: waitAt + 10, copilotSessionId: child)
+        snapshot.pendingPermissionRequestIds = []
+        snapshot.inputCompletions = [child: waitAt + 100]
+        try fixture.publish(snapshot)
+        let persisted = try JSONDecoder().decode(
+            SessionStatusRecord.self,
+            from: Data(contentsOf: hook.file("status-record.json")))
+        XCTAssertEqual(persisted.status, .idle)
+        XCTAssertEqual(persisted.statusTimestamp, waitAt + 10)
+        XCTAssertEqual(persisted.promptStatusTimestamp, waitAt + 10)
+        XCTAssertEqual(fixture.sends.permissionRestores.count, 1)
+        XCTAssertEqual(notifications.permissionCount, 1)
+    }
+
+    @MainActor
+    func testCompletionBeforeNotificationDelayPersistsAndAllowsAnotherWait() async throws {
+        let fixture = try Fixture(permissionDelayNanoseconds: 200_000_000)
+        defer { fixture.cleanup() }
+        let child = UUID().uuidString.lowercased()
+        let waitAt = fixture.baseMs + 100
+        var snapshot = fixture.snapshot()
+        snapshot.pendingPermissionRequestIds = ["first"]
+        snapshot.runtimeActivity?.observedAtMilliseconds = waitAt + 300
+        try fixture.publish(snapshot)
+        try fixture.beginWait(sender: child, timestamp: waitAt)
+        snapshot.pendingPermissionRequestIds = []
+        snapshot.inputCompletions = [child: waitAt + 100]
+        try fixture.publish(snapshot)
+        let recordURL = fixture.directory.appendingPathComponent("\(fixture.session.id).status-record.json")
+        var persisted = try JSONDecoder().decode(SessionStatusRecord.self, from: Data(contentsOf: recordURL))
+        XCTAssertEqual(persisted.status, .idle)
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .idle)
+        XCTAssertEqual(fixture.sends.permissionRestores.count, 1)
+
+        snapshot.pendingPermissionRequestIds = ["second"]
+        try fixture.publish(snapshot)
+        try fixture.beginWait(sender: child, timestamp: waitAt + 200)
+        snapshot.pendingPermissionRequestIds = []
+        snapshot.inputCompletions = [child: waitAt + 250]
+        try fixture.publish(snapshot)
+        persisted = try JSONDecoder().decode(SessionStatusRecord.self, from: Data(contentsOf: recordURL))
+        XCTAssertEqual(persisted.status, .idle)
+        XCTAssertEqual(persisted.statusTimestamp, waitAt + 200)
+        XCTAssertEqual(fixture.sends.permissionRestores.count, 2)
+        try await Task.sleep(nanoseconds: 250_000_000)
+        XCTAssertEqual(fixture.sends.permissionRestores.count, 2)
+    }
+
+    @MainActor
+    func testEarlyPermissionCompletionPersistsStillWorkingCoordinator() throws {
+        let fixture = try Fixture(permissionDelayNanoseconds: 200_000_000)
+        defer { fixture.cleanup() }
+        let child = UUID().uuidString.lowercased()
+        let waitAt = fixture.baseMs + 100
+        var snapshot = fixture.snapshot(processing: true)
+        snapshot.pendingPermissionRequestIds = ["permission"]
+        snapshot.runtimeActivity?.observedAtMilliseconds = waitAt + 200
+        try fixture.publish(snapshot)
+        try fixture.beginWait(sender: child, timestamp: waitAt)
+        snapshot.pendingPermissionRequestIds = []
+        snapshot.inputCompletions = [child: waitAt + 100]
+        try fixture.publish(snapshot)
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .running)
+        XCTAssertTrue(fixture.model.projects[0].sessions[0].statusIsRuntimeDerived)
+        XCTAssertEqual(fixture.sends.permissionRestores, [
+            SessionStatusRecord(status: .running, statusTimestamp: waitAt, promptStatusTimestamp: waitAt)
+        ])
+        XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "blocked"), .busy)
+    }
+
+    @MainActor
+    func testFutureLegacyOrUnsupportedObservationCannotReleaseWait() throws {
+        for unsupported in [false, true] {
+            let fixture = try Fixture()
+            defer { fixture.cleanup() }
+            let child = UUID().uuidString.lowercased()
+            let waitAt = fixture.baseMs + 100
+            var snapshot = fixture.snapshot()
+            if unsupported {
+                snapshot.runtimeActivity?.error = "unsupported"
+            } else {
+                snapshot.runtimeActivity = nil
+                snapshot.inputCompletions = nil
+            }
+            try fixture.publish(snapshot)
+            try fixture.beginWait(sender: child, timestamp: waitAt, kind: .elicitation)
+            snapshot.updatedAt = Date().addingTimeInterval(60)
+                .formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true))
+            if unsupported { snapshot.inputCompletions = [child: waitAt + 10] }
+            try fixture.publish(snapshot)
+            XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .waiting)
+            XCTAssertEqual(fixture.model.sendRemotePrompt(
+                sessionId: fixture.session.id, value: "must stay blocked"), .busy)
         }
     }
 
@@ -484,12 +621,24 @@ final class ForegroundActivityTests: XCTestCase {
         snapshot.runtimeActivity?.observedAtMilliseconds = waitAt + 200
         let restarted = AppModel(
             stateRepository: fixture.repository,
+            persistPermissionStatus: { sessionId, status, timestamp, promptTimestamp in
+                XCTAssertTrue(SessionArtifacts.persistStatus(
+                    sessionId: sessionId, status: status, timestamp: timestamp,
+                    promptStatusTimestamp: promptTimestamp,
+                    sessionsDirectory: fixture.directory))
+            },
             isAppActive: { false },
             agentActivityDirectory: fixture.directory,
             resumeMarkerDirectory: fixture.directory)
         XCTAssertEqual(restarted.projects[0].sessions[0].status, .waiting)
         try fixture.publish(snapshot, to: restarted)
         XCTAssertEqual(restarted.projects[0].sessions[0].status, .idle)
+        let record = try JSONDecoder().decode(
+            SessionStatusRecord.self,
+            from: Data(contentsOf: fixture.directory
+                .appendingPathComponent("\(fixture.session.id).status-record.json")))
+        XCTAssertEqual(record.status, .idle)
+        XCTAssertEqual(record.statusTimestamp, waitAt)
     }
 
     @MainActor

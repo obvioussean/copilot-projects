@@ -107,7 +107,8 @@ struct AgentActivitySnapshot: Codable, Equatable {
     func isFresh(at now: Date = Date(), ttl: TimeInterval = 15) -> Bool {
         guard schemaVersion == Self.currentSchemaVersion,
               let updated = AgentTimestamp.parse(updatedAt) else { return false }
-        return now.timeIntervalSince(updated) <= ttl
+        let age = now.timeIntervalSince(updated)
+        return age >= 0 && age <= ttl
     }
 
     /// True when the last heartbeat carried a terminal RPC-connection error
