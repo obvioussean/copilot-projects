@@ -375,6 +375,8 @@ and background activity. The tracker observes the local coordinator's processing
 SDK, fenced to its current conversation and to the query's start time. Root `assistant.idle`
 refreshes that observation; an individual model iteration's `assistant.turn_end` is not proof
 the coordinator finished. Background agents do not make an idle coordinator busy.
+Permission completions delivered during tracker startup retain their sender certificate even
+when SDK history includes the same events; historical-only completions do not create certificates.
 
 The host uses fresh runtime observations for status and prompt eligibility without rewriting
 ordering clocks to heartbeat time. Input waits are released only by matching, same-conversation

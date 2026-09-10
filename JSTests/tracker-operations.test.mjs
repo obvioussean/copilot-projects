@@ -527,6 +527,64 @@ test("only observed input completions certify the matching sender", {
   assert.equal(readSnapshot(runtime).inputCompletions[runtime.copilotSessionId], undefined);
 });
 
+for (const sender of ["root", "child"]) {
+  for (const historyMode of ["none", "overlap", "historical request"]) {
+    test(`startup permission completion certifies ${sender} with ${historyMode} history`, {
+      concurrency: false,
+    }, async (t) => {
+      let owner;
+      let completed;
+      const runtime = await createRuntime(t, (session) => {
+        owner = sender === "root" ? session.sessionId : uuid();
+        const extra = sender === "root" ? {} : { agentId: owner };
+        const requested = {
+          id: uuid(), type: "permission.requested",
+          timestamp: new Date().toISOString(),
+          data: { requestId: "startup" }, ...extra,
+        };
+        completed = {
+          ...requested, id: uuid(), type: "permission.completed",
+        };
+        session.getEvents = async () => {
+          if (historyMode !== "historical request") {
+            await session.emit(requested.type, requested.data, requested);
+          }
+          await session.emit(completed.type, completed.data, completed);
+          return historyMode === "none" ? [] : [requested, completed];
+        };
+      });
+      await waitForActivity(runtime, (activity) => activity?.processing === false);
+      const snapshot = readSnapshot(runtime);
+      assert.deepEqual(snapshot.pendingPermissionRequestIds, []);
+      assert.deepEqual(snapshot.inputCompletions, {
+        [owner]: Date.parse(completed.timestamp),
+      });
+      await runtime.session.emit(completed.type, completed.data, {
+        ...completed, timestamp: new Date(Date.parse(completed.timestamp) + 10).toISOString(),
+      });
+      assert.deepEqual(readSnapshot(runtime).inputCompletions, snapshot.inputCompletions);
+    });
+  }
+}
+
+test("historical-only and unowned startup permission completions do not certify a sender", {
+  concurrency: false,
+}, async (t) => {
+  const child = uuid();
+  const runtime = await createRuntime(t, (session) => {
+    const requested = {
+      id: uuid(), type: "permission.requested", agentId: child,
+      timestamp: new Date().toISOString(), data: { requestId: "historical" },
+    };
+    session.getEvents = async () => {
+      await session.emit("permission.completed", { requestId: "unseen" }, { agentId: child });
+      return [requested, { ...requested, id: uuid(), type: "permission.completed" }];
+    };
+  });
+  assert.deepEqual(readSnapshot(runtime).pendingPermissionRequestIds, []);
+  assert.deepEqual(readSnapshot(runtime).inputCompletions, {});
+});
+
 test("conversation rotation drops old input completion certificates", {
   concurrency: false,
 }, async (t) => {

@@ -148,7 +148,7 @@ if (validSessionId && socketPath) {
     // permission events, or this extension would take prompt ownership away
     // from the CLI's terminal UI.
     const pendingPermissionRequests = new Map();
-    const completedPermissionRequestIds = new Set();
+    const completedPermissionRequests = new Map();
     const inputCompletions = new Map();
     let terminalDisconnectError = null;
     let foregroundTurnActive = false;
@@ -2339,9 +2339,9 @@ if (validSessionId && socketPath) {
     }
 
     function boundCompletedPermissionIds() {
-        while (completedPermissionRequestIds.size > 128) {
-            completedPermissionRequestIds.delete(
-                completedPermissionRequestIds.values().next().value
+        while (completedPermissionRequests.size > 128) {
+            completedPermissionRequests.delete(
+                completedPermissionRequests.keys().next().value
             );
         }
     }
@@ -2359,18 +2359,23 @@ if (validSessionId && socketPath) {
         if (typeof requestId !== "string" || requestId.length === 0) return;
         let changed = false;
         if (event.type === "permission.requested") {
-            if (!completedPermissionRequestIds.has(requestId)
+            if (!completedPermissionRequests.has(requestId)
                     && !pendingPermissionRequests.has(requestId)
                     && pendingPermissionRequests.size < 64) {
                 pendingPermissionRequests.set(requestId, event.agentId || copilotSessionId);
                 changed = true;
             }
         } else if (event.type === "permission.completed") {
-            completedPermissionRequestIds.add(requestId);
+            const completed = completedPermissionRequests.get(requestId);
+            const owner = pendingPermissionRequests.get(requestId) ?? completed?.owner;
+            const certify = live && !completed?.certified && owner !== undefined;
+            completedPermissionRequests.set(requestId, {
+                owner,
+                certified: completed?.certified === true || certify,
+            });
             boundCompletedPermissionIds();
-            const owner = pendingPermissionRequests.get(requestId);
-            changed = pendingPermissionRequests.delete(requestId);
-            if (live && changed) recordInputCompletion(owner, event);
+            changed = pendingPermissionRequests.delete(requestId) || certify;
+            if (certify) recordInputCompletion(owner, event);
         }
         if (live && changed) publish();
     }
@@ -3001,11 +3006,13 @@ if (validSessionId && socketPath) {
         }
         transcriptInitialized = true;
         for (const event of queuedTranscriptEvents) {
+            // These were delivered live while history loaded. History can
+            // overlap them, but must not consume their one sender certificate.
+            applyPermissionEvent(event, true);
             if (durableTranscriptAuthoritative) {
-                applyPermissionEvent(event, false);
                 applyModelFromEvent(event);
             } else {
-                replayHistoryEvent(event, true);
+                replayHistoryEvent(event, false);
             }
         }
         queuedTranscriptEvents.length = 0;
@@ -3034,7 +3041,7 @@ if (validSessionId && socketPath) {
         pendingElicitations.clear();
         inFlightElicitationResponses.clear();
         pendingPermissionRequests.clear();
-        completedPermissionRequestIds.clear();
+        completedPermissionRequests.clear();
         inputCompletions.clear();
         runtimeActivityUnsupported = false;
         invalidateRuntimeActivity();
