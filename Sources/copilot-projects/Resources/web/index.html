@@ -30,7 +30,17 @@
     </span>
   </header>
   <main>
-    <nav id="sessions"></nav>
+    <aside id="session-sidebar" aria-label="Sessions">
+      <div id="attention-summary" tabindex="-1">
+        <div id="attention-status" role="status" aria-live="polite" aria-atomic="true">
+          <strong id="attention-count">Needs attention</strong>
+          <span id="attention-detail">Waiting for sessions</span>
+        </div>
+        <button id="attention-next" type="button" disabled
+          aria-label="Go to next session needing attention">Next &#8594;</button>
+      </div>
+      <nav id="sessions" aria-label="Projects and sessions"></nav>
+    </aside>
     <div id="content" data-mode="conversation">
       <div id="pivot">
         <div id="pivot-tabs" role="tablist" aria-label="Session view">
@@ -44,6 +54,17 @@
         <button id="notifications" aria-label="Enable web notifications"
           title="Enable web notifications">🔔</button>
       </div>
+      <section id="session-attention" aria-label="Selected session attention" hidden>
+        <div class="session-attention-copy">
+          <strong id="session-attention-title"></strong>
+          <span id="session-attention-detail"></span>
+          <span id="attention-read-status" role="status" aria-live="polite"></span>
+        </div>
+        <div class="session-attention-actions">
+          <button id="attention-open" type="button">View activity</button>
+          <button id="attention-mark-read" type="button" hidden>Mark seen</button>
+        </div>
+      </section>
       <aside id="transcript-pane" role="tabpanel" aria-label="Conversation">
         <div id="transcript-header">
           <strong>Completed turns</strong>
@@ -51,7 +72,7 @@
             Select a Copilot session
           </span>
         </div>
-        <div id="transcript" aria-live="polite">Select a session</div>
+        <div id="transcript" aria-live="polite" tabindex="-1">Select a session</div>
         <div id="user-input" role="group" aria-label="Copilot questions"></div>
         <div id="prompt-queue" role="list" aria-label="Queued messages" hidden></div>
         <form id="prompt-form">

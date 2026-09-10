@@ -1,4 +1,14 @@
 const sessions = document.querySelector('#sessions');
+const attentionSummary = document.querySelector('#attention-summary');
+const attentionCount = document.querySelector('#attention-count');
+const attentionDetail = document.querySelector('#attention-detail');
+const attentionNext = document.querySelector('#attention-next');
+const sessionAttentionBanner = document.querySelector('#session-attention');
+const sessionAttentionTitle = document.querySelector('#session-attention-title');
+const sessionAttentionDetail = document.querySelector('#session-attention-detail');
+const attentionOpen = document.querySelector('#attention-open');
+const attentionMarkRead = document.querySelector('#attention-mark-read');
+const attentionReadStatus = document.querySelector('#attention-read-status');
 const terminal = document.querySelector('#terminal');
 const terminalLines = document.querySelector('#terminal-lines');
 const terminalImageOverlay = document.querySelector('#terminal-image-overlay');
@@ -516,7 +526,11 @@ function selectSession(id) {
   terminal.classList.remove('terminal-scroll');
   document.querySelectorAll('nav button').forEach((button) => {
     button.classList.toggle('active', button.dataset.id === id);
+    button.setAttribute('aria-current', String(button.dataset.id === id));
   });
+  attentionReadStatus.textContent = '';
+  attentionMarkRead.disabled = false;
+  renderSelectedAttention();
   openStream();
   acquire(id);
   if (viewMode === 'terminal') terminal.focus();
@@ -1355,6 +1369,154 @@ function updateSelectedConversationEpoch() {
   }
   if (nextEpoch) selectedConversationEpoch = nextEpoch;
 }
+
+// Attention describes unseen work or a request for input, not promptability.
+function sessionAttention(session) {
+  if (!session) return null;
+  if ((session.pendingUserInputs || []).length || (session.pendingElicitations || []).length) {
+    return { kind: 'waiting', label: 'Needs input', mode: 'conversation' };
+  }
+  if (session.status === 'waiting') {
+    return { kind: 'waiting', label: 'Needs input', mode: 'terminal' };
+  }
+  if (session.status === 'idle' && session.ready) {
+    return { kind: 'ready', label: 'Ready to review', mode: 'conversation' };
+  }
+  if (session.unread) {
+    return { kind: 'unread', label: 'Unread activity', mode: 'conversation' };
+  }
+  return null;
+}
+function attentionSessions() {
+  return [...sessionState.values()].filter((session) => sessionAttention(session))
+    .sort((a, b) => Number(sessionAttention(b).kind === 'waiting')
+      - Number(sessionAttention(a).kind === 'waiting'));
+}
+function focusSessionNavigation() {
+  (sessions.querySelector('button[aria-current="true"]') || attentionSummary)
+    .focus({ preventScroll: true });
+}
+function renderAttentionSummary() {
+  const pending = attentionSessions();
+  const waiting = pending.filter((session) => sessionAttention(session).kind === 'waiting').length;
+  const unseen = pending.length - waiting;
+  const count = pending.length ? `Needs attention (${pending.length})` : 'All caught up';
+  const detail = [
+    waiting ? `${waiting} waiting for input` : '',
+    unseen ? `${unseen} with unseen activity` : ''
+  ].filter(Boolean).join(' \u00b7 ') || 'No sessions need attention';
+  // Keep this live region stable; unrelated snapshots should not reannounce it.
+  if (attentionCount.textContent !== count) attentionCount.textContent = count;
+  if (attentionDetail.textContent !== detail) attentionDetail.textContent = detail;
+  attentionSummary.dataset.attention = waiting ? 'waiting' : unseen ? 'unseen' : 'none';
+  if (!pending.length && document.activeElement === attentionNext) focusSessionNavigation();
+  attentionNext.disabled = !pending.length;
+  document.title = pending.length ? `(${pending.length}) Copilot Projects` : 'Copilot Projects';
+}
+function renderSelectedAttention() {
+  const attention = sessionAttention(sessionState.get(selected));
+  if ((!attention && sessionAttentionBanner.contains(document.activeElement))
+      || (attention?.kind === 'waiting' && document.activeElement === attentionMarkRead)) {
+    focusSessionNavigation();
+  }
+  if (!attention || attention.kind === 'waiting'
+      || sessionAttentionBanner.dataset.attention !== attention.kind) {
+    attentionReadStatus.textContent = '';
+  }
+  sessionAttentionBanner.hidden = !attention;
+  if (!attention) return;
+  sessionAttentionBanner.dataset.attention = attention.kind;
+  sessionAttentionTitle.textContent = attention.label;
+  sessionAttentionDetail.textContent = attention.kind === 'waiting'
+    ? attention.mode === 'terminal'
+      ? 'Copilot is waiting for a response in the terminal.'
+      : 'Copilot has a question for you in Conversation.'
+    : attention.kind === 'ready'
+      ? 'Work finished while you were away.'
+      : 'This session has an unseen notification.';
+  attentionOpen.textContent = attention.kind === 'waiting'
+    ? attention.mode === 'terminal' ? 'Open terminal' : 'View question'
+    : 'View activity';
+  attentionMarkRead.hidden = attention.kind === 'waiting';
+}
+function openSelectedAttention() {
+  const attention = sessionAttention(sessionState.get(selected));
+  if (!attention) return;
+  setViewMode(attention.mode);
+  if (attention.kind === 'waiting' && attention.mode === 'conversation') {
+    userInput.scrollTop = 0;
+    userInput.querySelector('button:enabled, input:enabled, textarea:enabled, select:enabled, a')
+      ?.focus();
+  } else if (attention.mode === 'conversation') {
+    transcript.focus();
+  }
+}
+function selectNextAttention() {
+  const pending = attentionSessions();
+  if (!pending.length) return;
+  const index = pending.findIndex((session) => session.id === selected);
+  const next = pending[(index + 1) % pending.length];
+  if (selected !== next.id) selectSession(next.id);
+  const button = sessions.querySelector(`button[data-id="${CSS.escape(next.id)}"]`);
+  button?.scrollIntoView({ block: 'nearest' });
+  button?.focus({ preventScroll: true });
+}
+async function markSelectedAttentionRead() {
+  const id = selected;
+  const generation = selectionGeneration;
+  const attention = sessionAttention(sessionState.get(id));
+  if (!attention || attention.kind === 'waiting' || attentionMarkRead.disabled) return;
+  if (document.activeElement === attentionMarkRead) focusSessionNavigation();
+  attentionMarkRead.disabled = true;
+  attentionReadStatus.textContent = 'Marking seen...';
+  const response = await control({ type: 'mark-read', sessionId: id });
+  if (selected !== id || selectionGeneration !== generation) return;
+  attentionMarkRead.disabled = false;
+  const current = sessionAttention(sessionState.get(id));
+  if (!current || current.kind === 'waiting' || current.kind !== attention.kind) {
+    attentionReadStatus.textContent = '';
+    return;
+  }
+  // Acknowledgement is shared with the Mac; only a host snapshot clears the badges.
+  attentionReadStatus.textContent = response?.ok
+    ? 'Marked seen. Waiting for the host update.'
+    : 'Could not mark seen. Try again.';
+}
+function renderSessionButton(session, active) {
+  const attention = sessionAttention(session);
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.dataset.id = session.id;
+  button.dataset.attention = attention?.kind || 'none';
+  button.className = session.id === active ? 'active' : '';
+  button.setAttribute('aria-current', String(session.id === active));
+  if (attention) {
+    const icon = document.createElement('span');
+    icon.className = 'session-attention-icon';
+    icon.setAttribute('aria-hidden', 'true');
+    icon.textContent = attention.kind === 'waiting' ? '!' : '\u2022';
+    button.append(icon);
+  }
+  const title = document.createElement('span');
+  title.className = 'session-name';
+  title.textContent = session.title;
+  button.append(title);
+  const detail = document.createElement('small');
+  detail.textContent = attention?.label || session.status;
+  button.append(detail);
+  const states = [];
+  if (attention && session.status === 'running') states.push('running');
+  if (session.background) states.push('background');
+  if (session.scheduled) states.push('scheduled');
+  if (states.length) {
+    const work = document.createElement('span');
+    work.className = 'session-work';
+    work.textContent = states.join(' \u00b7 ');
+    detail.append(document.createElement('br'), work);
+  }
+  button.onclick = () => selectSession(session.id);
+  return button;
+}
 function renderWorkspace(data) {
   const active = selected;
   const activeWasPresent = !!active && sessionState.has(active);
@@ -1362,29 +1524,41 @@ function renderWorkspace(data) {
   const nextProjectId = data.selectedProjectId || null;
   hostSelectedProjectId = nextProjectId;
   syncCreateProjectOptions(data.projects, hostSelectedProjectId);
+  const focusedSessionId = sessions.contains(document.activeElement)
+    ? document.activeElement.dataset.id : null;
   sessionState.clear();
   sessions.replaceChildren();
   data.projects.forEach((project) => {
     const heading = document.createElement('h3');
-    heading.textContent = project.name;
+    const name = document.createElement('span');
+    name.className = 'project-name';
+    name.textContent = project.name;
+    heading.append(name);
+    const pending = project.sessions.map(sessionAttention).filter(Boolean);
+    if (pending.length) {
+      const count = document.createElement('span');
+      count.className = 'project-attention-count';
+      count.dataset.attention = pending.some((attention) => attention.kind === 'waiting')
+        ? 'waiting' : 'unseen';
+      count.textContent = String(pending.length);
+      count.setAttribute('role', 'img');
+      count.setAttribute('aria-label', pending.length === 1
+        ? '1 session needs attention' : `${pending.length} sessions need attention`);
+      heading.append(count);
+    }
     sessions.append(heading);
     project.sessions.forEach((session) => {
       sessionState.set(session.id, session);
-      const button = document.createElement('button');
-      button.dataset.id = session.id;
-      button.className = session.id === active ? 'active' : '';
-      button.textContent = session.title;
-      const detail = document.createElement('small');
-      const states = [session.status];
-      if (session.background) states.push('background');
-      if (session.scheduled) states.push('scheduled');
-      if (session.unread) states.push('unread');
-      detail.textContent = states.join(' · ');
-      button.append(detail);
-      button.onclick = () => selectSession(session.id);
-      sessions.append(button);
+      sessions.append(renderSessionButton(session, active));
     });
   });
+  renderAttentionSummary();
+  renderSelectedAttention();
+  if (focusedSessionId) {
+    const focused = sessions.querySelector(`button[data-id="${CSS.escape(focusedSessionId)}"]`);
+    if (focused) focused.focus({ preventScroll: true });
+    else focusSessionNavigation();
+  }
   if (activeWasPresent && !sessionState.has(active)) {
     invalidateConversationOperations();
     selectedConversationEpoch = null;
@@ -3669,6 +3843,9 @@ document.querySelector('#pivot-tabs').addEventListener('keydown', (event) => {
 });
 newSessionButton.onclick = () => { createSession(); };
 closeSessionButton.onclick = () => { closeCurrentSession(); };
+attentionNext.onclick = selectNextAttention;
+attentionOpen.onclick = openSelectedAttention;
+attentionMarkRead.onclick = markSelectedAttentionRead;
 newSessionProject.onchange = () => {
   const nextProjectId = newSessionProject.value || null;
   if (createTargetProjectId === nextProjectId) return;
