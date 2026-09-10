@@ -758,10 +758,15 @@ final class ProjectsTerminalView: LocalProcessTerminalView {
 
         // Accumulate fractional/precise deltas so a single trackpad flick (dozens
         // of tiny events) doesn't fire dozens of steps. Positive = up.
-        let cellH = bounds.height > 0 ? bounds.height / CGFloat(max(state.dimensions.rows, 1)) : 18
-        let lines = event.hasPreciseScrollingDeltas
-            ? event.scrollingDeltaY / max(cellH, 1)
-            : event.scrollingDeltaY
+        let lines: CGFloat
+        if event.hasPreciseScrollingDeltas {
+            let cellH = bounds.height > 0
+                ? getOptimalFrameSize().height / CGFloat(max(state.dimensions.rows, 1))
+                : 18
+            lines = event.scrollingDeltaY / max(cellH, 1)
+        } else {
+            lines = event.scrollingDeltaY
+        }
         guard lines != 0 else { return false }
 
         if (lines > 0) != (scrollAccum > 0) { scrollAccum = 0 }
@@ -831,8 +836,11 @@ final class ProjectsTerminalView: LocalProcessTerminalView {
         guard dimensions.cols > 0, dimensions.rows > 0,
               bounds.width > 0, bounds.height > 0 else { return (0, 0) }
         let p = convert(event.locationInWindow, from: nil)
-        let cellW = bounds.width / CGFloat(dimensions.cols)
-        let cellH = bounds.height / CGFloat(dimensions.rows)
+        // With our overlay scroller, the optimal frame is exactly the rendered
+        // grid, excluding the partial-cell space at the view's right and bottom.
+        let renderedFrame = getOptimalFrameSize()
+        let cellW = renderedFrame.width / CGFloat(dimensions.cols)
+        let cellH = renderedFrame.height / CGFloat(dimensions.rows)
         let col = min(max(0, Int(p.x / max(cellW, 1))), dimensions.cols - 1)
         let row = min(max(0, Int((bounds.height - p.y) / max(cellH, 1))), dimensions.rows - 1)
         return (col, row)
