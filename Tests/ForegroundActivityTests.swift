@@ -1,0 +1,446 @@
+import XCTest
+import AppKit
+import CopilotProjectsCore
+import Combine
+@testable import copilot_projects
+
+final class ForegroundActivityTests: XCTestCase {
+    @MainActor
+    private final class Fixture {
+        final class Sends {
+            var count = 0
+            var succeeds = true
+        }
+
+        let root: URL
+        let directory: URL
+        let owner: String
+        let epoch = "\(UUID().uuidString.lowercased()):0"
+        let session: Session
+        let repository: StateRepository
+        let model: AppModel
+        let sends: Sends
+        let base = Date().addingTimeInterval(-1)
+
+        var baseMs: Int64 { Int64(base.timeIntervalSince1970 * 1_000) }
+        var snapshotURL: URL {
+            directory.appendingPathComponent("\(session.id).agent-activity.json")
+        }
+
+        init(root: URL? = nil, sessionId: String? = nil, owner: String? = nil) throws {
+            _ = NSApplication.shared
+            let root = root ?? FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            self.root = root
+            directory = root.appendingPathComponent("sessions", isDirectory: true)
+            self.owner = owner ?? UUID().uuidString.lowercased()
+            session = Session(id: sessionId ?? UUID().uuidString, title: "activity", cwd: root.path)
+            repository = StateRepository(path: root.appendingPathComponent("state.json"))
+            let sends = Sends()
+            self.sends = sends
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try Data(self.owner.utf8).write(
+                to: directory.appendingPathComponent("\(session.id).copilot-session"))
+            try repository.save(PersistedState(
+                projects: [Project(name: "activity", cwd: root.path, sessions: [session])],
+                selectedProjectId: nil))
+            let sid = session.id
+            model = AppModel(
+                stateRepository: repository,
+                persistPermissionStatus: { _, _, _, _ in },
+                isAppActive: { false },
+                agentActivityDirectory: directory,
+                resumeMarkerDirectory: directory,
+                remotePromptLiveSessions: { _ in [sid] },
+                remotePromptTarget: { _ in
+                    RemotePromptTarget(activity: .idle, send: { _ in
+                        sends.count += 1
+                        return sends.succeeds
+                    })
+                }
+            )
+        }
+
+        func snapshot(processing: Bool = false, background: Bool = true) -> AgentActivitySnapshot {
+            AgentActivitySnapshot(
+                schemaVersion: 1,
+                updatedAt: base.formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true)),
+                foregroundTurnActive: processing,
+                foregroundTransitionAt: base.formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true)),
+                scheduledTurnActive: false,
+                activeSubagents: background
+                    ? [TrackedSubagent(id: session.id, name: "worker", description: "", model: nil)]
+                    : [],
+                schedules: [],
+                idleGeneration: 1, lastIdleAborted: false, lastIdleTurnKind: nil, error: nil,
+                trackedUserInputs: [], trackedElicitations: [], pendingPermissionRequestIds: [],
+                copilotSessionId: owner, conversationEpoch: epoch,
+                runtimeActivity: RuntimeActivitySnapshot(
+                    processing: processing,
+                    observedAtMilliseconds: baseMs, idleAtMilliseconds: nil, error: nil),
+                inputCompletions: [:]
+            )
+        }
+
+        func publish(_ snapshot: AgentActivitySnapshot, to target: AppModel? = nil) throws {
+            try JSONEncoder().encode(snapshot).write(to: snapshotURL, options: .atomic)
+            (target ?? model).refreshAgentActivitySnapshots()
+        }
+
+        func beginWait(sender: String, timestamp: Int64, kind: StatusNotificationKind? = .permission) throws {
+            let record = SessionStatusRecord(
+                status: .waiting, statusTimestamp: timestamp, promptStatusTimestamp: timestamp,
+                inputWait: InputWaitContext(
+                    senderSessionId: sender, rootSessionId: owner, conversationEpoch: epoch))
+            try JSONEncoder().encode(record).write(
+                to: directory.appendingPathComponent("\(session.id).status-record.json"), options: .atomic)
+            model.setStatus(
+                sessionId: session.id, status: .waiting, text: nil,
+                timestamp: timestamp, copilotSessionId: sender, notification: kind)
+        }
+
+        func cleanup() {
+            SessionArtifacts.removeFiles(sessionId: session.id)
+            try? FileManager.default.removeItem(at: root)
+        }
+    }
+
+    func testReadyFooterVariantsDoNotBlockRemotePrompts() {
+        for footer in [
+            "/ commands · ? help · GPT-6 Astra",
+            "autopilot · / commands · GPT-6 Astra",
+            "autopilot (limited) · / commands · GPT-6 Astra",
+            "ctrl+q enqueue · @ files · # issues · GPT-6 Astra",
+            "esc again to stop agents · GPT-6 Astra",
+        ] {
+            let activity = TerminalController.classifyFooter(footer)
+            XCTAssertEqual(activity, .idle, footer)
+            XCTAssertEqual(AppModel.remotePromptEligibility(
+                status: .idle,
+                hasLiveAgent: true,
+                footerActivity: activity
+            ), .sent, footer)
+        }
+    }
+
+    func testModalAndForegroundBusyHintsWinOverReadyHints() {
+        for footer in [
+            "/ commands · ? help · esc cancel",
+            "autopilot · / commands · esc to interrupt",
+            "@ files · # issues · esc again to cancel",
+            "esc again to interrupt · GPT-6 Astra",
+        ] {
+            XCTAssertEqual(TerminalController.classifyFooter(footer), .working, footer)
+        }
+        XCTAssertEqual(TerminalController.classifyFooter("/ commands"), .unknown)
+        XCTAssertEqual(TerminalController.classifyFooter("ordinary output"), .unknown)
+        XCTAssertEqual(TerminalController.classifyFooterRows([
+            "@ files · # issues", "model picker"
+        ]), .unknown)
+        XCTAssertEqual(TerminalController.classifyFooterRows([
+            "autopilot · / commands", "esc cancel"
+        ]), .working)
+        XCTAssertEqual(TerminalController.classifyFooterRows([
+            "autopilot · / commands", "  \u{0} "
+        ]), .idle)
+    }
+
+    @MainActor
+    func testRuntimeActivityValidationDistinguishesLegacyFromUnknown() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        var snapshot = fixture.snapshot()
+        let now = Date()
+        XCTAssertEqual(snapshot.runtimeForegroundActivity(
+            expectedSessionId: fixture.owner, now: now,
+            minimumObservationMilliseconds: fixture.baseMs - 1), .idle)
+        XCTAssertEqual(snapshot.runtimeForegroundActivity(
+            expectedSessionId: fixture.owner, now: now,
+            minimumObservationMilliseconds: fixture.baseMs), .unknown)
+        XCTAssertEqual(snapshot.runtimeForegroundActivity(
+            expectedSessionId: UUID().uuidString, now: now,
+            minimumObservationMilliseconds: nil), .unknown)
+        XCTAssertEqual(snapshot.runtimeForegroundActivity(
+            expectedSessionId: fixture.owner, now: now,
+            minimumObservationMilliseconds: fixture.baseMs + 1), .unknown)
+        snapshot.runtimeActivity?.observedAtMilliseconds = fixture.baseMs - 20_000
+        XCTAssertEqual(snapshot.runtimeForegroundActivity(
+            expectedSessionId: fixture.owner, now: now,
+            minimumObservationMilliseconds: nil), .unknown)
+        snapshot.runtimeActivity?.observedAtMilliseconds = fixture.baseMs + 20_000
+        XCTAssertEqual(snapshot.runtimeForegroundActivity(
+            expectedSessionId: fixture.owner, now: now,
+            minimumObservationMilliseconds: nil), .unknown)
+        snapshot.runtimeActivity?.error = "unsupported"
+        XCTAssertNil(snapshot.runtimeForegroundActivity(
+            expectedSessionId: fixture.owner, now: now,
+            minimumObservationMilliseconds: nil))
+        snapshot.runtimeActivity = nil
+        XCTAssertNil(snapshot.runtimeForegroundActivity(
+            expectedSessionId: nil, now: now,
+            minimumObservationMilliseconds: nil))
+    }
+
+    @MainActor
+    func testRuntimeRestoresWorkingAfterAChildPoisonedTheOldClock() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        fixture.model.setStatus(
+            sessionId: fixture.session.id, status: .idle, text: nil,
+            timestamp: fixture.baseMs - 100, source: "agent-stop")
+        var snapshot = fixture.snapshot(processing: true)
+        snapshot.foregroundTransitionAt = fixture.base.addingTimeInterval(-10).ISO8601Format()
+        try fixture.publish(snapshot)
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .running)
+        XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "next"), .busy)
+        XCTAssertEqual(fixture.sends.count, 0)
+    }
+
+    @MainActor
+    func testRuntimeIdleRepairsOldBusyStateWithoutRewritingClocks() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let record = SessionStatusRecord(
+            status: .running, statusTimestamp: fixture.baseMs - 100,
+            promptStatusTimestamp: fixture.baseMs - 100)
+        let recordURL = fixture.directory.appendingPathComponent("\(fixture.session.id).status-record.json")
+        try JSONEncoder().encode(record).write(to: recordURL)
+        fixture.model.setStatus(
+            sessionId: fixture.session.id, status: .running,
+            text: nil, timestamp: record.statusTimestamp)
+        try fixture.publish(fixture.snapshot())
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .idle)
+        XCTAssertEqual(fixture.model.remoteWorkspaceSnapshot().projects[0].sessions[0].promptable, true)
+        XCTAssertEqual(try JSONDecoder().decode(SessionStatusRecord.self, from: Data(contentsOf: recordURL)), record)
+    }
+
+    @MainActor
+    func testModernChildPermissionCanResolveWithoutARootHook() throws {
+        let hook = try BackgroundHookTests.Fixture()
+        let fixture = try Fixture(root: hook.root, sessionId: hook.tabId, owner: hook.ownerId)
+        defer { fixture.cleanup() }
+        var snapshot = fixture.snapshot()
+        snapshot.pendingPermissionRequestIds = ["child-request"]
+        try fixture.publish(snapshot)
+        let waitAt = fixture.baseMs + 100
+        try hook.run("notify", payload:
+            #"{"sessionId":"\#(hook.childId)","timestamp":\#(waitAt),"notificationType":"permission_prompt"}"#)
+        fixture.model.setStatus(
+            sessionId: fixture.session.id, status: .waiting, text: nil,
+            timestamp: waitAt, copilotSessionId: hook.childId, notification: .permission)
+        XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "blocked"), .busy)
+        try hook.run("idle", payload:
+            #"{"sessionId":"\#(hook.childId)","timestamp":\#(waitAt + 100)}"#)
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .waiting)
+        snapshot.pendingPermissionRequestIds = []
+        snapshot.inputCompletions = [hook.childId: waitAt + 100]
+        snapshot.runtimeActivity?.observedAtMilliseconds = waitAt + 200
+        try fixture.publish(snapshot)
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .idle)
+        XCTAssertEqual(fixture.model.remoteWorkspaceSnapshot().projects[0].sessions[0].promptable, true)
+        XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "next"), .sent)
+        XCTAssertEqual(fixture.sends.count, 1)
+    }
+
+    @MainActor
+    func testOtherActorOrGenerationCannotClearAWait() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let child = UUID().uuidString.lowercased()
+        let waitAt = fixture.baseMs + 100
+        var snapshot = fixture.snapshot()
+        try fixture.publish(snapshot)
+        try fixture.beginWait(sender: child, timestamp: waitAt)
+        snapshot.runtimeActivity?.observedAtMilliseconds = waitAt + 200
+        snapshot.inputCompletions = [fixture.owner: waitAt + 100]
+        try fixture.publish(snapshot)
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .waiting)
+        snapshot.inputCompletions = [child: waitAt + 100]
+        snapshot.conversationEpoch = "\(UUID().uuidString):0"
+        try fixture.publish(snapshot)
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .waiting)
+        snapshot.conversationEpoch = fixture.epoch
+        snapshot.pendingPermissionRequestIds = ["another-actor"]
+        try fixture.publish(snapshot)
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .waiting)
+    }
+
+    @MainActor
+    func testCompletedElicitationRepairsPersistedWaitOnAppRestart() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let child = UUID().uuidString.lowercased()
+        let waitAt = fixture.baseMs + 100
+        var snapshot = fixture.snapshot()
+        try fixture.publish(snapshot)
+        try fixture.beginWait(sender: child, timestamp: waitAt, kind: .elicitation)
+        snapshot.inputCompletions = [child: waitAt + 100]
+        snapshot.runtimeActivity?.observedAtMilliseconds = waitAt + 200
+        let restarted = AppModel(
+            stateRepository: fixture.repository,
+            isAppActive: { false },
+            agentActivityDirectory: fixture.directory,
+            resumeMarkerDirectory: fixture.directory)
+        XCTAssertEqual(restarted.projects[0].sessions[0].status, .waiting)
+        try fixture.publish(snapshot, to: restarted)
+        XCTAssertEqual(restarted.projects[0].sessions[0].status, .idle)
+    }
+
+    @MainActor
+    func testAcceptedPromptNeedsANewCoordinatorAcknowledgement() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        var snapshot = fixture.snapshot()
+        try fixture.publish(snapshot)
+        XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "first"), .sent)
+        Thread.sleep(forTimeInterval: 0.003)
+        let observed = Int64(Date().timeIntervalSince1970 * 1_000)
+        snapshot.runtimeActivity?.observedAtMilliseconds = observed
+        try fixture.publish(snapshot)
+        XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "duplicate"), .busy)
+        XCTAssertEqual(fixture.sends.count, 1)
+        snapshot.runtimeActivity?.idleAtMilliseconds = observed
+        try fixture.publish(snapshot)
+        XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "next"), .sent)
+        XCTAssertEqual(fixture.sends.count, 2)
+    }
+
+    @MainActor
+    func testFailedPromptDoesNotLeaveAnAdmissionFence() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        try fixture.publish(fixture.snapshot())
+        fixture.sends.succeeds = false
+        XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "first"), .invalid)
+        fixture.sends.succeeds = true
+        XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "retry"), .sent)
+    }
+
+    @MainActor
+    func testRuntimeLossDoesNotBecomeLegacyIdle() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        try fixture.publish(fixture.snapshot())
+        try FileManager.default.removeItem(at: fixture.snapshotURL)
+        fixture.model.refreshAgentActivitySnapshots()
+        XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "next"), .busy)
+    }
+
+    @MainActor
+    func testLegacyTrackerKeepsTheExistingPromptPath() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        var snapshot = fixture.snapshot()
+        snapshot.runtimeActivity = nil
+        snapshot.inputCompletions = nil
+        try fixture.publish(snapshot)
+        XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "legacy"), .sent)
+    }
+
+    @MainActor
+    func testExplicitUnsupportedRuntimeDoesNotInstallASendFence() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        var snapshot = fixture.snapshot()
+        snapshot.runtimeActivity?.error = "unsupported"
+        snapshot.runtimeActivity?.processing = nil
+        try fixture.publish(snapshot)
+        XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "one"), .sent)
+        XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "two"), .sent)
+    }
+
+    @MainActor
+    func testScheduledCoordinatorStillBlocksSendingWhileProcessing() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        var snapshot = fixture.snapshot(processing: true)
+        snapshot.scheduledTurnActive = true
+        try fixture.publish(snapshot)
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .idle)
+        XCTAssertTrue(fixture.model.projects[0].sessions[0].hasBackgroundWork)
+        XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "next"), .busy)
+    }
+
+    @MainActor
+    func testWholeSessionIdleReleasesCancelledWaitButChildIdleDoesNot() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let waitAt = fixture.baseMs + 100
+        var snapshot = fixture.snapshot(background: false)
+        try fixture.publish(snapshot)
+        try fixture.beginWait(sender: UUID().uuidString.lowercased(), timestamp: waitAt)
+        snapshot.runtimeActivity?.observedAtMilliseconds = waitAt + 200
+        snapshot.runtimeActivity?.idleAtMilliseconds = waitAt + 100
+        try fixture.publish(snapshot)
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .waiting)
+        snapshot.sessionIdleAtMilliseconds = waitAt + 100
+        try fixture.publish(snapshot)
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .idle)
+    }
+
+    @MainActor
+    func testUnchangedRuntimeObservationUpdatesFreshnessWithoutRedrawingProjects() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        var snapshot = fixture.snapshot()
+        try fixture.publish(snapshot)
+        var updates = 0
+        let subscription = fixture.model.objectWillChange.sink { updates += 1 }
+        defer { subscription.cancel() }
+        snapshot.updatedAt = Date().formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true))
+        snapshot.runtimeActivity?.observedAtMilliseconds = fixture.baseMs + 100
+        try fixture.publish(snapshot)
+        XCTAssertEqual(updates, 0)
+        XCTAssertEqual(
+            fixture.model.projects[0].sessions[0].agentActivity?.runtimeActivity?.observedAtMilliseconds,
+            fixture.baseMs + 100)
+    }
+
+    @MainActor
+    func testDisconnectedRuntimeStillUsesTheDisplayBackstopButCannotAdmitInput() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        fixture.model.setStatus(
+            sessionId: fixture.session.id, status: .running,
+            text: nil, timestamp: fixture.baseMs - 100)
+        var snapshot = fixture.snapshot()
+        snapshot.error = "Connection is closed."
+        snapshot.runtimeActivity?.error = snapshot.error
+        snapshot.runtimeActivity?.processing = nil
+        try fixture.publish(snapshot)
+        fixture.model.reconcileAgentFooters()
+        fixture.model.reconcileAgentFooters()
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .idle)
+        XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "not ready"), .busy)
+    }
+
+    @MainActor
+    func testLegacyTrackerCanReleaseElicitationAndRepeatedChildWaits() throws {
+        for kind in [StatusNotificationKind.permission, .elicitation] {
+            let fixture = try Fixture()
+            defer { fixture.cleanup() }
+            var snapshot = fixture.snapshot()
+            snapshot.runtimeActivity = nil
+            snapshot.inputCompletions = nil
+            try fixture.publish(snapshot)
+            let waitAt = fixture.baseMs + 100
+            try fixture.beginWait(
+                sender: UUID().uuidString.lowercased(), timestamp: waitAt, kind: kind)
+            try fixture.beginWait(
+                sender: UUID().uuidString.lowercased(), timestamp: waitAt + 100, kind: nil)
+            snapshot.pendingPermissionRequestIds = ["another-request"]
+            snapshot.updatedAt = Date().formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true))
+            try fixture.publish(snapshot)
+            XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .waiting)
+            snapshot.pendingPermissionRequestIds = []
+            snapshot.conversationEpoch = "\(UUID().uuidString):0"
+            try fixture.publish(snapshot)
+            XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .waiting)
+            snapshot.conversationEpoch = fixture.epoch
+            snapshot.updatedAt = Date().formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true))
+            try fixture.publish(snapshot)
+            XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .idle)
+            XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "next"), .sent)
+        }
+    }
+}

@@ -147,8 +147,9 @@ if (validSessionId && socketPath) {
     // Passive observation only: NEVER register interest / call setRequired for
     // permission events, or this extension would take prompt ownership away
     // from the CLI's terminal UI.
-    const pendingPermissionRequestIds = new Set();
+    const pendingPermissionRequests = new Map();
     const completedPermissionRequestIds = new Set();
+    const inputCompletions = new Map();
     let terminalDisconnectError = null;
     let foregroundTurnActive = false;
     // Wall-clock time of the most recent `foregroundTurnActive` transition
@@ -162,7 +163,17 @@ if (validSessionId && socketPath) {
     // `timestamp`), so it's directly comparable to the status-event clock.
     // The initial value predates any turn and never seeds a clock (recovery/
     // demotion require a real transition first).
-    let foregroundTransitionAt = new Date().toISOString();
+    let foregroundTransitionAt = null;
+    let runtimeActivity = {
+        processing: null, observedAtMilliseconds: null,
+        idleAtMilliseconds: null, error: "pending",
+    };
+    let runtimeActivityUnsupported = false;
+    let runtimeActivityRevision = 0;
+    let runtimeActivityRefresh = null;
+    let runtimeIdleAtMilliseconds = null;
+    let sessionIdleAtMilliseconds = null;
+    let shuttingDown = false;
     let scheduledTurnActive = false;
     let currentTurnKind = null;
     let idleGeneration = 0;
@@ -756,6 +767,7 @@ if (validSessionId && socketPath) {
         setScheduledTurnMarker(scheduledTurnActive);
         publish();
         publishTranscript(true);
+        refreshRuntimeActivity(true);
     }
 
     async function refreshForegroundAuthority() {
@@ -1113,6 +1125,158 @@ if (validSessionId && socketPath) {
         return published;
     }
 
+    function invalidateRuntimeActivity() {
+        runtimeActivityRevision += 1;
+        runtimeIdleAtMilliseconds = null;
+        sessionIdleAtMilliseconds = null;
+        if (!runtimeActivityUnsupported) {
+            runtimeActivity = {
+                processing: null, observedAtMilliseconds: null,
+                idleAtMilliseconds: null, error: "pending",
+            };
+        }
+    }
+
+    function recordInputCompletion(owner, event) {
+        if (!sessionIdPattern.test(owner || "")) return;
+        const timestamp = Date.parse(normalizedTimestamp(event.timestamp));
+        if (!Number.isFinite(timestamp)) return;
+        const key = owner.toLowerCase();
+        const previous = inputCompletions.get(key);
+        inputCompletions.delete(key);
+        inputCompletions.set(key, Math.max(previous ?? timestamp, timestamp));
+        while (inputCompletions.size > 128) {
+            inputCompletions.delete(inputCompletions.keys().next().value);
+        }
+        // Child activity does not invalidate a coordinator observation. Only a
+        // matching input wait needs a fresh read after this completion.
+        let record;
+        try {
+            record = JSON.parse(readFileSync(
+                join(sessionsDir, `${appSessionId}.status-record.json`), "utf8"
+            ));
+        } catch (error) {
+            if (error?.code !== "ENOENT") {
+                console.error("[copilot-projects] could not read input wait context:", error);
+            }
+            return;
+        }
+        if (record?.status === "waiting"
+            && typeof record.inputWait?.senderSessionId === "string"
+            && typeof record.inputWait?.rootSessionId === "string"
+            && record.inputWait.senderSessionId.toLowerCase() === key
+            && record.inputWait.rootSessionId.toLowerCase() === copilotSessionId.toLowerCase()
+            && record.inputWait?.conversationEpoch === conversationEpoch
+            && Number.isSafeInteger(record.statusTimestamp)
+            && record.statusTimestamp <= timestamp) {
+            runtimeActivityRevision += 1;
+            refreshRuntimeActivity(true);
+        }
+    }
+
+    async function refreshRuntimeActivity(forcePublish = false) {
+        if (shuttingDown || runtimeActivityUnsupported
+            || !validCopilotSessionId || !ownsSharedFiles()) return;
+        if (runtimeActivityRefresh?.generation === conversationGeneration) {
+            runtimeActivityRefresh.forcePublish ||= forcePublish;
+            return;
+        }
+        const token = {
+            generation: conversationGeneration,
+            revision: runtimeActivityRevision,
+            sessionId: copilotSessionId,
+            epoch: conversationEpoch,
+            forcePublish,
+        };
+        runtimeActivityRefresh = token;
+        const observedAtMilliseconds = Date.now();
+        let timeout = null;
+        const current = () => !shuttingDown
+            && token.generation === conversationGeneration
+            && token.revision === runtimeActivityRevision
+            && token.sessionId === copilotSessionId
+            && token.epoch === conversationEpoch
+            && ownsSharedFiles();
+        try {
+            const params = { sessionId: token.sessionId };
+            const values = await Promise.race([
+                Promise.all([
+                    session.connection.sendRequest("session.metadata.snapshot", params),
+                    session.connection.sendRequest("session.metadata.isProcessing", params),
+                ]),
+                new Promise((_, reject) => {
+                    timeout = setTimeout(
+                        () => reject(new Error("runtime activity query timed out")),
+                        2_000
+                    );
+                }),
+            ]);
+            if (!current()) return;
+            const [metadata, processing] = values;
+            if (metadata?.sessionId !== token.sessionId
+                || typeof metadata?.isRemote !== "boolean") {
+                throw new Error("invalid runtime session metadata");
+            }
+            if (metadata.isRemote) {
+                const changed = runtimeActivity?.error !== "remote";
+                if (changed) {
+                    console.error("[copilot-projects] remote session uses legacy activity signals");
+                }
+                runtimeActivity = {
+                    processing: null, observedAtMilliseconds,
+                    idleAtMilliseconds: null, error: "remote",
+                };
+                if (changed || token.forcePublish) publish();
+                return;
+            }
+            if (typeof processing?.processing !== "boolean") {
+                throw new Error("invalid runtime activity response");
+            }
+            const changed = runtimeActivity?.processing !== processing.processing
+                || runtimeActivity?.error != null;
+            runtimeActivity = {
+                processing: processing.processing,
+                observedAtMilliseconds,
+                idleAtMilliseconds: runtimeIdleAtMilliseconds,
+                error: null,
+            };
+            // Unchanged observations ride the next heartbeat; actual transitions
+            // and input completions publish immediately.
+            if (changed || token.forcePublish) publish();
+        } catch (error) {
+            if (!current()) return;
+            if (error?.code === -32601) {
+                runtimeActivityUnsupported = true;
+                runtimeActivity = {
+                    processing: null, observedAtMilliseconds,
+                    idleAtMilliseconds: null, error: "unsupported",
+                };
+                console.error("[copilot-projects] runtime activity API unavailable; using legacy signals");
+                publish();
+                return;
+            }
+            const message = String(error);
+            const changed = runtimeActivity?.error !== message;
+            if (changed) {
+                console.error("[copilot-projects] runtime activity query failed:", error);
+            }
+            runtimeActivity = {
+                processing: null,
+                observedAtMilliseconds, idleAtMilliseconds: null, error: message,
+            };
+            if (changed || token.forcePublish) publish(error);
+        } finally {
+            if (timeout) clearTimeout(timeout);
+            if (runtimeActivityRefresh === token) {
+                runtimeActivityRefresh = null;
+                if (!shuttingDown && token.generation === conversationGeneration
+                    && token.revision !== runtimeActivityRevision) {
+                    queueMicrotask(() => refreshRuntimeActivity(true));
+                }
+            }
+        }
+    }
+
     function publish(error) {
         if (!ownsSharedFiles()) return false;
         if (isTerminalDisconnect(error)) {
@@ -1124,6 +1288,9 @@ if (validSessionId && socketPath) {
             updatedAt: new Date().toISOString(),
             foregroundTurnActive,
             foregroundTransitionAt,
+            runtimeActivity,
+            inputCompletions: Object.fromEntries(inputCompletions),
+            sessionIdleAtMilliseconds,
             scheduledTurnActive,
             activeSubagents: [...activeSubagents.values()],
             schedules,
@@ -1136,7 +1303,7 @@ if (validSessionId && socketPath) {
                 : [...pendingElicitations.values()],
             // Always present (including []) so the host can distinguish this
             // extension from an older build that cannot validate prompts.
-            pendingPermissionRequestIds: [...pendingPermissionRequestIds],
+            pendingPermissionRequestIds: [...pendingPermissionRequests.keys()],
             ...(currentModel ? { model: currentModel } : {}),
             ...(availableModels ? { availableModels } : {}),
             copilotSessionId,
@@ -2182,8 +2349,8 @@ if (validSessionId && socketPath) {
     function applyPermissionEvent(event, live) {
         if (event.type === "session.idle") {
             if (event.agentId) return;
-            if (pendingPermissionRequestIds.size > 0) {
-                pendingPermissionRequestIds.clear();
+            if (pendingPermissionRequests.size > 0) {
+                pendingPermissionRequests.clear();
                 if (live) publish();
             }
             return;
@@ -2193,15 +2360,17 @@ if (validSessionId && socketPath) {
         let changed = false;
         if (event.type === "permission.requested") {
             if (!completedPermissionRequestIds.has(requestId)
-                    && !pendingPermissionRequestIds.has(requestId)
-                    && pendingPermissionRequestIds.size < 64) {
-                pendingPermissionRequestIds.add(requestId);
+                    && !pendingPermissionRequests.has(requestId)
+                    && pendingPermissionRequests.size < 64) {
+                pendingPermissionRequests.set(requestId, event.agentId || copilotSessionId);
                 changed = true;
             }
         } else if (event.type === "permission.completed") {
             completedPermissionRequestIds.add(requestId);
             boundCompletedPermissionIds();
-            changed = pendingPermissionRequestIds.delete(requestId);
+            const owner = pendingPermissionRequests.get(requestId);
+            changed = pendingPermissionRequests.delete(requestId);
+            if (live && changed) recordInputCompletion(owner, event);
         }
         if (live && changed) publish();
     }
@@ -2864,8 +3033,11 @@ if (validSessionId && socketPath) {
         inFlightUserInputResponses.clear();
         pendingElicitations.clear();
         inFlightElicitationResponses.clear();
-        pendingPermissionRequestIds.clear();
+        pendingPermissionRequests.clear();
         completedPermissionRequestIds.clear();
+        inputCompletions.clear();
+        runtimeActivityUnsupported = false;
+        invalidateRuntimeActivity();
 
         foregroundTurnActive = false;
         scheduledTurnActive = false;
@@ -3324,6 +3496,7 @@ if (validSessionId && socketPath) {
 
     session.on("user.message", (event) => {
         if (event.agentId) return;
+        invalidateRuntimeActivity();
         closeActivityState = "ready";
         clearCloseActivityRetry();
         lastIdleTurnKind = null;
@@ -3331,11 +3504,31 @@ if (validSessionId && socketPath) {
             ? "scheduled"
             : "foreground";
         setScheduledTurnMarker(currentTurnKind === "scheduled");
+        foregroundTurnActive = currentTurnKind !== "scheduled";
+        foregroundTransitionAt = normalizedTimestamp(event.timestamp);
+        publish();
+        refreshRuntimeActivity(true);
         processCloseSessionRequest();
     });
 
     session.on("assistant.turn_start", (event) => {
-        if (event.agentId) return;
+        if (event.agentId) {
+            sessionIdleAtMilliseconds = null;
+            if (!activeSubagents.has(event.agentId)) {
+                activeSubagents.set(event.agentId, {
+                    id: event.agentId,
+                    name: "Background agent",
+                    description: "",
+                });
+            }
+            publish();
+            return;
+        }
+        runtimeActivityRevision += 1;
+        runtimeIdleAtMilliseconds = null;
+        sessionIdleAtMilliseconds = null;
+        const needsRefresh = runtimeActivity?.processing !== true;
+        if (needsRefresh) invalidateRuntimeActivity();
         closeActivityState = "ready";
         clearCloseActivityRetry();
         lastIdleTurnKind = null;
@@ -3344,18 +3537,31 @@ if (validSessionId && socketPath) {
         foregroundTransitionAt = normalizedTimestamp(event.timestamp);
         if (scheduledTurnActive) setScheduledTurnMarker(true);
         publish();
+        if (needsRefresh) refreshRuntimeActivity(true);
         processCloseSessionRequest();
     });
 
-    session.on("assistant.turn_end", (event) => {
-        if (event.agentId) return;
+    session.on("assistant.idle", (event) => {
+        if (event.agentId) {
+            activeSubagents.delete(event.agentId);
+            publish();
+            return;
+        }
+        const transition = normalizedTimestamp(event.timestamp);
+        if (foregroundTransitionAt && transition < foregroundTransitionAt) return;
+        runtimeActivityRevision += 1;
         foregroundTurnActive = false;
-        foregroundTransitionAt = normalizedTimestamp(event.timestamp);
+        foregroundTransitionAt = transition;
+        runtimeIdleAtMilliseconds = Date.parse(transition);
         publish();
+        refreshRuntimeActivity(true);
     });
 
     session.on("session.idle", (event) => {
         if (event.agentId) return;
+        const transition = normalizedTimestamp(event.timestamp);
+        if (foregroundTransitionAt && transition < foregroundTransitionAt) return;
+        runtimeActivityRevision += 1;
         closeActivityState = "ready";
         clearCloseActivityRetry();
         idleGeneration += 1;
@@ -3363,10 +3569,14 @@ if (validSessionId && socketPath) {
         lastIdleTurnKind = currentTurnKind;
         currentTurnKind = null;
         foregroundTurnActive = false;
-        foregroundTransitionAt = normalizedTimestamp(event.timestamp);
+        foregroundTransitionAt = transition;
+        runtimeIdleAtMilliseconds = Date.parse(foregroundTransitionAt);
+        sessionIdleAtMilliseconds = runtimeIdleAtMilliseconds;
         scheduledTurnActive = false;
         activeSubagents.clear();
+        pendingPermissionRequests.clear();
         publish();
+        refreshRuntimeActivity(true);
         setTimeout(() => setScheduledTurnMarker(false), 5_000);
         processCloseSessionRequest();
     });
@@ -3424,11 +3634,12 @@ if (validSessionId && socketPath) {
     });
 
     session.on("subagent.started", (event) => {
+        sessionIdleAtMilliseconds = null;
         const id = event.agentId || event.data.toolCallId;
         activeSubagents.set(id, {
             id,
-            name: event.data.agentDisplayName,
-            description: event.data.agentDescription,
+            name: boundedMetadataText(event.data.agentDisplayName) || "Background agent",
+            description: boundedMetadataText(event.data.agentDescription) || "",
             model: event.data.model,
         });
         publish();
@@ -3563,7 +3774,6 @@ if (validSessionId && socketPath) {
             removeFile(setModelRequestPath);
         }
     }
-    let shuttingDown = false;
     async function shutdown(signal) {
         if (shuttingDown) return;
         shuttingDown = true;
@@ -3593,8 +3803,12 @@ if (validSessionId && socketPath) {
     session.on("user_input.completed", (event) => {
         const requestId = event.data?.requestId;
         const cleared = observeLiveRootQuestion(event);
-        if ((typeof requestId === "string"
-                && pendingUserInputs.delete(requestId)) || cleared) {
+        const entry = pendingUserInputs.get(requestId);
+        if (entry) {
+            pendingUserInputs.delete(requestId);
+            recordInputCompletion(entry.agentId || copilotSessionId, event);
+        }
+        if (entry || cleared) {
             publish();
         }
     });
@@ -3614,8 +3828,12 @@ if (validSessionId && socketPath) {
     session.on("elicitation.completed", (event) => {
         const requestId = event.data?.requestId;
         const cleared = observeLiveRootQuestion(event);
-        if ((typeof requestId === "string"
-                && pendingElicitations.delete(requestId)) || cleared) {
+        const entry = pendingElicitations.get(requestId);
+        if (entry) {
+            pendingElicitations.delete(requestId);
+            recordInputCompletion(entry.agentId || copilotSessionId, event);
+        }
+        if (entry || cleared) {
             publish();
         }
     });
@@ -3650,6 +3868,7 @@ if (validSessionId && socketPath) {
 
     refreshSchedules();
     refreshModels();
+    refreshRuntimeActivity(true);
 
     processUserInputResponse();
     processElicitationResponse();
@@ -3671,6 +3890,7 @@ if (validSessionId && socketPath) {
         // heartbeat exact while collapsing the steady-state cost from two
         // full snapshot writes per tick to one.
         publish();
+        refreshRuntimeActivity();
         refreshSchedules();
         refreshModels();
         processUserInputResponse();

@@ -123,6 +123,53 @@ final class SessionSemanticsTests: XCTestCase {
         ), .cancel)
     }
 
+    func testRuntimeAuthorityDoesNotBypassInputOrModalGates() {
+        for status in [SessionStatus.idle, .running] {
+            XCTAssertEqual(SessionSemantics.promptEligibility(.init(
+                status: status, hasLiveAgent: true,
+                footerActivity: .idle, foregroundActivity: .working
+            )), .busy)
+            XCTAssertEqual(SessionSemantics.promptEligibility(.init(
+                status: status, hasLiveAgent: true,
+                footerActivity: .idle, foregroundActivity: .unknown
+            )), .busy)
+            XCTAssertEqual(SessionSemantics.promptEligibility(.init(
+                status: status, scheduledTurnActive: true, hasLiveAgent: true,
+                footerActivity: .idle, foregroundActivity: .idle
+            )), .send)
+        }
+
+        for footer in [FooterActivity.working, .unknown] {
+            XCTAssertEqual(SessionSemantics.promptEligibility(.init(
+                status: .idle, hasLiveAgent: true,
+                footerActivity: footer, foregroundActivity: .idle
+            )), .busy)
+        }
+        XCTAssertEqual(SessionSemantics.promptEligibility(.init(
+            status: .waiting, hasLiveAgent: true,
+            footerActivity: .idle, foregroundActivity: .idle
+        )), .busy)
+        XCTAssertEqual(SessionSemantics.promptEligibility(.init(
+            status: .idle, hasPendingQuestions: true, hasLiveAgent: true,
+            footerActivity: .idle, foregroundActivity: .idle
+        )), .busy)
+    }
+
+    func testPromptAcknowledgementMustBeStrictlyAfterSubmission() {
+        XCTAssertFalse(SessionSemantics.acknowledgesSubmittedPrompt(
+            foreground: .working, observedAt: 100, idleAt: nil, submittedAt: 100))
+        XCTAssertFalse(SessionSemantics.acknowledgesSubmittedPrompt(
+            foreground: .idle, observedAt: 101, idleAt: 100, submittedAt: 100))
+        XCTAssertFalse(SessionSemantics.acknowledgesSubmittedPrompt(
+            foreground: .idle, observedAt: 101, idleAt: 102, submittedAt: 100))
+        XCTAssertFalse(SessionSemantics.acknowledgesSubmittedPrompt(
+            foreground: .unknown, observedAt: 102, idleAt: 101, submittedAt: 100))
+        XCTAssertTrue(SessionSemantics.acknowledgesSubmittedPrompt(
+            foreground: .working, observedAt: 101, idleAt: nil, submittedAt: 100))
+        XCTAssertTrue(SessionSemantics.acknowledgesSubmittedPrompt(
+            foreground: .idle, observedAt: 102, idleAt: 101, submittedAt: 100))
+    }
+
     func testBackgroundEvidenceRejectsStaleFutureAndOlderClockValues() {
         let current = evidence(transition: 900)
         XCTAssertEqual(SessionSemantics.backgroundOnlyEvidenceMilliseconds(

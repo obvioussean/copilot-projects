@@ -40,7 +40,11 @@ fs.writeFileSync = (path, ...args) => {
   if (runtime?.failWrite?.(String(path))) {
     throw new Error("injected tracker write failure");
   }
-  return originalWriteFileSync(path, ...args);
+  const result = originalWriteFileSync(path, ...args);
+  if (runtime && String(path).includes(".agent-activity.json.")) {
+    runtime.activityWrites.push(JSON.parse(String(args[0])));
+  }
+  return result;
 };
 syncBuiltinESMExports();
 
@@ -78,6 +82,10 @@ class FakeSession {
     this.modelSwitchCalls = [];
     this.closeCalls = [];
     this.history = [];
+    this.processing = false;
+    this.runtimeCalls = [];
+    this.metadataHandler = async ({ sessionId }) => ({ sessionId, isRemote: false });
+    this.processingHandler = async () => ({ processing: this.processing });
     this.abortHandler = async () => this.emit("session.idle", { aborted: true });
     this.enqueueHandler = async () => ({ queued: true });
     this.userInputHandler = async () => ({ success: true });
@@ -132,7 +140,15 @@ class FakeSession {
       },
     };
     this.connection = {
-      sendRequest: async () => ({ sessionId: this.sessionId }),
+      sendRequest: async (method, params) => {
+        if (method === "session.getForeground") {
+          return { sessionId: this.foregroundSessionId ?? this.sessionId };
+        }
+        this.runtimeCalls.push({ method, ...params });
+        if (method === "session.metadata.snapshot") return this.metadataHandler(params);
+        if (method === "session.metadata.isProcessing") return this.processingHandler(params);
+        throw Object.assign(new Error(`Unknown RPC: ${method}`), { code: -32601 });
+      },
     };
   }
 
@@ -147,6 +163,10 @@ class FakeSession {
   }
 
   async emit(type, data = {}, extra = {}) {
+    if (!extra.agentId && type === "assistant.turn_start") this.processing = true;
+    if (!extra.agentId && (type === "assistant.idle" || type === "session.idle")) {
+      this.processing = false;
+    }
     const event = {
       id: randomUUID(),
       type,
@@ -219,6 +239,7 @@ async function createRuntime(t, configure = () => {}) {
     watchCallback: null,
     intervalCallback: null,
     failWrite: null,
+    activityWrites: [],
   };
   runtime.session = new FakeSession(runtime.copilotSessionId);
   configure(runtime.session);
@@ -332,6 +353,293 @@ function requestClose(runtime) {
   realWriteFileSync(join(runtime.sessions, name), "");
   trigger(runtime, name);
 }
+
+async function waitForActivity(runtime, predicate) {
+  return waitFor(
+    () => predicate(readSnapshot(runtime).runtimeActivity),
+    "runtime activity did not settle",
+    4_000
+  );
+}
+
+test("runtime activity distinguishes coordinator iterations from background work", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await waitForActivity(runtime, (activity) => activity?.processing === false);
+  const child = uuid();
+  await runtime.session.emit("subagent.started", { agentDisplayName: "worker" }, { agentId: child });
+  await runtime.session.emit("assistant.turn_start", { turnId: "1" });
+  await waitForActivity(runtime, (activity) => activity?.processing === true);
+  await runtime.session.emit("assistant.turn_end", { turnId: "1" });
+  assert.equal(readSnapshot(runtime).foregroundTurnActive, true);
+  assert.equal(readSnapshot(runtime).runtimeActivity.processing, true);
+  await runtime.session.emit("assistant.idle");
+  await waitForActivity(runtime, (activity) => activity?.processing === false);
+  assert.equal(readSnapshot(runtime).foregroundTurnActive, false);
+  assert.equal(readSnapshot(runtime).activeSubagents.length, 1);
+});
+
+test("a child's idle event cannot idle the coordinator", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await runtime.session.emit("assistant.turn_start");
+  await waitForActivity(runtime, (activity) => activity?.processing === true);
+  await runtime.session.emit("assistant.idle", {}, { agentId: uuid() });
+  assert.equal(readSnapshot(runtime).foregroundTurnActive, true);
+  assert.equal(readSnapshot(runtime).runtimeActivity.processing, true);
+});
+
+test("late idle query cannot overwrite a new foreground turn", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await waitForActivity(runtime, (activity) => activity?.processing === false);
+  let finish;
+  runtime.session.processingHandler = () => new Promise((resolve) => { finish = resolve; });
+  runtime.intervalCallback();
+  await waitFor(() => finish, "idle query did not start");
+  await runtime.session.emit("assistant.turn_start");
+  const firstNewTurnWrite = runtime.activityWrites.length - 1;
+  runtime.session.processingHandler = async () => ({ processing: true });
+  finish({ processing: false });
+  await waitForActivity(runtime, (activity) => activity?.processing === true);
+  assert.ok(runtime.activityWrites.slice(firstNewTurnWrite)
+    .every((snapshot) => snapshot.runtimeActivity.processing !== false));
+});
+
+test("runtime queries use the new owner even when SDK sessionId still points backward", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await waitForActivity(runtime, (activity) => activity?.processing === false);
+  let finishOld;
+  const oldId = runtime.copilotSessionId;
+  runtime.session.processingHandler = ({ sessionId }) => sessionId === oldId
+    ? new Promise((resolve) => { finishOld = resolve; })
+    : Promise.resolve({ processing: true });
+  runtime.intervalCallback();
+  await waitFor(() => finishOld, "old query did not start");
+  const next = uuid();
+  runtime.session.foregroundSessionId = next;
+  runtime.session.processing = true;
+  const firstNewCall = runtime.session.runtimeCalls.length;
+  await runtime.session.emit("session.start", { sessionId: next });
+  await waitFor(() => readSnapshot(runtime).copilotSessionId === next, "owner did not rotate");
+  finishOld({ processing: false });
+  await waitForActivity(runtime, (activity) => activity?.processing === true);
+  assert.ok(runtime.session.runtimeCalls.slice(firstNewCall)
+    .every((call) => call.sessionId === next));
+  assert.equal(runtime.session.sessionId, oldId);
+});
+
+test("runtime failures are unknown and a later observation recovers", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await waitForActivity(runtime, (activity) => activity?.processing === false);
+  runtime.session.processingHandler = async () => { throw new Error("injected query failure"); };
+  runtime.intervalCallback();
+  await waitForActivity(runtime, (activity) => activity?.error?.includes("injected query failure"));
+  assert.equal(readSnapshot(runtime).runtimeActivity.processing, null);
+  runtime.session.processingHandler = async () => ({ processing: false });
+  runtime.intervalCallback();
+  await waitForActivity(runtime, (activity) => activity?.processing === false && activity.error === null);
+});
+
+test("runtime timeout does not republish the old idle observation as fresh", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await waitForActivity(runtime, (activity) => activity?.processing === false);
+  runtime.session.processingHandler = () => new Promise(() => {});
+  runtime.intervalCallback();
+  await waitForActivity(runtime, (activity) => activity?.error?.includes("timed out"));
+  assert.equal(readSnapshot(runtime).runtimeActivity.processing, null);
+});
+
+test("unsupported runtime API explicitly retains legacy activity behavior", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    session.processingHandler = async () => {
+      throw Object.assign(new Error("method not found"), { code: -32601 });
+    };
+  });
+  await waitForActivity(runtime, (activity) => activity?.error === "unsupported");
+  const calls = runtime.session.runtimeCalls.length;
+  runtime.intervalCallback();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(runtime.session.runtimeCalls.length, calls);
+});
+
+test("remote sessions never turn the local processing false into idle authority", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    session.metadataHandler = async ({ sessionId }) => ({ sessionId, isRemote: true });
+  });
+  await waitForActivity(runtime, (activity) => activity?.error === "remote");
+  assert.equal(readSnapshot(runtime).runtimeActivity.processing, null);
+  runtime.session.metadataHandler = async ({ sessionId }) => ({ sessionId, isRemote: false });
+  runtime.intervalCallback();
+  await waitForActivity(runtime, (activity) => activity?.processing === false);
+});
+
+test("mismatched runtime response ownership fails closed", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    session.metadataHandler = async () => ({ sessionId: uuid(), isRemote: false });
+  });
+  await waitForActivity(runtime, (activity) => activity?.error?.includes("invalid runtime session metadata"));
+  assert.equal(readSnapshot(runtime).runtimeActivity.processing, null);
+});
+
+test("idle heartbeats issue one bounded scalar observation without extra snapshot churn", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await waitForActivity(runtime, (activity) => activity?.processing === false);
+  const calls = runtime.session.runtimeCalls.length;
+  const writes = runtime.activityWrites.length;
+  runtime.intervalCallback();
+  await waitFor(() => runtime.session.runtimeCalls.length >= calls + 2, "poll did not run");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(runtime.session.runtimeCalls.length - calls, 2);
+  assert.equal(runtime.activityWrites.length - writes, 1);
+});
+
+test("only observed input completions certify the matching sender", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await waitForActivity(runtime, (activity) => activity?.processing === false);
+  const child = uuid();
+  await runtime.session.emit("permission.completed", { requestId: "unseen" }, { agentId: child });
+  assert.equal(readSnapshot(runtime).inputCompletions[child], undefined);
+  await runtime.session.emit("permission.requested", { requestId: "permission" }, { agentId: child });
+  assert.deepEqual(readSnapshot(runtime).pendingPermissionRequestIds, ["permission"]);
+  await runtime.session.emit("permission.completed", { requestId: "permission" }, { agentId: child });
+  await waitFor(() => readSnapshot(runtime).inputCompletions[child], "completion was not published");
+  assert.deepEqual(readSnapshot(runtime).pendingPermissionRequestIds, []);
+  assert.equal(readSnapshot(runtime).inputCompletions[runtime.copilotSessionId], undefined);
+});
+
+test("conversation rotation drops old input completion certificates", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  const child = uuid();
+  await runtime.session.emit("permission.requested", { requestId: "permission" }, { agentId: child });
+  await runtime.session.emit("permission.completed", { requestId: "permission" }, { agentId: child });
+  await waitFor(() => readSnapshot(runtime).inputCompletions[child], "completion missing");
+  const next = uuid();
+  runtime.session.sessionId = next;
+  await runtime.session.emit("session.start", { sessionId: next });
+  await waitFor(() => readSnapshot(runtime).copilotSessionId === next, "rotation missing");
+  assert.deepEqual(readSnapshot(runtime).inputCompletions, {});
+});
+
+test("reused child agents leave and rejoin background activity independently of the coordinator", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await waitForActivity(runtime, (activity) => activity?.processing === false);
+  const child = uuid();
+  await runtime.session.emit("subagent.started", {}, { agentId: child });
+  await runtime.session.emit("assistant.idle", {}, { agentId: child });
+  assert.deepEqual(readSnapshot(runtime).activeSubagents, []);
+  await runtime.session.emit("assistant.turn_start", {}, { agentId: child });
+  assert.equal(readSnapshot(runtime).activeSubagents[0].id, child);
+  assert.equal(typeof readSnapshot(runtime).activeSubagents[0].name, "string");
+  assert.equal(typeof readSnapshot(runtime).activeSubagents[0].description, "string");
+  assert.equal(readSnapshot(runtime).foregroundTurnActive, false);
+});
+
+test("new child work invalidates whole-session idle without making the coordinator busy", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await runtime.session.emit("session.idle");
+  assert.equal(typeof readSnapshot(runtime).sessionIdleAtMilliseconds, "number");
+  const child = uuid();
+  await runtime.session.emit("assistant.turn_start", {}, { agentId: child });
+  assert.equal(readSnapshot(runtime).sessionIdleAtMilliseconds, null);
+  assert.equal(readSnapshot(runtime).foregroundTurnActive, false);
+  await runtime.session.emit("assistant.idle", {}, { agentId: child });
+  assert.equal(readSnapshot(runtime).sessionIdleAtMilliseconds, null);
+});
+
+test("background child iteration churn cannot starve coordinator observations", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await waitForActivity(runtime, (activity) => activity?.processing === false);
+  const originalObservation = readSnapshot(runtime).runtimeActivity.observedAtMilliseconds;
+  const calls = runtime.session.runtimeCalls.length;
+  const finishers = [];
+  runtime.session.processingHandler = () => new Promise((resolve) => { finishers.push(resolve); });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  runtime.intervalCallback();
+  await waitFor(() => finishers.length > 0, "query did not start");
+  const child = uuid();
+  for (let index = 0; index < 20; index += 1) {
+    await runtime.session.emit("assistant.turn_start", {}, { agentId: child });
+    await runtime.session.emit("permission.requested", { requestId: `auto-${index}` }, { agentId: child });
+    await runtime.session.emit("permission.completed", { requestId: `auto-${index}` }, { agentId: child });
+    await runtime.session.emit("assistant.idle", {}, { agentId: child });
+  }
+  finishers[0]({ processing: false });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  try {
+    assert.equal(runtime.session.runtimeCalls.length - calls, 2);
+    runtime.intervalCallback();
+    assert.ok(readSnapshot(runtime).runtimeActivity.observedAtMilliseconds > originalObservation);
+  } finally {
+    for (const finish of finishers) finish({ processing: false });
+  }
+});
+
+test("a matching completed input wait reissues an older in-flight observation", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await waitForActivity(runtime, (activity) => activity?.processing === false);
+  const child = uuid();
+  await runtime.session.emit("permission.requested", { requestId: "permission" }, { agentId: child });
+  const at = Date.now();
+  writeHandoff(runtime, join(runtime.sessions, `${runtime.appSessionId}.status-record.json`), {
+    schemaVersion: 1, status: "waiting", statusTimestamp: at, promptStatusTimestamp: at,
+    inputWait: {
+      senderSessionId: child,
+      rootSessionId: runtime.copilotSessionId,
+      conversationEpoch: readSnapshot(runtime).conversationEpoch,
+    },
+  });
+
+  test("whole-session idle clears pending permissions before its first publication", {
+    concurrency: false,
+  }, async (t) => {
+    const runtime = await createRuntime(t);
+    await runtime.session.emit("permission.requested", { requestId: "aborted" }, { agentId: uuid() });
+    const before = runtime.activityWrites.length;
+    await runtime.session.emit("session.idle", { aborted: true });
+    assert.ok(runtime.activityWrites.slice(before)
+      .every((snapshot) => snapshot.pendingPermissionRequestIds.length === 0));
+  });
+  let finishOld;
+  runtime.session.processingHandler = () => new Promise((resolve) => { finishOld = resolve; });
+  runtime.intervalCallback();
+  await waitFor(() => finishOld, "query did not start");
+  await runtime.session.emit("permission.completed", { requestId: "permission" }, { agentId: child });
+  const completedAt = readSnapshot(runtime).inputCompletions[child];
+  runtime.session.processingHandler = async () => ({ processing: false });
+  finishOld({ processing: false });
+  await waitForActivity(runtime, (activity) =>
+    activity?.processing === false && activity.observedAtMilliseconds >= completedAt);
+});
 
 test("historical scheduled turns do not contaminate live idle classification on close", {
   concurrency: false,

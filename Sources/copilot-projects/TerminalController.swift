@@ -32,9 +32,8 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     /// updating even while the tab is backgrounded, because the CLI keeps rendering
     /// on focus-out.
     ///
-    /// Only the bottom-most non-empty row is inspected: the CLI's footer is fixed
-    /// chrome at the bottom of the screen, so streamed output never lands there — no
-    /// risk of the agent's own text spoofing a signature. Deliberately does NOT gate
+    /// Only the bottom-most non-empty row can establish an idle prompt, so draft
+    /// text in the input box cannot spoof the footer. Deliberately does NOT gate
     /// on the alternate buffer: a session resumed via dtach renders its TUI in
     /// SwiftTerm's normal buffer (the CLI never re-emits 1049h on reattach), so an
     /// alt-buffer check would blind this to every resumed agent. The caller scopes
@@ -47,12 +46,13 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
         guard rows > 0, cols > 0 else { return .unknown }
         // Only the bottom band is footer chrome; output above it must not
         // promote an old idle footer or agent-authored text to activity evidence.
-        for row in snapshot.visibleRows.reversed() where row.row >= max(0, rows - 8) {
-            let activity = Self.classifyFooter(row.text)
-            if activity != .unknown {
+        let band = snapshot.visibleRows.filter { $0.row >= max(0, rows - 8) }
+        let activity = Self.classifyFooterRows(band.map(\.text))
+        if activity != .unknown {
+            if let row = band.last(where: { !Self.isEmptyFooterRow($0.text) }) {
                 Self.debugLog("activity sid=\(sessionId.prefix(8)) alt=\(input.isAlternateBuffer) row=\(row.row)/\(rows) -> \(activity)  [\(row.text.trimmingCharacters(in: .whitespaces).suffix(90))]")
-                return activity
             }
+            return activity
         }
         Self.dumpLayoutOnce(sessionId: sessionId, snapshot: snapshot)
         return .unknown
@@ -77,15 +77,33 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
 
     /// Classify copilot's footer line into coarse activity. Pure/static so it can be
     /// unit-tested against captured fixtures.
+    nonisolated static func classifyFooterRows(_ rows: [String]) -> FooterActivity {
+        guard let footer = rows.last(where: { !isEmptyFooterRow($0) }) else { return .unknown }
+        return classifyFooter(footer)
+    }
+
+    nonisolated private static func isEmptyFooterRow(_ row: String) -> Bool {
+        row.trimmingCharacters(
+            in: CharacterSet.whitespacesAndNewlines.union(.controlCharacters)
+        ).isEmpty
+    }
+
     nonisolated static func classifyFooter(_ footerLine: String) -> FooterActivity {
         let f = footerLine.lowercased()
         guard !f.trimmingCharacters(in: .whitespaces).isEmpty else { return .unknown }
         if f.contains("esc cancel") || f.contains("esc to cancel")
             || f.contains("esc interrupt") || f.contains("esc to interrupt")
+            || f.contains("esc again to cancel") || f.contains("esc again to interrupt")
             || f.contains("working") {
             return .working
         }
         if f.contains("tab next tab") || (f.contains("? help") && f.contains("/ commands")) {
+            return .idle
+        }
+        if (f.contains("autopilot") && f.contains("/ commands"))
+            || (f.contains("@ files") && f.contains("# issues"))
+            || f.contains("esc again to stop agents")
+            || f.contains("esc stop agents") {
             return .idle
         }
         return .unknown

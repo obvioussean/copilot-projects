@@ -6,6 +6,12 @@ public enum FooterActivity: Equatable, Sendable {
     case unknown
 }
 
+public enum ForegroundActivity: Equatable, Sendable {
+    case working
+    case idle
+    case unknown
+}
+
 public enum PromptEligibility: Equatable, Sendable {
     case send
     case busy
@@ -25,6 +31,7 @@ public struct PromptabilityInput: Equatable, Sendable {
     public var hasLiveAgent: Bool
     public var hasBackgroundOnlyEvidence: Bool
     public var footerActivity: FooterActivity
+    public var foregroundActivity: ForegroundActivity?
 
     public init(
         status: SessionStatus,
@@ -32,7 +39,8 @@ public struct PromptabilityInput: Equatable, Sendable {
         hasPendingQuestions: Bool = false,
         hasLiveAgent: Bool,
         hasBackgroundOnlyEvidence: Bool = false,
-        footerActivity: FooterActivity
+        footerActivity: FooterActivity,
+        foregroundActivity: ForegroundActivity? = nil
     ) {
         self.status = status
         self.scheduledTurnActive = scheduledTurnActive
@@ -40,6 +48,7 @@ public struct PromptabilityInput: Equatable, Sendable {
         self.hasLiveAgent = hasLiveAgent
         self.hasBackgroundOnlyEvidence = hasBackgroundOnlyEvidence
         self.footerActivity = footerActivity
+        self.foregroundActivity = foregroundActivity
     }
 }
 
@@ -75,16 +84,32 @@ public struct BackgroundEvidence: Equatable, Sendable {
 }
 
 public enum SessionSemantics {
+    public static func acknowledgesSubmittedPrompt(
+        foreground: ForegroundActivity?,
+        observedAt: Int64?,
+        idleAt: Int64?,
+        submittedAt: Int64
+    ) -> Bool {
+        guard let observedAt, observedAt > submittedAt else { return false }
+        if foreground == .working { return true }
+        guard foreground == .idle, let idleAt else { return false }
+        return idleAt > submittedAt && idleAt <= observedAt
+    }
+
     public static func promptEligibility(_ input: PromptabilityInput) -> PromptEligibility {
         guard input.hasLiveAgent else { return .noLiveAgent }
         guard !input.hasPendingQuestions, input.status != .waiting else {
             return .busy
         }
-        guard !input.scheduledTurnActive || input.hasBackgroundOnlyEvidence else {
-            return .busy
-        }
-        guard input.status != .running || input.hasBackgroundOnlyEvidence else {
-            return .busy
+        if let foreground = input.foregroundActivity {
+            guard foreground == .idle else { return .busy }
+        } else {
+            guard !input.scheduledTurnActive || input.hasBackgroundOnlyEvidence else {
+                return .busy
+            }
+            guard input.status != .running || input.hasBackgroundOnlyEvidence else {
+                return .busy
+            }
         }
         guard input.footerActivity == .idle else { return .busy }
         return .send

@@ -3,7 +3,7 @@ import CopilotProjectsCore
 @testable import copilot_projects
 
 final class BackgroundHookTests: XCTestCase {
-    private final class Fixture {
+    final class Fixture {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         let tabId = UUID().uuidString
@@ -366,5 +366,137 @@ final class BackgroundHookTests: XCTestCase {
         XCTAssertEqual(settled.promptStatusTimestamp, 500)
         XCTAssertEqual(AppModel.remotePromptEligibility(
             status: settled.status, hasLiveAgent: true, footerActivity: .idle), .sent)
+    }
+
+    func testChildLifecycleHooksPreserveForegroundStateAndMarkers() throws {
+        for status in ["idle", "running", "waiting"] {
+            let fixture = try Fixture()
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            try fixture.run("running", payload:
+                #"{"sessionId":"\#(fixture.ownerId)","timestamp":100}"#)
+            let record = SessionStatusRecord(
+                status: try XCTUnwrap(SessionStatus(rawValue: status)),
+                statusTimestamp: 100, promptStatusTimestamp: 90)
+            try JSONEncoder().encode(record).write(to: fixture.file("status-record.json"))
+            try Data(status.utf8).write(to: fixture.file("status"))
+            for suffix in ["background-agents", "session-idle-hook",
+                           "active-turn", "agent-stop-completion", "scheduled-turn"] {
+                try Data("preserve".utf8).write(to: fixture.file(suffix))
+            }
+            let before = try fixture.markerContents()
+            let calls = try Data(contentsOf: fixture.capture)
+            for action in ["idle", "end", "notify"] {
+                try fixture.run(action, payload:
+                    #"{"sessionId":"\#(fixture.childId)","timestamp":300,"notification_type":"session_idle"}"#)
+                XCTAssertEqual(try fixture.markerContents(), before, "\(status), \(action)")
+                XCTAssertEqual(try Data(contentsOf: fixture.capture), calls)
+            }
+        }
+    }
+
+    func testNotificationDialectsBothPreserveSharedPermissionWaits() throws {
+        for key in ["notificationType", "notification_type"] {
+            for (kind, notification) in [
+                ("permission_prompt", "permission"),
+                ("elicitation_dialog", "elicitation"),
+            ] {
+                let fixture = try Fixture()
+                defer { try? FileManager.default.removeItem(at: fixture.root) }
+                try fixture.run("running", payload:
+                    #"{"sessionId":"\#(fixture.ownerId)","timestamp":100}"#)
+                try fixture.run("notify", payload:
+                    #"{"sessionId":"\#(fixture.childId)","timestamp":200,"\#(key)":"\#(kind)"}"#)
+                let record = try JSONDecoder().decode(
+                    SessionStatusRecord.self,
+                    from: Data(contentsOf: fixture.file("status-record.json")))
+                XCTAssertEqual(record.status, .waiting)
+                XCTAssertEqual(record.promptStatusTimestamp, 200)
+                XCTAssertEqual(
+                    try String(contentsOf: fixture.capture).split(separator: "\n").last,
+                    "set-status waiting --session \(fixture.tabId) --timestamp 200 --notification \(notification) --copilot-session \(fixture.childId)")
+            }
+        }
+    }
+
+    func testChildIdleNotificationIsNotForegroundIdle() throws {
+        let fixture = try Fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try fixture.run("running", payload:
+            #"{"sessionId":"\#(fixture.ownerId)","timestamp":100}"#)
+        let before = try fixture.markerContents()
+        let calls = try Data(contentsOf: fixture.capture)
+        for fields in [
+            #""notificationType":"agent_idle""#,
+            #""notificationType":"agent_idle","notification_type":"permission_prompt""#,
+            #""notificationType":{},"notification_type":"permission_prompt""#,
+            #""message":{"notificationType":"permission_prompt"}"#,
+        ] {
+            try fixture.run("notify", payload:
+                #"{"sessionId":"\#(fixture.ownerId)","timestamp":200,\#(fields)}"#)
+            XCTAssertEqual(try fixture.markerContents(), before)
+            XCTAssertEqual(try Data(contentsOf: fixture.capture), calls)
+        }
+    }
+
+    func testChildStopDoesNotConsumeAnActiveForegroundTurn() throws {
+        let fixture = try Fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try fixture.run("running", payload:
+            #"{"sessionId":"\#(fixture.ownerId)","timestamp":100}"#)
+        let before = try fixture.markerContents()
+        let calls = try Data(contentsOf: fixture.capture)
+        try fixture.run("idle", payload:
+            #"{"sessionId":"\#(fixture.childId)","timestamp":300}"#)
+        XCTAssertEqual(try fixture.markerContents(), before)
+        XCTAssertEqual(try Data(contentsOf: fixture.capture), calls)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.file("active-turn").path))
+    }
+
+    func testWaitContextBindsSenderAndConversationAtomically() throws {
+        let fixture = try Fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let epoch = "\(UUID().uuidString.lowercased()):2"
+        try Data(#"{"copilotSessionId":"\#(fixture.ownerId)","conversationEpoch":"\#(epoch)"}"#.utf8)
+            .write(to: fixture.file("agent-activity.json"))
+        try fixture.run("notify", payload:
+            #"{"sessionId":"\#(fixture.childId)","timestamp":200,"notificationType":"permission_prompt"}"#)
+        let record = try JSONDecoder().decode(
+            SessionStatusRecord.self,
+            from: Data(contentsOf: fixture.file("status-record.json")))
+        XCTAssertEqual(record.inputWait, InputWaitContext(
+            senderSessionId: fixture.childId,
+            rootSessionId: fixture.ownerId,
+            conversationEpoch: epoch))
+    }
+
+    func testNestedTimestampAndIdentityAreNotStatusAuthority() throws {
+        let fixture = try Fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try fixture.run("running", payload:
+            #"{"sessionId":"\#(fixture.ownerId)","timestamp":100}"#)
+        try fixture.run("pre", payload:
+            #"{"toolArgs":{"timestamp":999999,"sessionId":"\#(fixture.childId)"},"sessionId":"\#(fixture.ownerId)"}"#)
+        let record = try JSONDecoder().decode(
+            SessionStatusRecord.self,
+            from: Data(contentsOf: fixture.file("status-record.json")))
+        XCTAssertEqual(record.statusTimestamp, 100)
+        XCTAssertEqual(
+            try String(contentsOf: fixture.capture).split(separator: "\n").last,
+            "set-status running --session \(fixture.tabId)")
+    }
+
+    func testNonIntegerTimestampsDoNotAdvanceClocks() throws {
+        let fixture = try Fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try fixture.run("running", payload:
+            #"{"sessionId":"\#(fixture.ownerId)","timestamp":100}"#)
+        for timestamp in ["123.5", "-1", #""999""#] {
+            try fixture.run("pre", payload:
+                #"{"sessionId":"\#(fixture.ownerId)","timestamp":\#(timestamp)}"#)
+            let record = try JSONDecoder().decode(
+                SessionStatusRecord.self,
+                from: Data(contentsOf: fixture.file("status-record.json")))
+            XCTAssertEqual(record.statusTimestamp, 100)
+        }
     }
 }

@@ -76,7 +76,7 @@ public enum CopilotHooks {
       esac
     }
     persist_status_record() {
-      local timestamp prompt_timestamp record record_tmp
+      local timestamp prompt_timestamp record record_tmp waiting_context
       timestamp="$2"
       [ -n "$timestamp" ] || return 1
       prompt_timestamp="$timestamp"
@@ -88,10 +88,14 @@ public enum CopilotHooks {
       fi
       record="$state_dir/sessions/$session_id.status-record.json"
       record_tmp="$record.$$"
+      waiting_context=null
+      if [ "$1" = "waiting" ]; then
+        waiting_context="$(input_wait_context "${4:-}")"
+      fi
       (
         umask 077
-        printf '{"schemaVersion":1,"status":"%s","statusTimestamp":%s,"promptStatusTimestamp":%s}\n' \
-          "$1" "$timestamp" "$prompt_timestamp" > "$record_tmp"
+        printf '{"schemaVersion":1,"status":"%s","statusTimestamp":%s,"promptStatusTimestamp":%s,"inputWait":%s}\n' \
+          "$1" "$timestamp" "$prompt_timestamp" "$waiting_context" > "$record_tmp"
       ) || { rm -f "$record_tmp" 2>/dev/null || true; return 1; }
       mv -f "$record_tmp" "$record" 2>/dev/null \
         || { rm -f "$record_tmp" 2>/dev/null || true; return 1; }
@@ -102,7 +106,7 @@ public enum CopilotHooks {
     status() {
       mkdir -p "$state_dir/sessions" 2>/dev/null || true
       if [ -n "${2:-}" ]; then
-        if persist_status_record "$1" "$2" "${3:-}"; then
+        if persist_status_record "$1" "$2" "${3:-}" "${5:-}"; then
           printf '%s' "$2" \
             > "$state_dir/sessions/$session_id.status-timestamp" 2>/dev/null || true
           if [ "${3:-}" != "scheduled-active" ]; then
@@ -153,20 +157,39 @@ public enum CopilotHooks {
       rm "$state_dir/sessions/$session_id.agent-stop-completion" 2>/dev/null
     }
     payload_timestamp() {
-      printf '%s' "$1" \
-        | grep -oE '"timestamp"[[:space:]]*:[[:space:]]*[0-9]+' \
-        | head -1 \
-        | sed -E 's/.*:[[:space:]]*//'
+      local value kind
+      kind="$(printf '%s' "$1" \
+        | /usr/bin/plutil -type timestamp - 2>/dev/null)" || return 0
+      [ "$kind" = "integer" ] || return 0
+      value="$(printf '%s' "$1" \
+        | /usr/bin/plutil -extract timestamp raw -o - - 2>/dev/null)" || value=""
+      case "$value" in
+        ""|*[!0-9]*) printf '' ;;
+        *) printf '%s' "$value" ;;
+      esac
+    }
+    payload_notification_type() {
+      local value kind key
+      key=notificationType
+      kind="$(printf '%s' "$1" \
+        | /usr/bin/plutil -type "$key" - 2>/dev/null)" || {
+          key=notification_type
+          kind="$(printf '%s' "$1" \
+            | /usr/bin/plutil -type "$key" - 2>/dev/null)" || return 0
+        }
+      [ "$kind" = "string" ] || return 0
+      value="$(printf '%s' "$1" \
+        | /usr/bin/plutil -extract "$key" raw -o - - 2>/dev/null)" || value=""
+      printf '%s' "$value"
     }
     input_notification_kind() {
-      if printf '%s' "$1" | grep -qE '"notification_type"[[:space:]]*:[[:space:]]*"elicitation_dialog"'; then
-        printf 'elicitation'
-      elif printf '%s' "$1" | grep -qE '"notification_type"[[:space:]]*:[[:space:]]*"permission_prompt"'; then
-        printf 'permission'
-      fi
+      case "$(payload_notification_type "$1")" in
+        elicitation_dialog) printf 'elicitation' ;;
+        permission_prompt) printf 'permission' ;;
+      esac
     }
     is_session_idle() {
-      printf '%s' "$1" | grep -qE '"notification_type"[[:space:]]*:[[:space:]]*"session_idle"'
+      [ "$(payload_notification_type "$1")" = "session_idle" ]
     }
     is_aborted() {
       printf '%s' "$1" | grep -qE '"aborted"[[:space:]]*:[[:space:]]*true'
@@ -178,17 +201,34 @@ public enum CopilotHooks {
     # Extract the Copilot CLI session id (carried by hook payloads as "sessionId")
     # so sessionEnd can only clear resume markers for the process that owns them.
     payload_session_id() {
-      # Match only a UUID-shaped value and take the leftmost: this relies on the
-      # CLI emitting the real top-level "sessionId" first (escaped occurrences inside
-      # tool args/results don't match the unescaped pattern).
+      local cid uuid
+      uuid='^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
       cid="$(printf '%s' "$1" \
-        | grep -oE '"sessionId"[[:space:]]*:[[:space:]]*"[0-9A-Fa-f-]{36}"' \
-        | head -1 \
-        | sed -E 's/.*"([0-9A-Fa-f-]{36})"$/\1/')"
-      case "$cid" in
-        ""|*[!0-9A-Fa-f-]*) printf '' ;;
-        *) printf '%s' "$cid" ;;
-      esac
+        | /usr/bin/plutil -extract sessionId raw -o - - 2>/dev/null)" || return 0
+      [[ "$cid" =~ $uuid ]] && printf '%s' "$cid"
+      return 0
+    }
+
+    input_wait_context() {
+      local caller owner snapshot_owner epoch snapshot uuid
+      uuid='^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
+      caller="$1"
+      owner="$(cat "$state_dir/sessions/$session_id.copilot-session" 2>/dev/null \
+        | tr -d '[:space:]')"
+      snapshot="$state_dir/sessions/$session_id.agent-activity.json"
+      snapshot_owner="$(/usr/bin/plutil -extract copilotSessionId raw -o - "$snapshot" 2>/dev/null)" \
+        || snapshot_owner=""
+      epoch="$(/usr/bin/plutil -extract conversationEpoch raw -o - "$snapshot" 2>/dev/null)" \
+        || epoch=""
+      if [[ "$caller" =~ $uuid ]] && [[ "$owner" =~ $uuid ]] \
+        && [ "$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')" \
+          = "$(printf '%s' "$snapshot_owner" | tr '[:upper:]' '[:lower:]')" ] \
+        && [[ "$epoch" =~ ^[0-9A-Fa-f-]{36}:[0-9]+$ ]]; then
+        printf '{"senderSessionId":"%s","rootSessionId":"%s","conversationEpoch":"%s"}' \
+          "$caller" "$owner" "$epoch"
+      else
+        printf 'null'
+      fi
     }
 
     hook_has_other_owner() {
@@ -234,6 +274,7 @@ public enum CopilotHooks {
         ;;
       idle)
         payload="$(cat 2>/dev/null || true)"
+        if hook_has_other_owner "$payload"; then emit; exit 0; fi
         if [ -f "$scheduled_turn" ]; then
           : > "$scheduled_turn"
           status idle "$(payload_timestamp "$payload")" scheduled-idle
@@ -267,6 +308,7 @@ public enum CopilotHooks {
         payload="$(cat 2>/dev/null || true)"
         timestamp="$(payload_timestamp "$payload")"
         if is_session_idle "$payload"; then
+          if hook_has_other_owner "$payload"; then emit; exit 0; fi
           if [ -f "$scheduled_turn" ]; then
             rm -f "$scheduled_turn" 2>/dev/null || true
             consume_active_turn || true
@@ -294,14 +336,15 @@ public enum CopilotHooks {
           [ -n "$notification" ] || { emit; exit 0; }
           previous_status="$(current_status)"
           if [ "$previous_status" = "waiting" ]; then
-            status waiting "$timestamp"
+            status waiting "$timestamp" "" "" "$(payload_session_id "$payload")"
           else
-            status waiting "$timestamp" "" "$notification"
+            status waiting "$timestamp" "" "$notification" "$(payload_session_id "$payload")"
           fi
         fi
         ;;
       end)
         payload="$(cat 2>/dev/null || true)"
+        if hook_has_other_owner "$payload"; then emit; exit 0; fi
         # Copilot reports both an explicit exit and a graceful macOS shutdown as
         # sessionEnd(reason=user_exit). Let the live app clear the resume marker only
         # when it is not terminating; if the app is shutting down or unreachable, the

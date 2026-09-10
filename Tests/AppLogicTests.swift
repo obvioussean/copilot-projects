@@ -2808,6 +2808,7 @@ final class AppLogicTests: XCTestCase {
         )
 
         let copilotSessionId = UUID().uuidString
+        try Data(copilotSessionId.utf8).write(to: marker)
         try runHook(
             hookURL: hookURL,
             action: "end",
