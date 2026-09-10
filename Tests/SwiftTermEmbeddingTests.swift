@@ -31,6 +31,195 @@ final class SwiftTermEmbeddingTests: XCTestCase {
         func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {}
     }
 
+    private final class ScrollEvent: NSEvent {
+        var point: NSPoint = .zero
+        var delta: CGFloat = 0
+        var precise = true
+        override var locationInWindow: NSPoint { point }
+        override var scrollingDeltaY: CGFloat { delta }
+        override var hasPreciseScrollingDeltas: Bool { precise }
+        override var modifierFlags: NSEvent.ModifierFlags { [] }
+    }
+
+    @MainActor
+    private func mouseEvent(
+        _ type: NSEvent.EventType,
+        at point: NSPoint,
+        in view: ProjectsTerminalView,
+        modifiers: NSEvent.ModifierFlags = []
+    ) throws -> NSEvent {
+        try XCTUnwrap(NSEvent.mouseEvent(
+            with: type, location: view.convert(point, to: nil),
+            modifierFlags: modifiers, timestamp: 0,
+            windowNumber: view.window?.windowNumber ?? 0, context: nil,
+            eventNumber: 1, clickCount: 1, pressure: 0))
+    }
+
+    @MainActor
+    private func assertForwardedClickMatchesNative(
+        _ view: ProjectsTerminalView,
+        delegate: MouseDelegate,
+        point: NSPoint,
+        col: Int,
+        row: Int,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let viewportRow = try XCTUnwrap(
+            view.terminalContentSnapshot(region: .viewport)).capturedRange.lowerBound
+        let down = try mouseEvent(.leftMouseDown, at: point, in: view)
+        let up = try mouseEvent(.leftMouseUp, at: point, in: view)
+        view.allowMouseReporting = true
+        delegate.writes.removeAll()
+        view.mouseDown(with: down)
+        view.mouseUp(with: up)
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+        let native = delegate.writes
+        XCTAssertEqual(native, [
+            Array("\u{1b}[<0;\(col + 1);\(row + 1)M".utf8),
+            Array("\u{1b}[<0;\(col + 1);\(row + 1)m".utf8),
+        ], "Native reporting must produce an independent press/release oracle", file: file, line: line)
+
+        // Native input delivery reveals the caret; compare both routes in the
+        // same viewport, including when the reader has scrolled into history.
+        view.scrollTo(row: viewportRow, notifyAccessibility: false)
+        XCTAssertEqual(view.terminalContentSnapshot(region: .viewport)?.capturedRange.lowerBound, viewportRow,
+                       file: file, line: line)
+        view.allowMouseReporting = false
+        delegate.writes.removeAll()
+        view.forwardClick(up)
+        XCTAssertEqual(delegate.writes, native, "Forwarded hit differs from the rendered cell", file: file, line: line)
+    }
+
+    @MainActor
+    func testForwardedClicksMatchNativeCellsAfterResizeAndFontChanges() async throws {
+        let view = ProjectsTerminalView(frame: NSRect(x: 0, y: 0, width: 800, height: 480))
+        let delegate = MouseDelegate()
+        view.terminalDelegate = delegate
+        view.linkHighlightMode = .hoverWithModifier
+        view.feed(text: "\u{1b}[?1000h\u{1b}[?1006h")
+        XCTAssertEqual(view.scrollerStyle, .overlay, "Optimal width must not include a reserved scrollbar")
+        for fontSize: CGFloat in [13, 17] {
+            view.font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
+            for size in [
+                NSSize(width: 1916, height: 1018),
+                NSSize(width: 1919, height: 1021),
+                NSSize(width: 1000, height: 700),
+                NSSize(width: 800, height: 480),
+            ] {
+                view.setFrameSize(size)
+                let dimensions = view.terminalDimensions
+                let rendered = view.getOptimalFrameSize()
+                let cellW = rendered.width / CGFloat(dimensions.cols)
+                let cellH = rendered.height / CGFloat(dimensions.rows)
+                for row in [0, dimensions.rows / 2, dimensions.rows - 1] {
+                    for col in [0, dimensions.cols / 2, dimensions.cols - 1] {
+                        let point = NSPoint(
+                            x: (CGFloat(col) + 0.5) * cellW,
+                            y: view.bounds.height - (CGFloat(row) + 0.5) * cellH)
+                        try await assertForwardedClickMatchesNative(
+                            view, delegate: delegate, point: point, col: col, row: row)
+                    }
+                }
+            }
+        }
+    }
+
+    @MainActor
+    func testForwardedClicksConvertWindowCoordinatesAndIgnoreScrollbackOffset() async throws {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1300, height: 900),
+            styleMask: [.titled], backing: .buffered, defer: false)
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 1300, height: 900))
+        window.contentView = root
+        let view = ProjectsTerminalView(frame: NSRect(x: 37, y: 21, width: 1007, height: 703))
+        root.addSubview(view)
+        defer { window.contentView = nil }
+        let delegate = MouseDelegate()
+        view.terminalDelegate = delegate
+        view.linkHighlightMode = .hoverWithModifier
+        view.feed(text: "\u{1b}[?1000h\u{1b}[?1006h"
+            + (0..<150).map { "line \($0)\r\n" }.joined())
+        view.scrollUp(lines: 5)
+        let snapshot = try XCTUnwrap(view.terminalContentSnapshot(region: .viewport))
+        XCTAssertGreaterThan(snapshot.capturedRange.lowerBound, 0)
+        XCTAssertLessThan(snapshot.capturedRange.lowerBound, snapshot.liveTopRow)
+        let dimensions = view.terminalDimensions
+        let rendered = view.getOptimalFrameSize()
+        let col = dimensions.cols - 2
+        let row = dimensions.rows - 2
+        let point = NSPoint(
+            x: (CGFloat(col) + 0.5) * rendered.width / CGFloat(dimensions.cols),
+            y: view.bounds.height - (CGFloat(row) + 0.5) * rendered.height / CGFloat(dimensions.rows))
+        XCTAssertNotEqual(view.convert(point, to: nil), point)
+        try await assertForwardedClickMatchesNative(view, delegate: delegate, point: point, col: col, row: row)
+    }
+
+    @MainActor
+    func testForwardedClicksClampPaddingAndPreserveModifiers() throws {
+        let view = ProjectsTerminalView(frame: NSRect(x: 0, y: 0, width: 1919, height: 1021))
+        let delegate = MouseDelegate()
+        view.terminalDelegate = delegate
+        view.allowMouseReporting = false
+        view.feed(text: "\u{1b}[?1000h\u{1b}[?1006h")
+        let dimensions = view.terminalDimensions
+        for (point, col, row) in [
+            (NSPoint(x: -10, y: view.bounds.height + 10), 0, 0),
+            (NSPoint(x: view.bounds.width - 0.1, y: 0.1), dimensions.cols - 1, dimensions.rows - 1),
+            (NSPoint(x: view.bounds.width + 10, y: -10), dimensions.cols - 1, dimensions.rows - 1),
+        ] {
+            delegate.writes.removeAll()
+            view.forwardClick(try mouseEvent(
+                .leftMouseUp, at: point, in: view, modifiers: [.shift, .option, .control]))
+            XCTAssertEqual(delegate.writes, [
+                Array("\u{1b}[<28;\(col + 1);\(row + 1)M".utf8),
+                Array("\u{1b}[<28;\(col + 1);\(row + 1)m".utf8),
+            ])
+        }
+        view.setFrameSize(.zero)
+        delegate.writes.removeAll()
+        view.forwardClick(try mouseEvent(.leftMouseUp, at: .zero, in: view))
+        XCTAssertEqual(delegate.writes, [Array("\u{1b}[<0;1;1M".utf8), Array("\u{1b}[<0;1;1m".utf8)])
+    }
+
+    @MainActor
+    func testPreciseForwardedScrollUsesRenderedRowHeightAndCoordinates() {
+        let view = ProjectsTerminalView(frame: NSRect(x: 0, y: 0, width: 1919, height: 1021))
+        let delegate = MouseDelegate()
+        view.terminalDelegate = delegate
+        view.allowMouseReporting = false
+        view.feed(text: "\u{1b}[?1006h")
+        let dimensions = view.terminalDimensions
+        let rendered = view.getOptimalFrameSize()
+        let cellH = rendered.height / CGFloat(dimensions.rows)
+        let event = ScrollEvent()
+        event.point = NSPoint(
+            x: (CGFloat(dimensions.cols) - 1.5) * rendered.width / CGFloat(dimensions.cols),
+            y: view.bounds.height - (CGFloat(dimensions.rows) - 1.5) * cellH)
+        event.delta = cellH / 4
+        for _ in 0..<3 {
+            XCTAssertTrue(view.forwardScroll(event, agentLive: true))
+            XCTAssertTrue(delegate.writes.isEmpty)
+        }
+        XCTAssertTrue(view.forwardScroll(event, agentLive: true))
+        let up = Array("\u{1b}[<64;\(dimensions.cols - 1);\(dimensions.rows - 1)M".utf8)
+        XCTAssertEqual(delegate.writes, [up])
+
+        delegate.writes.removeAll()
+        event.delta = -cellH
+        XCTAssertTrue(view.forwardScroll(event, agentLive: true))
+        let down = Array("\u{1b}[<65;\(dimensions.cols - 1);\(dimensions.rows - 1)M".utf8)
+        XCTAssertEqual(delegate.writes, [down])
+
+        delegate.writes.removeAll()
+        event.precise = false
+        event.delta = 100
+        XCTAssertTrue(view.forwardScroll(event, agentLive: true))
+        XCTAssertEqual(delegate.writes, Array(repeating: up, count: 8))
+    }
+
     @MainActor
     func testActualPTYOutputReachesCaptureAndParserExactlyOnce() async throws {
         let view = ProjectsTerminalView(frame: NSRect(x: 0, y: 0, width: 800, height: 480))
