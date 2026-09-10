@@ -619,16 +619,6 @@ test("a matching completed input wait reissues an older in-flight observation", 
     },
   });
 
-  test("whole-session idle clears pending permissions before its first publication", {
-    concurrency: false,
-  }, async (t) => {
-    const runtime = await createRuntime(t);
-    await runtime.session.emit("permission.requested", { requestId: "aborted" }, { agentId: uuid() });
-    const before = runtime.activityWrites.length;
-    await runtime.session.emit("session.idle", { aborted: true });
-    assert.ok(runtime.activityWrites.slice(before)
-      .every((snapshot) => snapshot.pendingPermissionRequestIds.length === 0));
-  });
   let finishOld;
   runtime.session.processingHandler = () => new Promise((resolve) => { finishOld = resolve; });
   runtime.intervalCallback();
@@ -639,6 +629,17 @@ test("a matching completed input wait reissues an older in-flight observation", 
   finishOld({ processing: false });
   await waitForActivity(runtime, (activity) =>
     activity?.processing === false && activity.observedAtMilliseconds >= completedAt);
+});
+
+test("whole-session idle clears pending permissions before its first publication", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await runtime.session.emit("permission.requested", { requestId: "aborted" }, { agentId: uuid() });
+  const before = runtime.activityWrites.length;
+  await runtime.session.emit("session.idle", { aborted: true });
+  assert.ok(runtime.activityWrites.slice(before)
+    .every((snapshot) => snapshot.pendingPermissionRequestIds.length === 0));
 });
 
 test("historical scheduled turns do not contaminate live idle classification on close", {
