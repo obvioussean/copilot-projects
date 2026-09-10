@@ -10,6 +10,7 @@ final class ForegroundActivityTests: XCTestCase {
         final class Sends {
             var count = 0
             var succeeds = true
+            var permissionRestores: [SessionStatusRecord] = []
         }
 
         let root: URL
@@ -27,7 +28,10 @@ final class ForegroundActivityTests: XCTestCase {
             directory.appendingPathComponent("\(session.id).agent-activity.json")
         }
 
-        init(root: URL? = nil, sessionId: String? = nil, owner: String? = nil) throws {
+        init(
+            root: URL? = nil, sessionId: String? = nil, owner: String? = nil,
+            permissionDelayNanoseconds: UInt64 = 1_000_000_000
+        ) throws {
             _ = NSApplication.shared
             let root = root ?? FileManager.default.temporaryDirectory
                 .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -47,7 +51,13 @@ final class ForegroundActivityTests: XCTestCase {
             let sid = session.id
             model = AppModel(
                 stateRepository: repository,
-                persistPermissionStatus: { _, _, _, _ in },
+                permissionNotificationDelayNanoseconds: permissionDelayNanoseconds,
+                persistPermissionStatus: { _, status, timestamp, promptTimestamp in
+                    sends.permissionRestores.append(
+                        SessionStatusRecord(
+                            status: status, statusTimestamp: timestamp,
+                            promptStatusTimestamp: promptTimestamp))
+                },
                 isAppActive: { false },
                 agentActivityDirectory: directory,
                 resumeMarkerDirectory: directory,
@@ -143,6 +153,202 @@ final class ForegroundActivityTests: XCTestCase {
         XCTAssertEqual(TerminalController.classifyFooterRows([
             "autopilot · / commands", "  \u{0} "
         ]), .idle)
+    }
+
+    func testSeparateModalFooterRowVetoesIdleWithoutTreatingDraftAsBusy() {
+        for hint in [
+            "esc cancel", "esc to cancel", "esc interrupt", "esc to interrupt",
+            "esc again to cancel", "esc again to interrupt",
+        ] {
+            let activity = TerminalController.classifyFooterRows([
+                hint, "ctrl+q enqueue · @ files · # issues", "  \u{0} ",
+            ])
+            XCTAssertEqual(activity, .working, hint)
+            XCTAssertEqual(
+                AppModel.remotePromptEligibility(
+                    status: .idle, hasLiveAgent: true, footerActivity: activity
+                ), .busy, hint)
+        }
+        XCTAssertEqual(
+            TerminalController.classifyFooterRows([
+                "esc cancel · tab switch", "@ files · # issues",
+            ]), .working)
+        XCTAssertEqual(
+            TerminalController.classifyFooterRows([
+                "◎ Working   esc cancel", "ctrl+q enqueue · @ files · # issues",
+            ]), .working)
+        for draft in [
+            "keep working on this", "esc cancel doesn't work",
+            "remember to esc cancel", "press esc to interrupt",
+            "esc again to stop agents", "esc stop agents",
+        ] {
+            XCTAssertEqual(
+                TerminalController.classifyFooterRows([
+                    draft, "@ files · # issues",
+                ]), .idle, draft)
+        }
+        XCTAssertEqual(
+            TerminalController.classifyFooterRows([
+                "esc cancel", "model picker",
+            ]), .unknown)
+    }
+
+    @MainActor
+    func testSuppressedPermissionRetainsWaitUntilMatchingCompletion() async throws {
+        let fixture = try Fixture(permissionDelayNanoseconds: 5_000_000)
+        defer { fixture.cleanup() }
+        let child = UUID().uuidString.lowercased()
+        let waitAt = fixture.baseMs + 100
+        var snapshot = fixture.snapshot()
+        snapshot.updatedAt = fixture.base.addingTimeInterval(0.2)
+            .formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true))
+        snapshot.runtimeActivity?.observedAtMilliseconds = waitAt + 100
+        snapshot.inputCompletions = [fixture.owner: waitAt + 50]
+        try fixture.publish(snapshot)
+        try fixture.beginWait(sender: child, timestamp: waitAt)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .waiting)
+        XCTAssertTrue(fixture.sends.permissionRestores.isEmpty)
+        XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "blocked"), .busy)
+
+        snapshot.inputCompletions = [child: waitAt + 50]
+        try fixture.publish(snapshot)
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .idle)
+        XCTAssertEqual(
+            fixture.sends.permissionRestores,
+            [
+                SessionStatusRecord(status: .idle, statusTimestamp: waitAt, promptStatusTimestamp: waitAt)
+            ])
+        XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "next"), .sent)
+    }
+
+    @MainActor
+    func testPostedPermissionRequiresFreshSenderEvidenceBeforePersistingRestore() async throws {
+        let fixture = try Fixture(permissionDelayNanoseconds: 5_000_000)
+        defer { fixture.cleanup() }
+        let child = UUID().uuidString.lowercased()
+        let waitAt = fixture.baseMs + 100
+        var snapshot = fixture.snapshot()
+        snapshot.updatedAt = fixture.base.addingTimeInterval(0.2)
+            .formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true))
+        snapshot.runtimeActivity?.observedAtMilliseconds = waitAt + 100
+        try fixture.publish(snapshot)
+        let notifications = PermissionNotificationSpy()
+        let posted = expectation(description: "permission notification posted")
+        notifications.onPost = { posted.fulfill() }
+        fixture.model.attach(notifications: notifications)
+        try fixture.beginWait(sender: child, timestamp: waitAt)
+        snapshot.pendingPermissionRequestIds = ["child-request"]
+        try fixture.publish(snapshot)
+        await fulfillment(of: [posted], timeout: 1)
+        snapshot.pendingPermissionRequestIds = []
+        snapshot.inputCompletions = [fixture.owner: waitAt + 50]
+
+        var invalidSnapshots = [snapshot]
+        snapshot.inputCompletions = [child: waitAt + 50]
+        var invalid = snapshot
+        invalid.runtimeActivity?.observedAtMilliseconds = waitAt
+        invalidSnapshots.append(invalid)
+        invalid = snapshot
+        invalid.runtimeActivity?.error = "Connection is closed."
+        invalidSnapshots.append(invalid)
+        invalid = snapshot
+        invalid.conversationEpoch = "\(UUID().uuidString):0"
+        invalidSnapshots.append(invalid)
+        invalid = snapshot
+        invalid.copilotSessionId = UUID().uuidString
+        invalidSnapshots.append(invalid)
+        invalid = snapshot
+        invalid.inputCompletions = [child: waitAt + 20_000]
+        invalidSnapshots.append(invalid)
+        for invalidSnapshot in invalidSnapshots {
+            try fixture.publish(invalidSnapshot)
+            XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .waiting)
+            XCTAssertTrue(fixture.sends.permissionRestores.isEmpty)
+            XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "blocked"), .busy)
+        }
+        let recordURL = fixture.directory.appendingPathComponent("\(fixture.session.id).status-record.json")
+        let record = try JSONDecoder().decode(SessionStatusRecord.self, from: Data(contentsOf: recordURL))
+        XCTAssertEqual(record.status, .waiting)
+        XCTAssertEqual(record.statusTimestamp, waitAt)
+        XCTAssertEqual(record.promptStatusTimestamp, waitAt)
+        XCTAssertEqual(record.inputWait?.senderSessionId, child)
+
+        snapshot.inputCompletions = [:]
+        snapshot.sessionIdleAtMilliseconds = waitAt + 50
+        try fixture.publish(snapshot)
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .idle)
+        XCTAssertEqual(
+            fixture.sends.permissionRestores,
+            [
+                SessionStatusRecord(status: .idle, statusTimestamp: waitAt, promptStatusTimestamp: waitAt)
+            ])
+    }
+
+    @MainActor
+    func testRepeatedSuppressedPermissionKeepsOriginalRestoreState() async throws {
+        let fixture = try Fixture(permissionDelayNanoseconds: 5_000_000)
+        defer { fixture.cleanup() }
+        let child = UUID().uuidString.lowercased()
+        let waitAt = fixture.baseMs + 100
+        var snapshot = fixture.snapshot()
+        snapshot.updatedAt = fixture.base.addingTimeInterval(0.3)
+            .formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true))
+        snapshot.runtimeActivity?.observedAtMilliseconds = waitAt + 200
+        try fixture.publish(snapshot)
+        fixture.model.setStatus(
+            sessionId: fixture.session.id, status: .idle,
+            text: "before permission", timestamp: fixture.baseMs)
+        try fixture.beginWait(sender: child, timestamp: waitAt)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .waiting)
+        try fixture.beginWait(sender: child, timestamp: waitAt + 10)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .waiting)
+        XCTAssertTrue(fixture.sends.permissionRestores.isEmpty)
+
+        snapshot.inputCompletions = [child: waitAt + 100]
+        try fixture.publish(snapshot)
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .idle)
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].statusText, "before permission")
+        XCTAssertEqual(
+            fixture.sends.permissionRestores,
+            [
+                SessionStatusRecord(
+                    status: .idle, statusTimestamp: waitAt + 10, promptStatusTimestamp: waitAt + 10)
+            ])
+    }
+
+    @MainActor
+    func testOverlappingPermissionNotificationsKeepLatestRestoreClocks() async throws {
+        let fixture = try Fixture(permissionDelayNanoseconds: 5_000_000)
+        defer { fixture.cleanup() }
+        let waitAt = fixture.baseMs + 100
+        try fixture.publish(fixture.snapshot())
+        fixture.model.setStatus(
+            sessionId: fixture.session.id, status: .idle,
+            text: "before permission", timestamp: fixture.baseMs)
+        for timestamp in [waitAt, waitAt + 10] {
+            fixture.model.setStatus(
+                sessionId: fixture.session.id, status: .waiting, text: nil,
+                timestamp: timestamp, notification: .permission)
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].status, .idle)
+        XCTAssertEqual(fixture.model.projects[0].sessions[0].statusText, "before permission")
+        XCTAssertEqual(fixture.sends.permissionRestores, [
+            SessionStatusRecord(
+                status: .idle, statusTimestamp: waitAt + 10, promptStatusTimestamp: waitAt + 10)
+        ])
+    }
+
+    @MainActor
+    private final class PermissionNotificationSpy: NotificationPosting {
+        var onPost: (() -> Void)?
+
+        func post(_ event: NotificationEvent) {
+            if event.kind == .permission { onPost?() }
+        }
     }
 
     @MainActor

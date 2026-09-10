@@ -2751,7 +2751,7 @@ final class AppModel: ObservableObject {
             }
         }
         let previous = projects[loc.p].sessions[loc.s].status
-        let permissionRestoreState: (
+        var permissionRestoreState: (
             status: SessionStatus,
             statusText: String?,
             scheduledTurnActive: Bool,
@@ -2761,7 +2761,6 @@ final class AppModel: ObservableObject {
             completionPending: Bool,
             foregroundIdleGenerationBaseline: Int?
         )? = notification == .permission
-            && permissionNotificationTokens[sessionId] == nil
             ? (
                 previous,
                 projects[loc.p].sessions[loc.s].statusText,
@@ -2773,6 +2772,18 @@ final class AppModel: ObservableObject {
                 foregroundIdleGenerationBaselines[sessionId]
             )
             : nil
+        if permissionRestoreState != nil,
+           previous == .waiting,
+           let retained = permissionStatusRestores[sessionId],
+           retained.statusTimestamp == previousTimestamp,
+           retained.status != .waiting {
+            permissionRestoreState = (
+                retained.status, retained.statusText, retained.scheduledTurnActive,
+                retained.finishedUnseen, retained.turnCompleted,
+                retained.backgroundAgentsSuppressed, retained.completionPending,
+                retained.foregroundIdleGenerationBaseline
+            )
+        }
         let startsScheduledTurn = source == "scheduled-start" || source == "scheduled-active"
         let endsScheduledTurn = source == "scheduled-idle"
         let scheduledStateChanges = startsScheduledTurn
@@ -2932,10 +2943,10 @@ final class AppModel: ObservableObject {
         sessionId: String,
         restore: PermissionStatusRestore
     ) {
+        permissionStatusRestores[sessionId] = restore
         guard permissionNotificationTokens[sessionId] == nil else { return }
         let token = UUID()
         permissionNotificationTokens[sessionId] = token
-        permissionStatusRestores[sessionId] = restore
         let delay = permissionNotificationDelayNanoseconds
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: delay)
@@ -3005,11 +3016,11 @@ final class AppModel: ObservableObject {
                 body: nil
             )
         case .suppress:
-            permissionStatusRestores[sessionId] = nil
             restoreStatusAfterTransientPermission(
                 sessionId: sessionId,
                 location: loc,
-                restore: restore
+                restore: restore,
+                now: Date()
             )
         }
     }
@@ -3017,27 +3028,30 @@ final class AppModel: ObservableObject {
     private func restoreCompletedPermissionWaits(now: Date) {
         for (sessionId, restore) in permissionStatusRestores {
             guard permissionNotificationTokens[sessionId] == nil,
-                  !restore.observedPendingRequestIds.isEmpty,
                   restore.status != .waiting,
                   let loc = locateIndex(sessionId),
                   projects[loc.p].sessions[loc.s].status == .waiting,
-                  sessionSemantics.statusClock.timestamp(for: sessionId) == restore.statusTimestamp,
-                  let snapshot = projects[loc.p].sessions[loc.s].agentActivity,
-                  snapshot.isFresh(at: now),
-                  snapshot.copilotSessionId?.lowercased() == restore.observedRootSessionId?.lowercased(),
-                  snapshot.conversationEpoch == restore.observedConversationEpoch,
-                  snapshot.copilotSessionId?.lowercased() == resumeMarkerValue(
-                    sessionId: sessionId, suffix: "copilot-session"
-                  )?.lowercased(),
-                  (snapshot.updatedAtMilliseconds ?? .min) > restore.statusTimestamp,
-                  snapshot.pendingPermissionRequestIds?.isEmpty == true,
-                  snapshot.trackedUserInputs?.isEmpty == true,
-                  snapshot.trackedElicitations?.isEmpty == true else {
+                  sessionSemantics.statusClock.timestamp(for: sessionId) == restore.statusTimestamp else {
                 continue
             }
-            permissionStatusRestores[sessionId] = nil
+            if inputWaits[sessionId] == nil {
+                guard !restore.observedPendingRequestIds.isEmpty,
+                      let snapshot = projects[loc.p].sessions[loc.s].agentActivity,
+                      snapshot.isFresh(at: now),
+                      snapshot.copilotSessionId?.lowercased() == restore.observedRootSessionId?.lowercased(),
+                      snapshot.conversationEpoch == restore.observedConversationEpoch,
+                      snapshot.copilotSessionId?.lowercased() == resumeMarkerValue(
+                        sessionId: sessionId, suffix: "copilot-session"
+                      )?.lowercased(),
+                      (snapshot.updatedAtMilliseconds ?? .min) > restore.statusTimestamp,
+                      snapshot.pendingPermissionRequestIds?.isEmpty == true,
+                      snapshot.trackedUserInputs?.isEmpty == true,
+                      snapshot.trackedElicitations?.isEmpty == true else {
+                    continue
+                }
+            }
             restoreStatusAfterTransientPermission(
-                sessionId: sessionId, location: loc, restore: restore
+                sessionId: sessionId, location: loc, restore: restore, now: now
             )
         }
     }
@@ -3045,9 +3059,20 @@ final class AppModel: ObservableObject {
     private func restoreStatusAfterTransientPermission(
         sessionId: String,
         location: (p: Int, s: Int),
-        restore: PermissionStatusRestore
+        restore: PermissionStatusRestore,
+        now: Date
     ) {
+        guard sessionSemantics.statusClock.timestamp(for: sessionId) == restore.statusTimestamp else {
+            return
+        }
         var session = projects[location.p].sessions[location.s]
+        if inputWaits[sessionId] != nil {
+            guard inputWaitWasResolved(
+                for: session,
+                foreground: runtimeForegroundActivity(for: session, now: now),
+                now: now
+            ) else { return }
+        }
         session.status = restore.status
         session.statusText = restore.statusText
         session.scheduledTurnActive = restore.scheduledTurnActive
@@ -3089,6 +3114,7 @@ final class AppModel: ObservableObject {
         if restore.completionPending {
             postCompletionIfReady(sessionId: sessionId)
         }
+        permissionStatusRestores[sessionId] = nil
     }
 
     /// Scheduled pre/post hooks reaffirm background activity but do not describe
@@ -3585,6 +3611,7 @@ final class AppModel: ObservableObject {
     private func clearStatusToIdle(pi: Int, si: Int, markFinished: Bool, effectiveTime: Int64? = nil) {
         let sid = projects[pi].sessions[si].id
         sessionSemantics.activityTracker.reset(sessionId: sid)
+        cancelPermissionNotification(sessionId: sid)
         projects[pi].sessions[si].status = .idle
         projects[pi].sessions[si].statusText = nil
         if markFinished, !isVisible(projectIndex: pi, sessionIndex: si) {

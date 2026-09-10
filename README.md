@@ -379,7 +379,8 @@ the coordinator finished. Background agents do not make an idle coordinator busy
 The host uses fresh runtime observations for status and prompt eligibility without rewriting
 ordering clocks to heartbeat time. Input waits are released only by matching, same-conversation
 completion evidence after the wait, with no other input pending. Submitted prompts remain fenced
-until the coordinator acknowledges activity. Terminal footer checks still protect modal UI,
+until the coordinator acknowledges activity. Suppressed permission notifications use the same
+sender-scoped completion check before restoring status. Terminal footer checks still protect modal UI,
 including when a draft or autopilot changes the visible shortcut hints; unknown and modal
 footers do not become permission to inject text.
 

@@ -75,11 +75,31 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
         }
     }
 
+    nonisolated private static let modalFooterHints = [
+        "esc cancel", "esc to cancel", "esc interrupt", "esc to interrupt",
+        "esc again to cancel", "esc again to interrupt",
+    ]
+
     /// Classify copilot's footer line into coarse activity. Pure/static so it can be
     /// unit-tested against captured fixtures.
     nonisolated static func classifyFooterRows(_ rows: [String]) -> FooterActivity {
         guard let footer = rows.last(where: { !isEmptyFooterRow($0) }) else { return .unknown }
-        return classifyFooter(footer)
+        let activity = classifyFooter(footer)
+        guard activity == .idle else { return activity }
+        // Modal chrome can sit above the shortcuts. Do not classify arbitrary
+        // draft/output rows as busy just because they contain "working".
+        let hasModalHint = rows.contains { row in
+            row.split(separator: "·").contains { part in
+                let hint = part.trimmingCharacters(
+                    in: CharacterSet.whitespacesAndNewlines.union(.controlCharacters)
+                ).lowercased()
+                guard let suffix = modalFooterHints.first(where: { hint.hasSuffix($0) }) else { return false }
+                let prefix = hint.dropLast(suffix.count).trimmingCharacters(in: .whitespaces)
+                return prefix.isEmpty
+                    || prefix.range(of: #"^[^\p{L}\p{N}]*working$"#, options: .regularExpression) != nil
+            }
+        }
+        return hasModalHint ? .working : .idle
     }
 
     nonisolated private static func isEmptyFooterRow(_ row: String) -> Bool {
@@ -91,10 +111,7 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     nonisolated static func classifyFooter(_ footerLine: String) -> FooterActivity {
         let f = footerLine.lowercased()
         guard !f.trimmingCharacters(in: .whitespaces).isEmpty else { return .unknown }
-        if f.contains("esc cancel") || f.contains("esc to cancel")
-            || f.contains("esc interrupt") || f.contains("esc to interrupt")
-            || f.contains("esc again to cancel") || f.contains("esc again to interrupt")
-            || f.contains("working") {
+        if modalFooterHints.contains(where: { f.contains($0) }) || f.contains("working") {
             return .working
         }
         if f.contains("tab next tab") || (f.contains("? help") && f.contains("/ commands")) {
