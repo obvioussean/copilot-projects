@@ -202,7 +202,13 @@ The bearer token is never placed in the callback URL in plaintext. Deploy the ga
 before distributing an iOS build that uses this route; older iOS clients continue to work.
 
 The mobile web client can list projects, select a terminal, and acquire the single remote writer
-lease. Its Markdown-rendered completed-turn pane mirrors the desktop drawer and includes a message
+lease. Amber session indicators identify questions and permission prompts; blue indicators mark
+unseen completed work or notifications. Project badges and the **Needs attention** count let you
+scan the workspace, and **Next** cycles through waiting sessions before unseen activity. A banner
+links to the question or terminal without changing your view when an update arrives. **Mark seen**
+clears unseen activity across devices, just as viewing the session on the Mac does; it never
+dismisses a pending question.
+Its Markdown-rendered completed-turn pane mirrors the desktop drawer and includes a message
 composer with per-session drafts that survive session switches and reloads. Sending is enabled only
 when a fresh server-side check confirms Copilot is alive and its foreground prompt is idle,
 with no pending question or permission prompt. Background work can continue while the foreground
