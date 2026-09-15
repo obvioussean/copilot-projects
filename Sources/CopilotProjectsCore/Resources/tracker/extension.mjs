@@ -133,14 +133,15 @@ if (validSessionId && socketPath) {
     const closeSessionRequestName = `${appSessionId}.close-session-request`;
     const activeSubagents = new Map();
     // All outstanding structured questions (root and subagent), keyed by
-    // requestId. Starts empty every launch: stale question state is never
-    // resurrected from disk, only rebuilt from live events.
+    // requestId. Rebuilt from live events and the runtime's pending snapshot,
+    // never resurrected from disk.
     const pendingUserInputs = new Map();
     const inFlightUserInputResponses = new Set();
     // Outstanding elicitations (schema-form / url questions), keyed by
-    // requestId. Same lifecycle as pendingUserInputs: rebuilt from live
-    // events, never resurrected from disk.
+    // requestId. Same lifecycle as pendingUserInputs.
     const pendingElicitations = new Map();
+    const recoveredQuestionToolCallIds = new Set();
+    let pendingQuestionRecovery = null;
     const inFlightElicitationResponses = new Set();
     const operationReceipts = new Map();
     const activeOperationKeys = new Set();
@@ -260,6 +261,7 @@ if (validSessionId && socketPath) {
     const MAX_TRANSCRIPT_EVENT_IDS = 50_000;
     const MAX_DURABLE_EVENT_BYTES = 4 * 1_024 * 1_024;
     const HISTORY_REPLAY_TIMEOUT_MS = 5_000;
+    const PENDING_QUESTIONS_TIMEOUT_MS = 2_000;
     const DURABLE_REPLAY_TIMEOUT_MS = 5_000;
     const DURABLE_RECONCILE_DEBOUNCE_MS = 200;
     const DURABLE_RECONCILE_POLL_MS = 5_000;
@@ -1513,27 +1515,16 @@ if (validSessionId && socketPath) {
                 response: { answer, wasFreeform },
             });
             if (!operationAuthorityCurrent(executionContext)) return;
+            const resolved = typeof result?.success === "boolean";
+            if (resolved) {
+                pendingQuestionRecovery?.completed.add(requestId);
+                pendingUserInputs.delete(requestId);
+            }
             if (operation.mode === "legacy") {
-                if (result?.success === true) {
-                    pendingUserInputs.delete(requestId);
-                    removeCapturedHandoff(
-                        userInputResponsePath,
-                        encoded,
-                        executionContext
-                    );
-                    publish();
-                } else {
-                    removeCapturedHandoff(
-                        userInputResponsePath,
-                        encoded,
-                        executionContext
-                    );
-                }
+                removeCapturedHandoff(userInputResponsePath, encoded, executionContext);
+                if (resolved) publish();
             } else {
                 const outcome = rpcReceiptOutcome(result);
-                if (outcome.state === "applied") {
-                    pendingUserInputs.delete(requestId);
-                }
                 const published = publishTerminalReceipt(
                     operation.context,
                     outcome.state,
@@ -1665,6 +1656,79 @@ if (validSessionId && socketPath) {
         }
     }
 
+    function suppressRecoveredDurableQuestion(toolCallId) {
+        if (typeof toolCallId !== "string" || !toolCallId
+                || toolCallId.length > 200) return;
+        recoveredQuestionToolCallIds.add(toolCallId);
+        const requestId = DURABLE_ASK_USER_PREFIX + toolCallId;
+        if (durableAskUser?.requestId === requestId) durableAskUser = null;
+        if (durableAskUserScan?.requestId === requestId) durableAskUserScan = null;
+    }
+
+    async function recoverPendingQuestions(generation) {
+        if (generation !== conversationGeneration || shuttingDown) return;
+        const recovery = {
+            sessionId: copilotSessionId,
+            completed: new Set(),
+        };
+        pendingQuestionRecovery = recovery;
+        let timeout = null;
+        const current = () => !shuttingDown
+            && pendingQuestionRecovery === recovery
+            && generation === conversationGeneration
+            && recovery.sessionId === copilotSessionId;
+        try {
+            if (typeof session.connection?.sendRequest !== "function") {
+                throw Object.assign(new Error("pending question RPC unavailable"), { code: -32601 });
+            }
+            const result = await Promise.race([
+                session.connection.sendRequest("session.ui.pendingRequests", {
+                    sessionId: recovery.sessionId,
+                }),
+                new Promise((_, reject) => {
+                    timeout = setTimeout(
+                        () => reject(new Error("pending question recovery timed out")),
+                        PENDING_QUESTIONS_TIMEOUT_MS
+                    );
+                }),
+            ]);
+            if (!current()) return;
+            if (!Array.isArray(result?.userInputRequests)
+                    || !Array.isArray(result?.elicitationRequests)) {
+                throw new Error("invalid pending question snapshot");
+            }
+            for (const [items, pending, parse, maximum] of [
+                [result.userInputRequests, pendingUserInputs, userInputEntry, MAX_USER_INPUTS],
+                [result.elicitationRequests, pendingElicitations, elicitationEntry, MAX_ELICITATIONS],
+            ]) {
+                for (const data of items.slice(-maximum)) {
+                    if (recovery.completed.has(data?.requestId)) continue;
+                    const entry = parse({ data });
+                    if (!entry) continue;
+                    // Live events win over an older snapshot, including their agent ownership.
+                    if (!pending.has(entry.requestId)) {
+                        if (pending.size >= maximum) continue;
+                        pending.set(entry.requestId, entry);
+                    }
+                    if (!pending.get(entry.requestId).agentId) {
+                        suppressRecoveredDurableQuestion(data.toolCallId);
+                    }
+                }
+            }
+            publish();
+        } catch (error) {
+            if (!current()) return;
+            if (error?.code === -32601) {
+                console.error("[copilot-projects] pending question recovery unavailable; using terminal fallback");
+            } else {
+                console.error("[copilot-projects] pending question recovery failed:", error);
+            }
+        } finally {
+            clearTimeout(timeout);
+            if (pendingQuestionRecovery === recovery) pendingQuestionRecovery = null;
+        }
+    }
+
     function clearDurableAskUser() {
         const changed = durableAskUser !== null
             || durableAskUserScan !== null;
@@ -1750,7 +1814,8 @@ if (validSessionId && socketPath) {
                 || userInputByteLength(message)
                     > MAX_ELICITATION_MESSAGE_BYTES
                 || typeof toolCallId !== "string" || !toolCallId
-                || toolCallId.length > 200) {
+                || toolCallId.length > 200
+                || recoveredQuestionToolCallIds.has(toolCallId)) {
             return null;
         }
         const requestedAt = normalizedTimestamp(event.timestamp);
@@ -1945,27 +2010,16 @@ if (validSessionId && socketPath) {
                 result,
             });
             if (!operationAuthorityCurrent(executionContext)) return;
+            const resolved = typeof rpcResult?.success === "boolean";
+            if (resolved) {
+                pendingQuestionRecovery?.completed.add(requestId);
+                pendingElicitations.delete(requestId);
+            }
             if (operation.mode === "legacy") {
-                if (rpcResult?.success === true) {
-                    pendingElicitations.delete(requestId);
-                    removeCapturedHandoff(
-                        elicitationResponsePath,
-                        encoded,
-                        executionContext
-                    );
-                    publish();
-                } else {
-                    removeCapturedHandoff(
-                        elicitationResponsePath,
-                        encoded,
-                        executionContext
-                    );
-                }
+                removeCapturedHandoff(elicitationResponsePath, encoded, executionContext);
+                if (resolved) publish();
             } else {
                 const outcome = rpcReceiptOutcome(rpcResult);
-                if (outcome.state === "applied") {
-                    pendingElicitations.delete(requestId);
-                }
                 const published = publishTerminalReceipt(
                     operation.context,
                     outcome.state,
@@ -2925,6 +2979,7 @@ if (validSessionId && socketPath) {
         // empty and would otherwise blank the model line the rotation event
         // just taught us.
         const preservedModel = currentModel;
+        const pendingQuestions = recoverPendingQuestions(generation);
         let history = [];
 
         durableTranscriptAuthoritative = durableHistoryAvailable();
@@ -3016,6 +3071,8 @@ if (validSessionId && socketPath) {
             }
         }
         queuedTranscriptEvents.length = 0;
+        await pendingQuestions;
+        if (stale()) return;
         publish();
         if (durableTranscriptAuthoritative) {
             scheduleDurableReconcile(0);
@@ -3039,6 +3096,8 @@ if (validSessionId && socketPath) {
         pendingUserInputs.clear();
         inFlightUserInputResponses.clear();
         pendingElicitations.clear();
+        recoveredQuestionToolCallIds.clear();
+        pendingQuestionRecovery = null;
         inFlightElicitationResponses.clear();
         pendingPermissionRequests.clear();
         completedPermissionRequests.clear();
@@ -3809,6 +3868,7 @@ if (validSessionId && socketPath) {
 
     session.on("user_input.completed", (event) => {
         const requestId = event.data?.requestId;
+        pendingQuestionRecovery?.completed.add(requestId);
         const cleared = observeLiveRootQuestion(event);
         const entry = pendingUserInputs.get(requestId);
         if (entry) {
@@ -3834,6 +3894,7 @@ if (validSessionId && socketPath) {
 
     session.on("elicitation.completed", (event) => {
         const requestId = event.data?.requestId;
+        pendingQuestionRecovery?.completed.add(requestId);
         const cleared = observeLiveRootQuestion(event);
         const entry = pendingElicitations.get(requestId);
         if (entry) {
