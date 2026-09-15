@@ -34,11 +34,13 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
 - **Private remote control:** expose a mobile web terminal behind Cloudflare Access + GitHub SSO,
   with scrollback, safe clickable links, project/session status, live screen snapshots, and a
   single remote writer lease.
-  On CLI versions supporting `session.ui.pendingRequests`, the tracker recovers questions
-  already waiting when it attaches or switches conversations. Native iOS and web transcript
-  forms can answer these using the original request ID, including free-text responses.
-  Older CLIs retain the **Open terminal** fallback; transcript history alone cannot safely
-  reconstruct an answerable question.
+  The tracker also reads question events on its five-second heartbeat, so a missed live
+  notification does not leave iOS and web transcript forms stuck on **Open terminal**.
+  Text, choices, and other supported forms use the original response ID. This works with
+  the existing CLI event API; no new CLI version is required for missed-event recovery.
+  An optional pending-question snapshot API also recovers older prompts on supporting CLIs.
+  If a question has already left the CLI's in-memory event history and no snapshot is
+  available, it remains answerable through **Open terminal** rather than a guessed response ID.
 - **Notifications:** native macOS banners identify the originating project/session and
   automatically alert when Copilot has a question, needs permission, or finishes a task.
   Task completions include a short, plain-text preview of the completed turn's response
