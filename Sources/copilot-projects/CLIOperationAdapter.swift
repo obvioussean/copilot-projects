@@ -6,6 +6,10 @@ enum CLISDKOperationKind: String, Codable {
     case answerUserInput = "answer-user-input"
     case answerElicitation = "answer-elicitation"
     case setModel = "set-model"
+    case sessionSend = "session-send"
+    case sessionAbort = "session-abort"
+    case setSessionBudget = "set-session-budget"
+    case answerSessionBudget = "answer-session-budget"
 }
 
 struct CLIOperationRequest: Equatable {
@@ -61,6 +65,10 @@ struct CLIOperationAdapter {
         "user-input-response.json",
         "elicitation-response.json",
         "set-model-request.json",
+        "session-send.json",
+        "session-abort.json",
+        "set-session-budget.json",
+        "answer-session-budget.json",
     ]
 
     private struct FingerprintEnvelope<Payload: Encodable>: Encodable {

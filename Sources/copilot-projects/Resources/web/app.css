@@ -1,4 +1,15 @@
 :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
+#session-workflow { flex:none; padding:10px; border-bottom:1px solid #333; font-size:12px;
+  max-height:40vh; overflow:auto; }
+#session-workflow p { margin:8px 0; white-space:pre-wrap; }
+#session-workflow input { width:150px; max-width:100%; }
+#session-workflow button, #native-prompt-controls button { min-height:32px; }
+#native-prompt-controls { display:flex; gap:8px; align-items:center; }
+#native-prompt-controls[hidden], #session-workflow[hidden],
+#workflow-budget-edit[hidden], #workflow-budget-answer[hidden] { display:none; }
+.task-result pre { overflow:auto; max-height:320px; font-size:11px; white-space:pre; }
+.task-result details { margin:8px 0; }
+.task-result summary { cursor:pointer; overflow-wrap:anywhere; }
 * { box-sizing: border-box; }
 html, body { margin: 0; background: #111; color: #eee; overscroll-behavior:none; }
 body { position:fixed; inset:0; width:100%; height: 100vh; height: 100dvh; overflow: hidden;

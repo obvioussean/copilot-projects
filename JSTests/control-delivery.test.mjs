@@ -48,7 +48,8 @@ function client(info = protocol()) {
     promptQueue: node(), promptStatus: node(), promptForm: node(), prompt: node(), promptSubmit: node(),
     lease: node(), input: node(), terminal: node(), inputDeliveryNotice: node(),
     inputDeliveryText: node(), discardPendingInput: node(), QUEUE_CAP: 25,
-    updateCloseSessionState() {}, renderModelLine() {},
+    updateCloseSessionState() {}, renderModelLine() {}, renderWorkflow() {},
+    RECEIPT_TIMEOUT_MS: 20000,
     newUUID: () => `00000000-0000-4000-8000-${String(++uuid).padStart(12, '0')}`,
     setTimeout: (callback, delay) => { const id = ++timerID; timers.set(id, {callback, delay}); return id; },
     clearTimeout: id => timers.delete(id),
@@ -56,6 +57,7 @@ function client(info = protocol()) {
   });
   context.controlDeliveries = context.createControlDeliveryAllocator();
   vm.runInContext(sourceSection('function selectTerminalInputSession(', '// ---- Model picker'), context);
+  vm.runInContext(sourceSection('function reconcileWorkflowPrompts()', 'function clearModelOperationState('), context);
   vm.runInContext(sourceSection('function updatePromptState(message)', 'function clearUserInputSubmission('), context);
   return {
     context, calls, timers,
@@ -93,6 +95,70 @@ test('replay support needs both the capability and a valid host epoch', () => {
   assert.equal(c.controlDeliverySupport(protocol(null)).kind, 'unavailable');
   assert.equal(c.controlDeliverySupport(protocol('not-an-epoch')).kind, 'unavailable');
   assert.deepEqual(plain(c.controlDeliverySupport(protocol())), {kind: 'replay-safe', epoch});
+});
+
+test('native prompt delivery waits for the exact SDK receipt, not HTTP acceptance', async () => {
+  const info = protocol();
+  info.capabilities.push('native-session-workflows', 'sdk-operation-receipts');
+  const {context: c, calls} = client(info);
+  const session = c.sessionState.get('A');
+  Object.assign(session, {
+    operationSupport: 'receipts',
+    workflow: {version: 1, observedAtMilliseconds: Date.now(),
+      capabilities: ['session-send'], sendReady: true},
+  });
+  assert.equal(c.enqueuePrompt('native work'), true);
+  await settle();
+  assert.equal(calls[0].type, 'session-send');
+  assert.equal(c.sessionQueue('A').length, 1);
+  await c.flushQueue();
+  assert.equal(calls.length, 1);
+  session.operationReceipts = [{
+    operationId: calls[0].requestId, conversationEpoch: 'conversation-A',
+    kind: 'session-send', state: 'applied', updatedAtMilliseconds: Date.now(),
+  }];
+  c.reconcileWorkflowPrompts();
+  assert.equal(c.sessionQueue('A').length, 0);
+});
+
+test('native prompt uncertainty is never replayed and a late receipt resolves it off-tab', async () => {
+  const info = protocol();
+  info.capabilities.push('native-session-workflows', 'sdk-operation-receipts');
+  const {context: c, calls} = client(info);
+  const session = c.sessionState.get('A');
+  Object.assign(session, {
+    operationSupport: 'receipts',
+    workflow: {version: 1, observedAtMilliseconds: Date.now(),
+      capabilities: ['session-send'], sendReady: true},
+  });
+
+  c.control = async message => { calls.push(plain(message)); return null; };
+  c.enqueuePrompt('uncertain native work');
+  await settle();
+  assert.ok(c.sessionQueue('A')[0].blockedReason);
+  await c.flushQueue();
+  assert.equal(calls.length, 1);
+  switchSession(c, 'B');
+  session.operationReceipts = [{
+    operationId: calls[0].requestId, conversationEpoch: 'conversation-A',
+    kind: 'session-send', state: 'applied', updatedAtMilliseconds: Date.now(),
+  }];
+  c.reconcileWorkflowPrompts();
+  assert.equal(c.sessionQueue('A').length, 0);
+  assert.equal(c.selected, 'B');
+});
+
+test('only positively unsupported native runtimes can use the legacy prompt path', async () => {
+  for (const fallback of [false, true]) {
+    const {context: c, calls} = client();
+    c.sessionState.get('A').workflow = {
+      version: 1, observedAtMilliseconds: 0, capabilities: [], sendReady: false,
+      legacyPromptFallback: fallback,
+    };
+    assert.equal(c.enqueuePrompt('compatibility'), fallback);
+    await settle();
+    assert.deepEqual(calls.map(call => call.type), fallback ? ['prompt'] : []);
+  }
 });
 
 test('delivery sequences are independent per session/lane and immutable after dispatch', () => {

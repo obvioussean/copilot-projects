@@ -20,6 +20,7 @@ let lastRenderedTranscript = null;
 // window: every render evicts the entries it didn't use, so this is never a
 // growing global memo.
 const transcriptCardCache = new Map();
+let taskResultCardCache = null;
 // Scroll anchor captured when "Show earlier" is clicked, so the widened
 // window lands on the same content even though the older turns arrive from a
 // later fetch (and even if a revision renders in between).
@@ -71,6 +72,7 @@ function clearTranscriptCardCache() {
   const releasing = Array.from(transcriptCardCache.values());
   transcriptCardCache.clear();
   transcriptShowEarlier = null;
+  taskResultCardCache = null;
   releasing.forEach(releaseTranscriptCardEntry);
 }
 
@@ -263,6 +265,54 @@ function buildTranscriptCard(sessionId, turn, signature) {
   return { card, signature, imageNodes };
 }
 
+function buildTaskResultCard(result) {
+  const signature = JSON.stringify(result);
+  if (taskResultCardCache?.signature === signature) return taskResultCardCache.card;
+  const card = document.createElement('article');
+  card.className = 'turn task-result';
+  card.dataset.turnId = `result-${result.turnId}`;
+  const text = (tag, content) => {
+    const node = document.createElement(tag);
+    node.textContent = content;
+    return node;
+  };
+  card.append(text('strong', 'Latest task result'),
+    text('p', result.status === 'blocked' ? 'Blocked' : result.status === 'stopped' ? 'Stopped' : 'Finished'));
+  if (result.summary) card.append(text('p', result.summary));
+  if (result.branch) card.append(text('p', `Branch: ${result.branch}`));
+  if (result.error) card.append(text('p', result.error));
+  for (const check of result.checks || []) {
+    card.append(text('p', `${check.title}: ${Number.isSafeInteger(check.exitCode)
+      ? `exited ${check.exitCode}` : 'completion not verified'}`));
+  }
+  if (result.diff) {
+    const diff = result.diff;
+    const details = document.createElement('details');
+    details.append(text('summary', diff.mode === 'session' && !diff.isFallback
+      ? 'Changes in this session' : 'Working-tree changes (not attributed to this task)'));
+    details.append(text('p', 'Captured after the task. This is not a per-turn diff.'));
+    if (diff.unavailableReason) details.append(text('p', diff.unavailableReason));
+    if (diff.truncated) details.append(text('p', 'Diff truncated; inspect the full working tree in Terminal.'));
+    for (const change of diff.changes || []) {
+      const file = document.createElement('details');
+      file.append(text('summary', change.path), text('pre', change.diff));
+      if (change.truncated) file.append(text('p', 'File diff truncated'));
+      details.append(file);
+    }
+    card.append(details);
+  }
+  for (const link of result.pullRequests || []) {
+    if (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/[1-9]\d*$/.test(link)) continue;
+    const anchor = text('a', 'Pull request reported by tool');
+    anchor.href = link;
+    anchor.target = '_blank';
+    anchor.rel = 'noopener noreferrer';
+    card.append(anchor);
+  }
+  taskResultCardCache = { signature, card };
+  return card;
+}
+
 function renderTranscript(snapshot) {
   lastRenderedTranscript = snapshot;
   // The Conversation pane is hidden: keep the snapshot, build nothing. The
@@ -351,6 +401,7 @@ function renderTranscript(snapshot) {
   transcriptCardCache.clear();
   retained.forEach((entry, key) => transcriptCardCache.set(key, entry));
   const focusedBefore = transcriptFocusedElement();
+  if (snapshot?.latestResult) desired.push(buildTaskResultCard(snapshot.latestResult));
   reconcileTranscriptChildren(desired);
   // Only a genuinely reordered node gets moved, and only such a move can
   // blur focus the transcript owned. Restore it (without scrolling) instead

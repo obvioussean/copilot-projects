@@ -11059,8 +11059,9 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(RemoteWebAssets.javascript.contains("rel = 'noopener noreferrer'"))
         XCTAssertTrue(RemoteWebAssets.javascript.contains("push/subscribe"))
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
-            "q.push(controlAction(newUUID(), 'prompt', selected, value));"
+            "const entry = controlAction(newUUID(), 'prompt', selected, value);"
         ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("q.push(entry);"))
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
             "transcript?s=${encodeURIComponent(sessionId)}"
         ))

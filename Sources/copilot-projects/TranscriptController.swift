@@ -27,6 +27,7 @@ final class TranscriptController: ObservableObject {
         let transcript: FileSignature
         let owner: FileSignature?
         let quarantine: FileSignature?
+        let taskResult: FileSignature?
     }
 
     private struct LoadResult: Sendable {
@@ -157,7 +158,10 @@ final class TranscriptController: ObservableObject {
                 snapshot: nil
             )
         }
-        return LoadResult(signature: signature, snapshot: snapshot)
+        return LoadResult(
+            signature: signature,
+            snapshot: attachingTaskResult(snapshot, sessionId: sessionId)
+        )
     }
 
     nonisolated static func remoteRevision(sessionId: String) -> RemoteTranscriptRevision {
@@ -167,6 +171,7 @@ final class TranscriptController: ObservableObject {
                 fileGeneration(Paths.transcriptSnapshotPath(sessionId: sessionId)),
                 fileGeneration(Paths.transcriptOwnerPath(sessionId: sessionId)),
                 fileGeneration(Paths.transcriptQuarantinePath(sessionId: sessionId)),
+                fileGeneration(taskResultPath(sessionId)),
             ].joined(separator: "|")
         )
     }
@@ -205,7 +210,49 @@ final class TranscriptController: ObservableObject {
         ) else {
             return emptyRemoteSnapshot()
         }
-        return snapshot
+        return attachingTaskResult(snapshot, sessionId: sessionId)
+    }
+
+    private struct TaskResultEnvelope: Decodable {
+        let schemaVersion: Int
+        let copilotSessionId: String
+        let result: RemoteTaskResult
+    }
+
+    nonisolated private static func taskResultPath(_ sessionId: String) -> String {
+        Paths.sessionsDir.appendingPathComponent("\(sessionId).task-result.json").path
+    }
+
+    nonisolated static func attachingTaskResult(
+        _ snapshot: TranscriptSnapshot,
+        sessionId: String,
+        directory: URL = Paths.sessionsDir
+    ) -> TranscriptSnapshot {
+        let url = directory.appendingPathComponent("\(sessionId).task-result.json")
+        var result: RemoteTaskResult?
+        if FileManager.default.fileExists(atPath: url.path) {
+            do {
+                let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+                guard let size = attributes[.size] as? NSNumber, size.intValue <= 256 * 1_024 else {
+                    throw CocoaError(.fileReadTooLarge)
+                }
+                let envelope = try transcriptDecoder().decode(
+                    TaskResultEnvelope.self, from: Data(contentsOf: url)
+                )
+                if envelope.schemaVersion == 1,
+                   envelope.copilotSessionId == snapshot.copilotSessionId,
+                   snapshot.turns.contains(where: { $0.id == envelope.result.turnId }) {
+                    result = envelope.result
+                }
+            } catch {
+                NSLog("copilot-projects: could not load task result: \(error)")
+            }
+        }
+        return TranscriptSnapshot(
+            schemaVersion: snapshot.schemaVersion, updatedAt: snapshot.updatedAt,
+            copilotSessionId: snapshot.copilotSessionId, turns: snapshot.turns,
+            totalTurns: snapshot.totalTurns, latestResult: result
+        )
     }
 
     /// Synchronously validates whether the process recorded in
@@ -614,7 +661,8 @@ final class TranscriptController: ObservableObject {
         return LoadSignature(
             transcript: transcript,
             owner: fileSignature(Paths.transcriptOwnerPath(sessionId: sessionId)),
-            quarantine: fileSignature(Paths.transcriptQuarantinePath(sessionId: sessionId))
+            quarantine: fileSignature(Paths.transcriptQuarantinePath(sessionId: sessionId)),
+            taskResult: fileSignature(taskResultPath(sessionId))
         )
     }
 

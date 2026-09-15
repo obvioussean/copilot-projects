@@ -66,6 +66,25 @@
         </div>
       </section>
       <aside id="transcript-pane" role="tabpanel" aria-label="Conversation">
+        <details id="session-workflow" hidden>
+          <summary>Usage and background work</summary>
+          <p id="workflow-detail"></p>
+          <p id="workflow-background"></p>
+          <div id="workflow-budget-edit">
+            <input id="workflow-limit" type="number" min="30" step="any"
+              aria-label="Session soft limit in AI credits" placeholder="Soft limit (minimum 30)">
+            <button id="workflow-set-limit" type="button">Set limit</button>
+            <button id="workflow-unset-limit" type="button">Remove limit</button>
+          </div>
+          <div id="workflow-budget-answer" hidden>
+            <p id="workflow-budget-question"></p>
+            <input id="workflow-additional" type="number" min="0" step="any"
+              aria-label="Additional AI credits" placeholder="Additional AI credits">
+            <button id="workflow-continue" type="button">Continue</button>
+            <button id="workflow-cancel-budget" type="button">Stop blocked request</button>
+          </div>
+          <p id="workflow-operation-status" role="status"></p>
+        </details>
         <div id="transcript-header">
           <strong>Completed turns</strong>
           <span id="prompt-status" role="status" aria-live="polite" aria-atomic="true">
@@ -84,6 +103,13 @@
               <span id="model-line-name">Model</span>
               <span id="model-line-chevron" aria-hidden="true">&#9662;</span>
             </button>
+          </div>
+          <div id="native-prompt-controls" hidden>
+            <select id="native-prompt-mode" aria-label="Message delivery">
+              <option value="enqueue">Run after current task</option>
+              <option value="immediate">Steer current task</option>
+            </select>
+            <button id="native-stop" type="button">Stop task</button>
           </div>
           <button id="prompt-submit" disabled>Send message</button>
         </form>

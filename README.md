@@ -57,6 +57,51 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
   menu-bar Open, notifications, and CLI focus all restore the main window. **Quit Copilot
   Projects** still performs the normal graceful detach and persistence drain.
 
+## Native session workflows
+
+With Copilot CLI 1.0.84 or newer on SDK protocol 3, the tracker offers native
+session controls through the existing private gateway. iOS and web composers
+can **Run after current task** or **Steer current task** without clearing the
+desktop CLI draft. **Stop task** requests cancellation without closing the tab,
+shell, or dtach session. Terminal controls remain available for other TUIs and
+unsupported CLI versions.
+
+Native actions retain the writer lease, conversation identity, and SDK operation
+receipt checks. HTTP acceptance is not completion. A send's `applied` receipt
+means Copilot accepted the message, not that it finished the task. Unknown
+outcomes are never automatically resubmitted or downgraded to terminal input.
+Stop has its own handoff lane, so an unresolved send cannot block cancellation.
+
+The session drawer and native/web conversation views include a **Latest task
+result** with the final response, branch, available diff, execution-derived check
+exit statuses, and PR links reported by tools. Diffs are cumulative session
+captures or explicitly labeled working-tree fallbacks, never per-turn attribution.
+Simple check commands need structured shell-exit metadata; a successful tool call,
+an asynchronous shell, or an assistant's assertion does not prove tests passed.
+The latest result is kept in one bounded private sidecar, not copied into every
+historical turn. Streaming text replaces its matching final message.
+
+**Usage and background work** shows accumulated session AI credits, the latest
+context observation, active agents, and schedules. Session totals and the current
+budget accounting window are deliberately separate. Users can opt into an AI-credit
+soft limit (minimum 30), remove it, or answer a live exhausted-budget request by
+adding credits or cancelling the blocked model request. There is no default limit.
+Limits are checked by Copilot after model calls and can be exceeded by the last
+call. A new budget request sends the existing Mac/APNs/web notification flow.
+
+Capabilities require fresh runtime evidence; unsupported or unavailable operations
+stay disabled. Restart/reload the tracker in existing CLI sessions to activate an
+updated tracker. Deploy the Mac host before clients using the new protocol.
+
+An optional offline integration test exercises the installed CLI/SDK pair against
+a loopback model fixture, without real model requests:
+
+```bash
+COPILOT_WORKFLOW_SDK=/path/to/copilot-sdk \
+COPILOT_WORKFLOW_CLI=/path/to/copilot \
+node --test JSTests/workflow-runtime.test.mjs
+```
+
 ## Install
 
 Download the latest `Copilot-Projects-<version>.dmg` from

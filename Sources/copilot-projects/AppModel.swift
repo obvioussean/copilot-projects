@@ -429,6 +429,7 @@ final class AppModel: ObservableObject {
         let controller: TerminalController?
     }
     private var permissionNotificationTokens: [String: UUID] = [:]
+    private var budgetNotificationKeys: [String: String] = [:]
     private var permissionStatusRestores: [String: PermissionStatusRestore] = [:]
     private let isAppActive: @MainActor () -> Bool
     private let agentActivityDirectory: URL
@@ -1519,7 +1520,8 @@ final class AppModel: ObservableObject {
                                 .remoteAvailableModels(),
                             conversationEpoch: operation.conversationEpoch,
                             operationSupport: operation.support,
-                            operationReceipts: operation.receipts
+                            operationReceipts: operation.receipts,
+                            workflow: session.agentActivity?.workflow
                         )
                     }
                 )
@@ -2289,6 +2291,116 @@ final class AppModel: ObservableObject {
                     contextTier: selection.contextTier
                 )
             }
+        )
+    }
+
+    func performSessionAction(
+        sessionId: String,
+        action: RemoteSessionAction,
+        operation: CLIOperationRequest,
+        now: Date = Date()
+    ) -> RemoteUserInputResult {
+        guard locateIndex(sessionId) != nil, action.isValid,
+              let kind = CLISDKOperationKind(rawValue: action.kind.rawValue) else {
+            return .invalid
+        }
+        let adapter = CLIOperationAdapter(
+            activityDirectory: agentActivityDirectory,
+            resumeMarkerDirectory: resumeMarkerDirectory
+        )
+        return adapter.submit(
+            sessionId: sessionId,
+            kind: kind,
+            operation: operation,
+            fingerprintPayload: action,
+            handoffSuffix: "\(kind.rawValue).json",
+            now: now,
+            validate: { snapshot in
+                guard let workflow = snapshot.workflow,
+                      workflow.supports(action.kind, at: now) else { return false }
+                switch action.kind {
+                case .send:
+                    return workflow.sendReady && !snapshot.hasPendingInput
+                case .abort:
+                    return true
+                case .setBudget:
+                    return workflow.limitsKnown && workflow.budgetRequest == nil
+                case .answerBudget:
+                    return workflow.budgetRequest?.requestId == action.requestId
+                }
+            },
+            makeHandoff: { metadata in
+                SessionActionHandoff(
+                    schemaVersion: 1,
+                    copilotSessionId: metadata.copilotSessionId,
+                    operationId: metadata.operationId,
+                    conversationEpoch: metadata.conversationEpoch,
+                    kind: metadata.kind,
+                    payloadFingerprint: metadata.payloadFingerprint,
+                    action: action
+                )
+            }
+        )
+    }
+
+    private struct SessionActionHandoff: Encodable {
+        let schemaVersion: Int
+        let copilotSessionId: String
+        let operationId: String?
+        let conversationEpoch: String?
+        let kind: String?
+        let payloadFingerprint: String?
+        let action: RemoteSessionAction
+    }
+
+    func sessionWorkflow(sessionId: String) -> RemoteSessionWorkflow? {
+        guard let location = locateIndex(sessionId) else { return nil }
+        return projects[location.p].sessions[location.s].agentActivity?.workflow
+    }
+
+    func sessionOperationProjection(sessionId: String) -> AgentOperationProjection {
+        guard let location = locateIndex(sessionId) else { return .unavailable }
+        return projects[location.p].sessions[location.s].agentActivity?
+            .remoteOperationProjection() ?? .unavailable
+    }
+
+    func performLocalSessionAction(
+        sessionId: String,
+        action: RemoteSessionAction
+    ) async -> RemoteWorkflowActionResult {
+        let adapter = CLIOperationAdapter(
+            activityDirectory: agentActivityDirectory,
+            resumeMarkerDirectory: resumeMarkerDirectory
+        )
+        guard let snapshot = adapter.loadFreshSnapshot(sessionId: sessionId, now: Date()),
+              let epoch = snapshot.remoteOperationProjection().conversationEpoch else {
+            return RemoteWorkflowActionResult(state: .rejected, message: "Native session controls are unavailable.")
+        }
+        let operation = CLIOperationRequest(operationId: UUID().uuidString, conversationEpoch: epoch)
+        guard performSessionAction(sessionId: sessionId, action: action, operation: operation) == .accepted else {
+            return RemoteWorkflowActionResult(state: .rejected, message: "The session action was not accepted.")
+        }
+        for _ in 0..<40 {
+            do { try await Task.sleep(for: .milliseconds(500)) }
+            catch { break }
+            guard let fresh = adapter.loadFreshSnapshot(sessionId: sessionId, now: Date()),
+                  fresh.conversationEpoch == epoch else { break }
+            if let receipt = fresh.remoteOperationProjection().receipts?.first(where: {
+                $0.operationId == operation.operationId && $0.kind == action.kind.rawValue
+            }), receipt.state.isTerminal {
+                return RemoteWorkflowActionResult(
+                    state: receipt.state,
+                    message: receipt.state == .applied ? nil : receipt.state == .rejected
+                        ? "Copilot did not apply this action."
+                        : "Outcome unknown. Inspect the terminal before trying again.",
+                    operationId: operation.operationId
+                )
+            }
+        }
+        return RemoteWorkflowActionResult(
+            state: .indeterminate,
+            message: "Couldn't confirm the outcome. Inspect the terminal before trying again.",
+            operationId: operation.operationId
         )
     }
 
@@ -3290,6 +3402,7 @@ final class AppModel: ObservableObject {
         var nextProjects = projects
         var activityChanged = false
         var seenSessionIds: Set<String> = []
+        var budgetNotifications: [(projectId: String, sessionId: String)] = []
         for pi in nextProjects.indices {
             for si in nextProjects[pi].sessions.indices {
                 let sessionId = nextProjects[pi].sessions[si].id
@@ -3300,6 +3413,15 @@ final class AppModel: ObservableObject {
                     sessionId: sessionId, path: path, decoder: decoder, fm: fm
                 )
                 let fresh = snapshot?.isFresh(at: now) == true ? snapshot : nil
+                if let workflow = fresh?.workflow, workflow.isFresh(at: now),
+                   let request = workflow.budgetRequest,
+                   let epoch = fresh?.conversationEpoch {
+                    let key = "\(epoch):\(request.requestId)"
+                    if budgetNotificationKeys[sessionId] != key {
+                        budgetNotificationKeys[sessionId] = key
+                        budgetNotifications.append((nextProjects[pi].id, sessionId))
+                    }
+                }
                 if snapshot?.runtimeActivity != nil, let owner = snapshot?.copilotSessionId,
                    owner.lowercased() == resumeMarkerValue(
                     sessionId: sessionId, suffix: "copilot-session"
@@ -3312,6 +3434,8 @@ final class AppModel: ObservableObject {
                         previous?.updatedAt = fresh.updatedAt
                         previous?.runtimeActivity?.observedAtMilliseconds =
                             fresh.runtimeActivity?.observedAtMilliseconds
+                        previous?.workflow?.observedAtMilliseconds =
+                            fresh.workflow?.observedAtMilliseconds ?? 0
                     }
                     activityChanged = activityChanged || previous != fresh
                     nextProjects[pi].sessions[si].agentActivity = fresh
@@ -3347,7 +3471,15 @@ final class AppModel: ObservableObject {
         agentActivitySnapshotCache = agentActivitySnapshotCache
             .filter { seenSessionIds.contains($0.key) }
         runtimeTrackedOwners = runtimeTrackedOwners.filter { seenSessionIds.contains($0.key) }
+        budgetNotificationKeys = budgetNotificationKeys.filter { seenSessionIds.contains($0.key) }
         reconcileRuntimeActivity(now: now)
+        for target in budgetNotifications {
+            postNotification(
+                projectId: target.projectId, sessionId: target.sessionId, kind: .permission,
+                title: "Copilot reached its session budget",
+                body: "Open this session to add AI credits or stop the blocked request."
+            )
+        }
     }
 
     /// Load a session's agent-activity snapshot, skipping the `Data(contentsOf:)`
