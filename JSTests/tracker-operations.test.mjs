@@ -19,6 +19,7 @@ const originalSetInterval = globalThis.setInterval;
 const originalClearInterval = globalThis.clearInterval;
 const originalWatch = fs.watch;
 const originalWriteFileSync = fs.writeFileSync;
+const originalCreateReadStream = fs.createReadStream;
 const originalRenameSync = fs.renameSync;
 const realMkdirSync = fs.mkdirSync.bind(fs);
 const realReadFileSync = fs.readFileSync.bind(fs);
@@ -46,6 +47,16 @@ fs.writeFileSync = (path, ...args) => {
     runtime.activityWrites.push(JSON.parse(String(args[0])));
   }
   return result;
+};
+fs.createReadStream = (path, ...args) => {
+  const stream = originalCreateReadStream(path, ...args);
+  const runtime = [...runtimes].find((entry) =>
+    String(path).startsWith(entry.root)
+  );
+  if (runtime && String(path).endsWith("events.jsonl")) {
+    stream.once("close", () => { runtime.durableReadsFinished += 1; });
+  }
+  return stream;
 };
 fs.renameSync = (from, to) => {
   const runtime = [...runtimes].find((entry) => String(from).startsWith(entry.root));
@@ -76,6 +87,7 @@ test.after(() => {
   globalThis.clearInterval = originalClearInterval;
   fs.watch = originalWatch;
   fs.writeFileSync = originalWriteFileSync;
+  fs.createReadStream = originalCreateReadStream;
   fs.renameSync = originalRenameSync;
   syncBuiltinESMExports();
   realRmSync(runtimeParent, { recursive: true, force: true });
@@ -91,6 +103,22 @@ class FakeSession {
     this.modelSwitchCalls = [];
     this.closeCalls = [];
     this.history = [];
+    this.pendingQuestionCalls = [];
+    this.questionEvents = [];
+    this.questionEventCalls = [];
+    this.questionEventHandler = async ({ cursor, max }) => {
+      const offset = Number(cursor ?? 0);
+      const events = this.questionEvents.slice(offset, offset + max);
+      return {
+        events,
+        cursor: String(offset + events.length),
+        hasMore: offset + events.length < this.questionEvents.length,
+        cursorStatus: "ok",
+      };
+    };
+    this.pendingQuestionsHandler = async () => ({
+      userInputRequests: [], elicitationRequests: [],
+    });
     this.processing = false;
     this.runtimeCalls = [];
     this.workflowCalls = [];
@@ -167,6 +195,14 @@ class FakeSession {
         if (method === "session.getForeground") {
           return { sessionId: this.foregroundSessionId ?? this.sessionId };
         }
+        if (method === "session.ui.pendingRequests") {
+          this.pendingQuestionCalls.push(params);
+          return this.pendingQuestionsHandler(params);
+        }
+        if (method === "session.eventLog.read") {
+          this.questionEventCalls.push(params);
+          return this.questionEventHandler(params);
+        }
         this.runtimeCalls.push({ method, ...params });
         if (method === "session.metadata.snapshot") return this.metadataHandler(params);
         if (method === "session.metadata.isProcessing") return this.processingHandler(params);
@@ -200,7 +236,7 @@ class FakeSession {
     this.namedListeners.set(type, listeners);
   }
 
-  async emit(type, data = {}, extra = {}) {
+  async emit(type, data = {}, extra = {}, deliver = true) {
     if (!extra.agentId && type === "assistant.turn_start") this.processing = true;
     if (!extra.agentId && (type === "assistant.idle" || type === "session.idle")) {
       this.processing = false;
@@ -212,6 +248,10 @@ class FakeSession {
       data,
       ...extra,
     };
+    if (/^(user_input|elicitation)\.(requested|completed)$/.test(type)) {
+      this.questionEvents.push(event);
+    }
+    if (!deliver) return event;
     const pending = [];
     for (const listener of this.namedListeners.get(type) ?? []) {
       pending.push(listener(event));
@@ -220,6 +260,7 @@ class FakeSession {
       pending.push(listener(event));
     }
     await Promise.all(pending.filter((value) => value?.then));
+    return event;
   }
 
   async getEvents() {
@@ -279,6 +320,7 @@ async function createRuntime(t, configure = () => {}) {
     failWrite: null,
     failRename: null,
     activityWrites: [],
+    durableReadsFinished: 0,
   };
   runtime.session = new FakeSession(runtime.copilotSessionId);
   configure(runtime.session, runtime);
@@ -312,8 +354,25 @@ async function createRuntime(t, configure = () => {}) {
   };
   globalThis.clearInterval = () => {};
 
+  runtime.snapshotPath = join(sessions, `${runtime.appSessionId}.agent-activity.json`);
+  runtime.userInputPath = join(sessions, `${runtime.appSessionId}.user-input-response.json`);
+  runtime.elicitationPath = join(sessions, `${runtime.appSessionId}.elicitation-response.json`);
+  runtime.modelPath = join(sessions, `${runtime.appSessionId}.set-model-request.json`);
+  runtime.ownerPath = join(sessions, `${runtime.appSessionId}.transcript-owner.json`);
   try {
     await import(`${pathToFileURL(extensionPath).href}?runtime=${uuid()}`);
+    await waitFor(
+      () => realExistsSync(runtime.snapshotPath),
+      "tracker did not publish its initial snapshot"
+    );
+    await waitFor(
+      () => readSnapshot(runtime).availableModels?.length === 1,
+      "tracker did not publish the fake SDK model catalog"
+    );
+    await waitFor(
+      () => readSnapshot(runtime).workflow?.observedAtMilliseconds > 0,
+      "tracker did not settle its initial workflow observation"
+    );
   } finally {
     globalThis.setInterval = savedSetInterval;
     globalThis.clearInterval = savedClearInterval;
@@ -321,39 +380,6 @@ async function createRuntime(t, configure = () => {}) {
     restoreEnvironment(savedEnvironment);
     removeAddedProcessListeners(listenersBefore);
   }
-
-  runtime.snapshotPath = join(
-    sessions,
-    `${runtime.appSessionId}.agent-activity.json`
-  );
-  runtime.userInputPath = join(
-    sessions,
-    `${runtime.appSessionId}.user-input-response.json`
-  );
-  runtime.elicitationPath = join(
-    sessions,
-    `${runtime.appSessionId}.elicitation-response.json`
-  );
-  runtime.modelPath = join(
-    sessions,
-    `${runtime.appSessionId}.set-model-request.json`
-  );
-  runtime.ownerPath = join(
-    sessions,
-    `${runtime.appSessionId}.transcript-owner.json`
-  );
-  await waitFor(
-    () => realExistsSync(runtime.snapshotPath),
-    "tracker did not publish its initial snapshot"
-  );
-  await waitFor(
-    () => readSnapshot(runtime).availableModels?.length === 1,
-    "tracker did not publish the fake SDK model catalog"
-  );
-  await waitFor(
-    () => readSnapshot(runtime).workflow?.observedAtMilliseconds > 0,
-    "tracker did not settle its initial workflow observation"
-  );
 
   t.after(() => {
     runtimes.delete(runtime);
@@ -993,6 +1019,836 @@ function requestClose(runtime) {
   trigger(runtime, name);
 }
 
+function pendingURLQuestion(requestId = "url-request", toolCallId = "call-url") {
+  return {
+    requestId,
+    toolCallId,
+    message: "Paste a URL",
+    requestedSchema: {
+      type: "object",
+      properties: { url: { type: "string", title: "URL" } },
+    },
+  };
+}
+
+function questionEvent(type, data) {
+  return { id: uuid(), type, timestamp: new Date().toISOString(), data };
+}
+
+function writeDurableQuestion(runtime, question = pendingURLQuestion()) {
+  const directory = join(
+    runtime.root, "copilot-home", "session-state", runtime.copilotSessionId
+  );
+  realMkdirSync(directory, { recursive: true });
+  const event = {
+    id: uuid(),
+    type: "tool.execution_start",
+    timestamp: "2026-09-01T01:00:00.000Z",
+    data: {
+      toolName: "ask_user",
+      toolCallId: question.toolCallId,
+      arguments: {
+        message: question.message,
+        requestedSchema: { properties: question.requestedSchema.properties },
+      },
+    },
+  };
+  const path = join(directory, "events.jsonl");
+  realWriteFileSync(path, `${JSON.stringify(event)}\n`);
+  return { path, event };
+}
+
+test("late attach recovers a free-text form and answers its real request exactly once", {
+  concurrency: false,
+}, async (t) => {
+  const question = pendingURLQuestion();
+  let durable;
+  const runtime = await createRuntime(t, (session, runtime) => {
+    durable = writeDurableQuestion(runtime, question);
+    session.pendingQuestionsHandler = async () => ({
+      userInputRequests: [], elicitationRequests: [question],
+    });
+  });
+  assert.deepEqual(runtime.session.pendingQuestionCalls, [{
+    sessionId: runtime.copilotSessionId,
+  }]);
+  let snapshot = readSnapshot(runtime);
+  assert.equal(snapshot.trackedElicitations.length, 1);
+  assert.equal(snapshot.trackedElicitations[0].requestId, question.requestId);
+  assert.deepEqual(snapshot.trackedElicitations[0].schema, question.requestedSchema);
+  await waitFor(() => runtime.durableReadsFinished > 0, "initial durable read did not finish");
+  const readsBefore = runtime.durableReadsFinished;
+  realWriteFileSync(durable.path, `${JSON.stringify({ ...durable.event, id: uuid() })}\n`, { flag: "a" });
+  const writesBefore = runtime.activityWrites.length;
+  const savedEnvironment = saveEnvironment(["COPILOT_HOME"]);
+  process.env.COPILOT_HOME = join(runtime.root, "copilot-home");
+  try {
+    runtime.intervalCallback();
+    await waitFor(() => runtime.durableReadsFinished > readsBefore, "durable rescan did not finish");
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    restoreEnvironment(savedEnvironment);
+  }
+  const newWrites = runtime.activityWrites.slice(writesBefore);
+  assert.ok(newWrites.length > 0);
+  assert.ok(newWrites.some((entry) =>
+    entry.trackedElicitations.some((request) => request.requestId === question.requestId)
+  ));
+  assert.ok(newWrites.every((entry) =>
+    entry.trackedElicitations.every((request) => !request.requestId.startsWith("synthetic::"))
+  ));
+
+  const fields = operationFields(runtime, "answer-elicitation");
+  writeHandoff(runtime, runtime.elicitationPath, {
+    schemaVersion: 1,
+    copilotSessionId: runtime.copilotSessionId,
+    requestId: question.requestId,
+    action: "accept",
+    content: { url: "https://example.com" },
+    ...fields,
+  });
+  trigger(runtime, `${runtime.appSessionId}.elicitation-response.json`);
+  await waitFor(() => receipt(runtime, fields.operationId)?.state === "applied", "answer not applied");
+  runtime.intervalCallback();
+  assert.deepEqual(runtime.session.elicitationCalls, [{
+    requestId: question.requestId,
+    result: { action: "accept", content: { url: "https://example.com" } },
+  }]);
+  snapshot = readSnapshot(runtime);
+  assert.deepEqual(snapshot.trackedElicitations, []);
+});
+
+test("recovery excludes racing completions and preserves live and subagent requests", {
+  concurrency: false,
+}, async (t) => {
+  const childId = uuid();
+  const runtime = await createRuntime(t, (session) => {
+    session.pendingQuestionsHandler = async () => {
+      await session.emit("elicitation.completed", { requestId: "completed" });
+      await session.emit("user_input.completed", { requestId: "completed-input" });
+      await session.emit("elicitation.requested", { ...pendingURLQuestion("live"), message: "New live prompt" });
+      await session.emit("elicitation.requested", pendingURLQuestion("child"), { agentId: childId });
+      return {
+        userInputRequests: [{ requestId: "completed-input", question: "Old input" }],
+        elicitationRequests: [
+          pendingURLQuestion("completed"),
+          pendingURLQuestion("live"),
+          pendingURLQuestion("child"),
+          pendingURLQuestion("recovered"),
+        ],
+      };
+    };
+  });
+  const snapshot = readSnapshot(runtime);
+  assert.deepEqual(snapshot.trackedUserInputs, []);
+  assert.deepEqual(snapshot.trackedElicitations.map((entry) => entry.requestId), [
+    "live", "child", "recovered",
+  ]);
+  assert.equal(snapshot.trackedElicitations[0].message, "New live prompt");
+  assert.equal(snapshot.trackedElicitations[1].agentId, childId);
+});
+
+test("conversation rotation discards a stale pending-question snapshot", {
+  concurrency: false,
+}, async (t) => {
+  const nextId = uuid();
+  const runtime = await createRuntime(t, (session) => {
+    session.pendingQuestionsHandler = async ({ sessionId }) => {
+      if (sessionId === nextId) {
+        return { userInputRequests: [], elicitationRequests: [pendingURLQuestion("new")] };
+      }
+      session.sessionId = nextId;
+      await session.emit("session.start", { sessionId: nextId });
+      return { userInputRequests: [], elicitationRequests: [pendingURLQuestion("old")] };
+    };
+  });
+  await waitFor(() => readSnapshot(runtime).trackedElicitations.some((entry) =>
+    entry.requestId === "new"
+  ), "new conversation question not recovered");
+  assert.equal(readSnapshot(runtime).copilotSessionId, nextId);
+  assert.deepEqual(readSnapshot(runtime).trackedElicitations.map((entry) => entry.requestId), ["new"]);
+  assert.equal(runtime.session.pendingQuestionCalls.length, 2);
+});
+
+test("recovered questions remain cached while another tracker owns publication", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  let finish;
+  runtime.session.pendingQuestionsHandler = () => new Promise((resolve) => { finish = resolve; });
+  runtime.session.sessionId = uuid();
+  await runtime.session.emit("session.start", { sessionId: runtime.session.sessionId });
+  await waitFor(() => finish, "recovery query was not issued");
+  const owner = JSON.parse(realReadFileSync(runtime.ownerPath, "utf8"));
+  realWriteFileSync(runtime.ownerPath, JSON.stringify({ ...owner, pid: process.ppid }));
+  const writesBefore = runtime.activityWrites.length;
+  finish({ userInputRequests: [], elicitationRequests: [pendingURLQuestion()] });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(runtime.activityWrites.length, writesBefore, "a non-owner published the snapshot");
+
+  realWriteFileSync(runtime.ownerPath, JSON.stringify(owner));
+  runtime.intervalCallback();
+  assert.deepEqual(readSnapshot(runtime).trackedElicitations.map((entry) => entry.requestId), ["url-request"]);
+  assert.equal(runtime.session.pendingQuestionCalls.length, 2, "ownership recovery did not need another RPC");
+});
+
+test("recovery never evicts live questions to make room for older snapshots", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    session.pendingQuestionsHandler = async () => {
+      for (let index = 0; index < 50; index += 1) {
+        await session.emit("elicitation.requested", pendingURLQuestion(`live-${index}`));
+        await session.emit("user_input.requested", { requestId: `input-${index}`, question: "Live input" });
+      }
+      return {
+        userInputRequests: [{ requestId: "older-input", question: "Old input" }],
+        elicitationRequests: [pendingURLQuestion("older-form")],
+      };
+    };
+  });
+  const snapshot = readSnapshot(runtime);
+  assert.equal(snapshot.trackedUserInputs.length, 50);
+  assert.equal(snapshot.trackedElicitations.length, 50);
+  assert.ok(snapshot.trackedUserInputs.every((entry) => entry.requestId.startsWith("input-")));
+  assert.ok(snapshot.trackedElicitations.every((entry) => entry.requestId.startsWith("live-")));
+});
+
+test("recovery timeout keeps the terminal prompt and safely ignores a late rejection", {
+  concurrency: false,
+}, async (t) => {
+  let rejectLate;
+  const runtime = await createRuntime(t, (session, runtime) => {
+    writeDurableQuestion(runtime);
+    session.pendingQuestionsHandler = () => new Promise((_, reject) => { rejectLate = reject; });
+  });
+  assert.equal(readSnapshot(runtime).trackedElicitations[0].mode, "terminal");
+  rejectLate(new Error("late RPC rejection"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(readSnapshot(runtime).trackedElicitations[0].mode, "terminal");
+});
+
+test("unsupported or failed recovery keeps the original terminal fallback", {
+  concurrency: false,
+}, async (t) => {
+  for (const error of [
+    Object.assign(new Error("method not found"), { code: -32601 }),
+    new Error("pending store unavailable"),
+  ]) {
+    const runtime = await createRuntime(t, (session, runtime) => {
+      writeDurableQuestion(runtime);
+      session.pendingQuestionsHandler = async () => { throw error; };
+    });
+    const requests = readSnapshot(runtime).trackedElicitations;
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].requestId, "synthetic::durable-ask-user::call-url");
+    assert.equal(requests[0].mode, "terminal");
+  }
+});
+
+test("recovering an unrelated question does not suppress a terminal prompt", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session, runtime) => {
+    writeDurableQuestion(runtime);
+    session.pendingQuestionsHandler = async () => ({
+      userInputRequests: [],
+      elicitationRequests: [pendingURLQuestion("other", "different-tool")],
+    });
+  });
+  assert.deepEqual(readSnapshot(runtime).trackedElicitations.map((entry) => entry.requestId), [
+    "other", "synthetic::durable-ask-user::call-url",
+  ]);
+});
+
+test("cursor reads recover text, boolean, choice, and multiselect when live notifications disappear", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    session.pendingQuestionsHandler = async () => {
+      throw Object.assign(new Error("old CLI"), { code: -32601 });
+    };
+  });
+  for (const [kind, field, answer] of [
+    ["text", { type: "string" }, "https://example.com"],
+    ["boolean", { type: "boolean", default: true }, true],
+    ["choice", { type: "string", enum: ["a", "b"] }, "b"],
+    ["multiple", { type: "array", items: { type: "string", enum: ["a", "b"] } }, ["a", "b"]],
+  ]) {
+    const requestId = `missing-${kind}`;
+    await runtime.session.emit("elicitation.requested", {
+      requestId, toolCallId: `call-${kind}`, message: `Question ${kind}`,
+      requestedSchema: { type: "object", properties: { answer: field } },
+    }, {}, false);
+    runtime.intervalCallback();
+    const request = await waitFor(() => readSnapshot(runtime).trackedElicitations
+      .find((entry) => entry.requestId === requestId), `missing ${kind} form`);
+    assert.deepEqual(request.schema.properties.answer, field);
+    const fields = operationFields(runtime, "answer-elicitation");
+    writeHandoff(runtime, runtime.elicitationPath, {
+      schemaVersion: 1, copilotSessionId: runtime.copilotSessionId,
+      requestId, action: "accept", content: { answer }, ...fields,
+    });
+    trigger(runtime, `${runtime.appSessionId}.elicitation-response.json`);
+    await waitFor(() => receipt(runtime, fields.operationId)?.state === "applied", "answer not applied");
+    await runtime.session.emit("elicitation.completed", { requestId, action: "accept" }, {}, false);
+    runtime.intervalCallback();
+    await waitFor(() => readSnapshot(runtime).trackedElicitations.length === 0, "answered form remained");
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(runtime.session.elicitationCalls.length, 4);
+  assert.ok(runtime.session.questionEventCalls.every((call) =>
+    call.sessionId === runtime.copilotSessionId && call.includeEphemeral === true
+      && call.types.length === 4 && call.agentScope === "all"
+  ));
+});
+
+test("cursor catch-up never publishes a question completed on a later page", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    const requested = { id: uuid(), type: "elicitation.requested", timestamp: "2026-09-15T00:00:00Z", data: pendingURLQuestion() };
+    const completed = { id: uuid(), type: "elicitation.completed", timestamp: "2026-09-15T00:00:01Z", data: { requestId: "url-request" } };
+    session.questionEventHandler = async ({ cursor }) => cursor == null
+      ? { events: [requested], cursor: "page-two", hasMore: true, cursorStatus: "ok" }
+      : { events: [completed], cursor: "tail", hasMore: false, cursorStatus: "ok" };
+  });
+  await waitFor(() => runtime.session.questionEventCalls.length === 2, "catch-up did not read both pages");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(runtime.activityWrites.every((snapshot) => snapshot.trackedElicitations.length === 0));
+});
+
+test("cursor replay cannot resurrect a live completion while reading", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  let finish;
+  const question = await runtime.session.emit("elicitation.requested", pendingURLQuestion(), {}, false);
+  runtime.session.questionEventHandler = () => new Promise((resolve) => { finish = resolve; });
+  runtime.intervalCallback();
+  await waitFor(() => finish, "cursor read did not start");
+  await runtime.session.emit("elicitation.completed", { requestId: question.data.requestId });
+  finish({ events: [question], cursor: "tail", hasMore: false, cursorStatus: "ok" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(readSnapshot(runtime).trackedElicitations, []);
+});
+
+test("cursor replay cannot resurrect an answer applied while reading", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  const question = await runtime.session.emit("elicitation.requested", pendingURLQuestion());
+  let finish;
+  runtime.session.questionEventHandler = () => new Promise((resolve) => { finish = resolve; });
+  runtime.intervalCallback();
+  await waitFor(() => finish, "cursor read did not start");
+  const fields = operationFields(runtime, "answer-elicitation");
+  writeHandoff(runtime, runtime.elicitationPath, {
+    schemaVersion: 1, copilotSessionId: runtime.copilotSessionId,
+    requestId: question.data.requestId, action: "accept", content: { url: "https://example.com" }, ...fields,
+  });
+  trigger(runtime, `${runtime.appSessionId}.elicitation-response.json`);
+  await waitFor(() => receipt(runtime, fields.operationId)?.state === "applied", "answer not applied");
+  finish({ events: [question], cursor: "tail", hasMore: false, cursorStatus: "ok" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(readSnapshot(runtime).trackedElicitations, []);
+  assert.equal(runtime.session.elicitationCalls.length, 1);
+});
+
+test("cursor rotation ignores old pages and recovers the new conversation", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  const oldId = runtime.copilotSessionId;
+  const newId = uuid();
+  let finish;
+  const nextQuestion = { id: uuid(), type: "elicitation.requested", timestamp: new Date().toISOString(), data: pendingURLQuestion("new") };
+  runtime.session.questionEventHandler = ({ sessionId }) => sessionId === oldId
+    ? new Promise((resolve) => { finish = resolve; })
+    : Promise.resolve({ events: [nextQuestion], cursor: "new-tail", hasMore: false, cursorStatus: "ok" });
+  runtime.intervalCallback();
+  await waitFor(() => finish, "old read did not start");
+  runtime.session.sessionId = newId;
+  await runtime.session.emit("session.start", { sessionId: newId });
+  await waitFor(() => readSnapshot(runtime).trackedElicitations.some((entry) => entry.requestId === "new"), "new cursor not read");
+  finish({ events: [{ ...nextQuestion, data: pendingURLQuestion("old") }], cursor: "old-tail", hasMore: false, cursorStatus: "ok" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(readSnapshot(runtime).trackedElicitations.map((entry) => entry.requestId), ["new"]);
+});
+
+test("an expired cursor is rebased without applying an incomplete page", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  const question = { id: uuid(), type: "elicitation.requested", timestamp: new Date().toISOString(), data: pendingURLQuestion("expired") };
+  runtime.session.questionEventHandler = async () => ({
+    events: [question], cursor: "expired-tail", hasMore: false, cursorStatus: "expired",
+  });
+  runtime.intervalCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(readSnapshot(runtime).trackedElicitations, []);
+  runtime.session.questionEventHandler = async ({ cursor }) => {
+    assert.equal(cursor, undefined);
+    return { events: [], cursor: "rebased", hasMore: false, cursorStatus: "ok" };
+  };
+  runtime.intervalCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(readSnapshot(runtime).trackedElicitations, []);
+});
+
+test("cursor recovery has a bounded page budget and retries without skipping events", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  let page = 0;
+  runtime.session.questionEventHandler = async () => ({
+    events: [], cursor: `page-${++page}`, hasMore: true, cursorStatus: "ok",
+  });
+  runtime.intervalCallback();
+  await waitFor(() => page === 10, "cursor page budget was not reached");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(page, 10);
+  let resumedCursor;
+  runtime.session.questionEventHandler = async ({ cursor }) => {
+    resumedCursor = cursor;
+    return { events: [], cursor: "recovered", hasMore: false, cursorStatus: "ok" };
+  };
+  runtime.intervalCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(resumedCursor, `page-${page}`);
+});
+
+test("cursor reading is single-flight and does not block heartbeat publication", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  let finish;
+  runtime.session.questionEventHandler = () => new Promise((resolve) => { finish = resolve; });
+  const before = runtime.session.questionEventCalls.length;
+  runtime.intervalCallback();
+  await waitFor(() => finish, "cursor read did not start");
+  const writes = runtime.activityWrites.length;
+  runtime.intervalCallback();
+  runtime.intervalCallback();
+  assert.equal(runtime.session.questionEventCalls.length, before + 1);
+  assert.ok(runtime.activityWrites.length > writes);
+  finish({ events: [], cursor: "tail", hasMore: false, cursorStatus: "ok" });
+  await new Promise((resolve) => setImmediate(resolve));
+});
+
+test("a late first cursor response still applies without blocking tracker startup", {
+  concurrency: false,
+}, async (t) => {
+  let finish;
+  const runtime = await createRuntime(t, (session) => {
+    session.questionEventHandler = () => new Promise((resolve) => { finish = resolve; });
+  });
+  await new Promise((resolve) => setTimeout(resolve, 2050));
+  runtime.intervalCallback();
+  assert.equal(runtime.session.questionEventCalls.length, 1);
+  finish({
+    events: [{ id: uuid(), type: "elicitation.requested", timestamp: new Date().toISOString(), data: pendingURLQuestion("late") }],
+    cursor: "tail", hasMore: false, cursorStatus: "ok",
+  });
+  await waitFor(() => readSnapshot(runtime).trackedElicitations.some((entry) => entry.requestId === "late"), "late response ignored");
+});
+
+test("polled completions clear live cards and preserve input completion ownership", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  const childId = uuid();
+  await runtime.session.emit("user_input.requested", { requestId: "input", question: "Choose" }, { agentId: childId });
+  await runtime.session.emit("elicitation.requested", pendingURLQuestion());
+  await runtime.session.emit("user_input.completed", { requestId: "input" }, { agentId: childId }, false);
+  await runtime.session.emit("elicitation.completed", { requestId: "url-request", action: "cancel" }, {}, false);
+  runtime.intervalCallback();
+  await waitFor(() => readSnapshot(runtime).trackedElicitations.length === 0 && readSnapshot(runtime).trackedUserInputs.length === 0, "completed cards remained");
+  const completions = readSnapshot(runtime).inputCompletions;
+  assert.equal(typeof completions[childId.toLowerCase()], "number");
+  assert.equal(typeof completions[runtime.copilotSessionId.toLowerCase()], "number");
+});
+
+test("cursor staging retains the newest pending question after old requests exceed the cap", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    for (let index = 0; index < 70; index++) {
+      session.questionEvents.push({
+        id: uuid(), type: "elicitation.requested", timestamp: new Date().toISOString(),
+        data: pendingURLQuestion(`request-${index}`),
+      });
+    }
+    for (let index = 0; index < 69; index++) {
+      session.questionEvents.push({
+        id: uuid(), type: "elicitation.completed", timestamp: new Date().toISOString(),
+        data: { requestId: `request-${index}` },
+      });
+    }
+  });
+  await waitFor(() => readSnapshot(runtime).trackedElicitations.length === 1, "newest question not recovered");
+  assert.equal(readSnapshot(runtime).trackedElicitations[0].requestId, "request-69");
+});
+
+for (const kind of ["elicitation", "user_input"]) {
+  test(`cursor staging overflow recovers older unresolved ${kind} questions`, {
+    concurrency: false,
+  }, async (t) => {
+    const runtime = await createRuntime(t, (session) => {
+      for (let index = 0; index < 70; index++) {
+        const requestId = `request-${index}`;
+        session.questionEvents.push(questionEvent(`${kind}.requested`, kind === "elicitation"
+          ? pendingURLQuestion(requestId) : { requestId, question: "Choose", choices: ["Go"] }));
+      }
+      for (let index = 20; index < 70; index++) {
+        session.questionEvents.push(questionEvent(`${kind}.completed`, { requestId: `request-${index}` }));
+      }
+    });
+    const field = kind === "elicitation" ? "trackedElicitations" : "trackedUserInputs";
+    await waitFor(() => readSnapshot(runtime)[field].length === 20, "older active questions were lost");
+    assert.deepEqual(readSnapshot(runtime)[field].map((entry) => entry.requestId),
+      Array.from({ length: 20 }, (_, index) => `request-${index}`));
+    assert.ok(runtime.activityWrites.every((snapshot) =>
+      snapshot[field].every((entry) => Number(entry.requestId.slice(8)) < 20)));
+    const reads = runtime.session.questionEventCalls.length;
+    runtime.intervalCallback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(runtime.session.questionEventCalls.length, reads + 1);
+    assert.equal(runtime.session.questionEventCalls.at(-1).cursor, "120");
+  });
+
+  test(`a losing ${kind} answer rejects its receipt without reopening the stale question`, {
+    concurrency: false,
+  }, async (t) => {
+    const runtime = await createRuntime(t);
+    const requestId = `already-answered-${kind}`;
+    const elicitation = kind === "elicitation";
+    const data = elicitation ? pendingURLQuestion(requestId)
+      : { requestId, question: "Choose", choices: ["Go"] };
+    const field = elicitation ? "trackedElicitations" : "trackedUserInputs";
+    await runtime.session.emit(`${kind}.requested`, data, {}, false);
+    runtime.intervalCallback();
+    await waitFor(() => readSnapshot(runtime)[field].length === 1, "missed question was not recovered");
+    runtime.session.elicitationHandler = runtime.session.userInputHandler = async () => ({ success: false });
+    const fields = operationFields(runtime, elicitation ? "answer-elicitation" : "answer-user-input");
+    const path = elicitation ? runtime.elicitationPath : runtime.userInputPath;
+    writeHandoff(runtime, path, {
+      schemaVersion: 1, copilotSessionId: runtime.copilotSessionId, requestId,
+      ...(elicitation ? { action: "accept", content: { url: "https://example.com" } }
+        : { answer: "Go", wasFreeform: false }),
+      ...fields,
+    });
+    trigger(runtime, `${runtime.appSessionId}.${elicitation ? "elicitation" : "user-input"}-response.json`);
+    await waitFor(() => receipt(runtime, fields.operationId)?.state === "rejected", "losing answer was not rejected");
+    assert.equal(receipt(runtime, fields.operationId).errorCode, "rpc-rejected");
+    assert.deepEqual(readSnapshot(runtime)[field], []);
+    await runtime.session.emit(`${kind}.requested`, data);
+    runtime.intervalCallback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(readSnapshot(runtime)[field], []);
+  });
+
+  test(`a live ${kind} completion frees an overflowed staging slot before the replay tail`, {
+    concurrency: false,
+  }, async (t) => {
+    let finishTail;
+    let delayed = false;
+    const runtime = await createRuntime(t, (session) => {
+      const events = Array.from({ length: 51 }, (_, index) => {
+        const requestId = `request-${index}`;
+        return questionEvent(`${kind}.requested`, kind === "elicitation"
+          ? pendingURLQuestion(requestId) : { requestId, question: "Choose", choices: ["Go"] });
+      });
+      session.questionEventHandler = async ({ cursor }) => {
+        if (cursor === undefined) {
+          return { events, cursor: "after-requests", hasMore: true, cursorStatus: "ok" };
+        }
+        if (!delayed) {
+          delayed = true;
+          return new Promise((resolve) => { finishTail = resolve; });
+        }
+        return { events: [], cursor: "tail", hasMore: false, cursorStatus: "ok" };
+      };
+    });
+    await waitFor(() => finishTail, "tail read did not pause");
+    await runtime.session.emit(`${kind}.completed`, { requestId: "request-50" });
+    finishTail({ events: [], cursor: "tail", hasMore: false, cursorStatus: "ok" });
+    const field = kind === "elicitation" ? "trackedElicitations" : "trackedUserInputs";
+    await waitFor(() => readSnapshot(runtime)[field].length === 50, "live completion hid an overflow vacancy");
+    assert.deepEqual(readSnapshot(runtime)[field].map((entry) => entry.requestId),
+      Array.from({ length: 50 }, (_, index) => `request-${index}`));
+    assert.equal(runtime.session.questionEventCalls.length, 4);
+  });
+}
+
+test("overflow replay preserves the page budget across a full retained question window", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    for (let index = 0; index < 70; index++) {
+      session.questionEvents.push(questionEvent("elicitation.requested", pendingURLQuestion(`request-${index}`)));
+    }
+    for (let index = 0; index < 3_976; index++) {
+      session.questionEvents.push(questionEvent("elicitation.completed", { requestId: `unrelated-${index}` }));
+    }
+    for (let index = 20; index < 70; index++) {
+      session.questionEvents.push(questionEvent("elicitation.completed", { requestId: `request-${index}` }));
+    }
+  });
+  let previousReads = 0;
+  for (let heartbeat = 0; heartbeat < 10; heartbeat++) {
+    await new Promise((resolve) => setImmediate(resolve));
+    const reads = runtime.session.questionEventCalls.length;
+    assert.ok(reads - previousReads <= 10, "replay exceeded the per-heartbeat page budget");
+    previousReads = reads;
+    if (readSnapshot(runtime).trackedElicitations.length === 20) break;
+    assert.deepEqual(readSnapshot(runtime).trackedElicitations, [], "published before the replay reached its tail");
+    runtime.intervalCallback();
+  }
+  assert.equal(readSnapshot(runtime).trackedElicitations.length, 20);
+  assert.equal(runtime.session.questionEventCalls.length, 82);
+  assert.ok(runtime.activityWrites.every((snapshot) =>
+    snapshot.trackedElicitations.every((entry) => Number(entry.requestId.slice(8)) < 20)));
+  runtime.intervalCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(runtime.session.questionEventCalls.at(-1).cursor, "4096");
+});
+
+test("overflow replay reselects again when later pages introduce new completions", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    for (let index = 0; index < 70; index++) {
+      session.questionEvents.push(questionEvent("elicitation.requested", pendingURLQuestion(`request-${index}`)));
+    }
+    for (let index = 0; index < 31; index++) {
+      session.questionEvents.push(questionEvent("elicitation.completed", {
+        requestId: index === 30 ? "request-69" : `unrelated-${index}`,
+      }));
+    }
+    const read = session.questionEventHandler;
+    session.questionEventHandler = async (params) => {
+      const result = await read(params);
+      if (session.questionEventCalls.length === 3) {
+        for (let index = 20; index < 70; index++) {
+          session.questionEvents.push(questionEvent("elicitation.completed", { requestId: `request-${index}` }));
+        }
+      }
+      return result;
+    };
+  });
+  await waitFor(() => readSnapshot(runtime).trackedElicitations.length === 20, "moving replay tail lost active questions");
+  assert.equal(runtime.session.questionEventCalls.length, 6);
+  assert.ok(runtime.activityWrites.every((snapshot) =>
+    snapshot.trackedElicitations.every((entry) => Number(entry.requestId.slice(8)) < 20)));
+});
+
+test("overflow replay starts at the captured cursor and stops with fifty genuinely pending questions", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await runtime.session.emit("elicitation.completed", { requestId: "old" }, {}, false);
+  runtime.intervalCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  const before = runtime.session.questionEventCalls.length;
+  for (let index = 0; index < 70; index++) {
+    await runtime.session.emit("elicitation.requested", pendingURLQuestion(`request-${index}`), {
+      timestamp: "2026-09-15T00:00:00.000Z",
+    }, false);
+  }
+  runtime.intervalCallback();
+  await waitFor(() => readSnapshot(runtime).trackedElicitations.length === 50, "bounded pending set not recovered");
+  assert.deepEqual(readSnapshot(runtime).trackedElicitations.map((entry) => entry.requestId),
+    Array.from({ length: 50 }, (_, index) => `request-${index + 20}`));
+  assert.deepEqual(runtime.session.questionEventCalls.slice(before).map((call) => call.cursor), ["1"]);
+  runtime.intervalCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(runtime.session.questionEventCalls.length, before + 2);
+  assert.equal(runtime.session.questionEventCalls.at(-1).cursor, "71");
+});
+
+for (const kind of ["elicitation", "user_input"]) {
+  test(`unrelated ${kind} completions cannot keep a full pending set replaying`, {
+    concurrency: false,
+  }, async (t) => {
+    const runtime = await createRuntime(t, (session) => {
+      for (let index = 0; index < 70; index++) {
+        session.questionEvents.push(questionEvent("elicitation.requested", pendingURLQuestion(`request-${index}`)));
+      }
+      const read = session.questionEventHandler;
+      session.questionEventHandler = async (params) => {
+        session.questionEvents.push(questionEvent(`${kind}.completed`, { requestId: uuid() }));
+        return read(params);
+      };
+    });
+    await waitFor(() => readSnapshot(runtime).trackedElicitations.length === 50, "unrelated completions prevented publication");
+    assert.equal(runtime.session.questionEventCalls.length, 1);
+    runtime.intervalCallback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(runtime.session.questionEventCalls.length, 2);
+    assert.equal(runtime.session.questionEventCalls.at(-1).cursor, "71");
+    assert.equal(readSnapshot(runtime).trackedElicitations.length, 50);
+  });
+}
+
+test("an expired overflow replay discards its old pass state and restarts retained history", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    session.questionEvents.push(questionEvent("elicitation.completed", { requestId: "old" }));
+  });
+  const history = (prefix) => [
+    ...Array.from({ length: 51 }, (_, index) =>
+      questionEvent("elicitation.requested", pendingURLQuestion(`${prefix}-${index}`))),
+    ...Array.from({ length: 31 }, (_, index) =>
+      questionEvent("elicitation.completed", { requestId: `${prefix}-${index + 20}` })),
+  ];
+  runtime.session.questionEvents.push(...history("request"));
+  const read = runtime.session.questionEventHandler;
+  let reads = 0;
+  runtime.session.questionEventHandler = async (params) => {
+    if (++reads === 2) {
+      runtime.session.questionEvents = history("retained");
+      return { events: [], cursor: "expired", hasMore: false, cursorStatus: "expired" };
+    }
+    return read(params);
+  };
+  runtime.intervalCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(readSnapshot(runtime).trackedElicitations, []);
+  assert.deepEqual(runtime.session.questionEventCalls.slice(1).map((call) => call.cursor), ["1", "1"]);
+  runtime.intervalCallback();
+  await waitFor(() => readSnapshot(runtime).trackedElicitations.length === 20, "retained questions not recovered");
+  assert.deepEqual(readSnapshot(runtime).trackedElicitations.map((entry) => entry.requestId),
+    Array.from({ length: 20 }, (_, index) => `retained-${index}`));
+  assert.deepEqual(runtime.session.questionEventCalls.slice(3).map((call) => call.cursor), [undefined, undefined]);
+});
+
+test("a duplicate live request cannot replace a polled card or reopen a completed request", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  const event = await runtime.session.emit("elicitation.requested", pendingURLQuestion(), {}, false);
+  runtime.intervalCallback();
+  await waitFor(() => readSnapshot(runtime).trackedElicitations.length === 1, "polled form missing");
+  const before = runtime.activityWrites.length;
+  await runtime.session.emit("elicitation.requested", { ...event.data, message: "duplicate mutation" });
+  assert.equal(readSnapshot(runtime).trackedElicitations[0].message, event.data.message);
+  assert.equal(runtime.activityWrites.length, before);
+  await runtime.session.emit("elicitation.completed", { requestId: event.data.requestId });
+  await runtime.session.emit("elicitation.requested", event.data);
+  assert.deepEqual(readSnapshot(runtime).trackedElicitations, []);
+});
+
+test("cursor recovery answers a legacy free-text question with no live notifications", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await runtime.session.emit("user_input.requested", {
+    requestId: "legacy-text", question: "Which URL?", choices: [], allowFreeform: true,
+  }, {}, false);
+  runtime.intervalCallback();
+  await waitFor(() => readSnapshot(runtime).trackedUserInputs.length === 1, "legacy question missing");
+  const fields = operationFields(runtime, "answer-user-input");
+  writeHandoff(runtime, runtime.userInputPath, {
+    schemaVersion: 1, copilotSessionId: runtime.copilotSessionId, requestId: "legacy-text",
+    answer: "https://example.com", wasFreeform: true, ...fields,
+  });
+  trigger(runtime, `${runtime.appSessionId}.user-input-response.json`);
+  await waitFor(() => receipt(runtime, fields.operationId)?.state === "applied", "legacy answer failed");
+  assert.deepEqual(runtime.session.userInputCalls, [{
+    requestId: "legacy-text", response: { answer: "https://example.com", wasFreeform: true },
+  }]);
+});
+
+test("cursor recovery replaces only an older card when the pending map is full", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  for (let index = 0; index < 50; index++) {
+    await runtime.session.emit("elicitation.requested", pendingURLQuestion(`live-${index}`), {
+      timestamp: `2026-09-15T00:00:${String(index).padStart(2, "0")}.000Z`,
+    });
+  }
+  await runtime.session.emit("elicitation.requested", pendingURLQuestion("newest"), {
+    timestamp: "2026-09-15T00:01:00.000Z",
+  }, false);
+  runtime.intervalCallback();
+  await waitFor(() => readSnapshot(runtime).trackedElicitations.some((entry) => entry.requestId === "newest"), "newest question was dropped");
+  assert.equal(readSnapshot(runtime).trackedElicitations.length, 50);
+  assert.ok(!readSnapshot(runtime).trackedElicitations.some((entry) => entry.requestId === "live-0"));
+  await runtime.session.emit("elicitation.requested", pendingURLQuestion("older"), {
+    timestamp: "2026-09-14T00:00:00.000Z",
+  }, false);
+  runtime.intervalCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(!readSnapshot(runtime).trackedElicitations.some((entry) => entry.requestId === "older"));
+});
+
+test("unrelated historical completions do not suppress a terminal-only question", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session, runtime) => {
+    writeDurableQuestion(runtime);
+    session.questionEvents.push({
+      id: uuid(), type: "elicitation.completed", timestamp: "2026-09-15T00:00:00.000Z",
+      data: { requestId: "unrelated-completed" },
+    });
+  });
+  assert.equal(readSnapshot(runtime).trackedElicitations[0].requestId, "synthetic::durable-ask-user::call-url");
+});
+
+test("a polled real question suppresses its terminal fallback even after a later durable rescan", {
+  concurrency: false,
+}, async (t) => {
+  let durable;
+  const runtime = await createRuntime(t, (session, runtime) => {
+    durable = writeDurableQuestion(runtime);
+    session.questionEvents.push({
+      id: uuid(), type: "elicitation.requested", timestamp: "2026-08-31T23:59:59.000Z",
+      data: pendingURLQuestion(),
+    });
+  });
+  await waitFor(() => readSnapshot(runtime).trackedElicitations.some((entry) => entry.requestId === "url-request"), "real form missing");
+  await waitFor(() => runtime.durableReadsFinished > 0, "durable baseline missing");
+  const before = runtime.durableReadsFinished;
+  realWriteFileSync(durable.path, `${JSON.stringify({ ...durable.event, id: uuid() })}\n`, { flag: "a" });
+  const saved = saveEnvironment(["COPILOT_HOME"]);
+  process.env.COPILOT_HOME = join(runtime.root, "copilot-home");
+  try {
+    runtime.intervalCallback();
+    await waitFor(() => runtime.durableReadsFinished > before, "durable rescan missing");
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    restoreEnvironment(saved);
+  }
+  assert.deepEqual(readSnapshot(runtime).trackedElicitations.map((entry) => entry.requestId), ["url-request"]);
+});
+
+test("invalid cursor pages never advance or publish a partial question", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  const question = { id: uuid(), type: "elicitation.requested", timestamp: new Date().toISOString(), data: pendingURLQuestion() };
+  for (const invalid of [
+    { events: [question], cursor: "bad", hasMore: false, cursorStatus: "unknown" },
+    { events: Array(101).fill(question), cursor: "bad", hasMore: false, cursorStatus: "ok" },
+  ]) {
+    runtime.session.questionEventHandler = async () => invalid;
+    runtime.intervalCallback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(readSnapshot(runtime).trackedElicitations, []);
+  }
+  let lastCursor;
+  runtime.session.questionEventHandler = async ({ cursor }) => {
+    lastCursor = cursor;
+    return { events: [question], cursor: "valid-tail", hasMore: false, cursorStatus: "ok" };
+  };
+  runtime.intervalCallback();
+  await waitFor(() => readSnapshot(runtime).trackedElicitations.length === 1, "valid retry failed");
+  assert.equal(lastCursor, "0");
+});
+
 async function waitForActivity(runtime, predicate) {
   return waitFor(
     () => predicate(readSnapshot(runtime).runtimeActivity),
@@ -1502,7 +2358,7 @@ test("all SDK controls preserve legacy behavior and publish correlated receipts"
   for (const entry of cases) {
     await t.test(entry.name, async (t) => {
       const runtime = await createRuntime(t);
-      const requestId = `request-${uuid()}`;
+      let requestId = `request-${uuid()}`;
       await entry.prepare(runtime, requestId);
       const legacy = entry.payload(runtime, requestId);
       writeHandoff(runtime, entry.path(runtime), legacy);
@@ -1514,6 +2370,7 @@ test("all SDK controls preserve legacy behavior and publish correlated receipts"
       );
       assert.deepEqual(readSnapshot(runtime).operationReceipts, []);
 
+      requestId = `request-${uuid()}`;
       await entry.prepare(runtime, requestId);
       const fields = operationFields(runtime, entry.name);
       let acceptedAtRPC = null;

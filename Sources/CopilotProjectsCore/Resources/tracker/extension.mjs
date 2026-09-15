@@ -140,14 +140,17 @@ if (validSessionId && socketPath) {
     const closeSessionRequestName = `${appSessionId}.close-session-request`;
     const activeSubagents = new Map();
     // All outstanding structured questions (root and subagent), keyed by
-    // requestId. Starts empty every launch: stale question state is never
-    // resurrected from disk, only rebuilt from live events.
+    // requestId. Rebuilt from live events and the runtime's pending snapshot,
+    // never resurrected from disk.
     const pendingUserInputs = new Map();
     const inFlightUserInputResponses = new Set();
     // Outstanding elicitations (schema-form / url questions), keyed by
-    // requestId. Same lifecycle as pendingUserInputs: rebuilt from live
-    // events, never resurrected from disk.
+    // requestId. Same lifecycle as pendingUserInputs.
     const pendingElicitations = new Map();
+    const recoveredQuestionToolCallIds = new Set();
+    const completedQuestionRequests = new Set();
+    let pendingQuestionRecovery = null;
+    let questionEventStream = null;
     const inFlightElicitationResponses = new Set();
     const operationReceipts = new Map();
     const activeOperationKeys = new Set();
@@ -284,6 +287,14 @@ if (validSessionId && socketPath) {
     const MAX_TRANSCRIPT_EVENT_IDS = 50_000;
     const MAX_DURABLE_EVENT_BYTES = 4 * 1_024 * 1_024;
     const HISTORY_REPLAY_TIMEOUT_MS = 5_000;
+    const PENDING_QUESTIONS_TIMEOUT_MS = 2_000;
+    const QUESTION_EVENT_TYPES = [
+        "user_input.requested", "user_input.completed",
+        "elicitation.requested", "elicitation.completed",
+    ];
+    const MAX_QUESTION_COMPLETIONS = 4_096;
+    const QUESTION_EVENT_PAGE_SIZE = 100;
+    const MAX_QUESTION_EVENT_PAGES = 10;
     const DURABLE_REPLAY_TIMEOUT_MS = 5_000;
     const DURABLE_RECONCILE_DEBOUNCE_MS = 200;
     const DURABLE_RECONCILE_POLL_MS = 5_000;
@@ -1927,9 +1938,10 @@ if (validSessionId && socketPath) {
 
     // Answer a pending question from the host-written response file. Legacy
     // invalid/stale responses only remove the file; correlated validation
-    // failures publish a rejected receipt. The pending question and its exact
-    // terminal fallback are preserved until an applied result or
-    // `user_input.completed`.
+    // failures publish a rejected receipt. Preflight failures and indeterminate
+    // RPC outcomes retain the pending question. Explicit boolean RPC results or
+    // completion events retire it: success:false means the ID is no longer
+    // pending, while the losing answer's receipt remains rejected.
     async function processUserInputResponse() {
         // Only the owner reconciles remote answers: a spawned classifier helper
         // shares this session dir and would otherwise delete the owner's pending
@@ -2064,27 +2076,17 @@ if (validSessionId && socketPath) {
                 response: { answer, wasFreeform },
             });
             if (!operationAuthorityCurrent(executionContext)) return;
+            // False means the request is no longer pending, not that our answer succeeded.
+            const resolved = typeof result?.success === "boolean";
+            if (resolved) {
+                noteQuestionCompleted(requestId);
+                pendingUserInputs.delete(requestId);
+            }
             if (operation.mode === "legacy") {
-                if (result?.success === true) {
-                    pendingUserInputs.delete(requestId);
-                    removeCapturedHandoff(
-                        userInputResponsePath,
-                        encoded,
-                        executionContext
-                    );
-                    publish();
-                } else {
-                    removeCapturedHandoff(
-                        userInputResponsePath,
-                        encoded,
-                        executionContext
-                    );
-                }
+                removeCapturedHandoff(userInputResponsePath, encoded, executionContext);
+                if (resolved) publish();
             } else {
                 const outcome = rpcReceiptOutcome(result);
-                if (outcome.state === "applied") {
-                    pendingUserInputs.delete(requestId);
-                }
                 const published = publishTerminalReceipt(
                     operation.context,
                     outcome.state,
@@ -2216,6 +2218,273 @@ if (validSessionId && socketPath) {
         }
     }
 
+    function suppressRecoveredDurableQuestion(toolCallId) {
+        if (typeof toolCallId !== "string" || !toolCallId
+                || toolCallId.length > 200) return;
+        recoveredQuestionToolCallIds.add(toolCallId);
+        while (recoveredQuestionToolCallIds.size > MAX_QUESTION_COMPLETIONS) {
+            recoveredQuestionToolCallIds.delete(recoveredQuestionToolCallIds.values().next().value);
+        }
+        const requestId = DURABLE_ASK_USER_PREFIX + toolCallId;
+        if (durableAskUser?.requestId === requestId) durableAskUser = null;
+        if (durableAskUserScan?.requestId === requestId) durableAskUserScan = null;
+    }
+
+    function noteQuestionCompleted(requestId) {
+        pendingQuestionRecovery?.completed.add(requestId);
+        questionEventStream?.inputs.delete(requestId);
+        questionEventStream?.elicitations.delete(requestId);
+        // Runtime request IDs are unique; a delayed notification must not reopen an answered form.
+        completedQuestionRequests.delete(requestId);
+        completedQuestionRequests.add(requestId);
+        while (completedQuestionRequests.size > MAX_QUESTION_COMPLETIONS) {
+            completedQuestionRequests.delete(completedQuestionRequests.values().next().value);
+        }
+    }
+
+    function applyQuestionEvent(event, recovered = false) {
+        const requestId = event?.data?.requestId;
+        if (!QUESTION_EVENT_TYPES.includes(event?.type)
+                || typeof requestId !== "string" || !requestId
+                || requestId.length > 200 || requestId.startsWith(DURABLE_ASK_USER_PREFIX)) return false;
+        const elicitation = event.type.startsWith("elicitation.");
+        const pending = elicitation ? pendingElicitations : pendingUserInputs;
+        if (event.type.endsWith(".completed")) {
+            noteQuestionCompleted(requestId);
+            const entry = pending.get(requestId);
+            const cleared = (!recovered || entry) ? observeLiveRootQuestion(event) : false;
+            if (entry) {
+                pending.delete(requestId);
+                recordInputCompletion(entry.agentId || copilotSessionId, event);
+            }
+            return Boolean(entry) || cleared;
+        }
+        if (completedQuestionRequests.has(requestId)) return false;
+        const entry = elicitation ? elicitationEntry(event) : userInputEntry(event);
+        const maximum = elicitation ? MAX_ELICITATIONS : MAX_USER_INPUTS;
+        if (recovered) {
+            if (!entry) return false;
+            if (!pending.has(requestId) && pending.size >= maximum) {
+                const oldest = [...pending.values()].reduce((oldest, item) =>
+                    item.requestedAt < oldest.requestedAt ? item : oldest
+                );
+                if (entry.requestedAt <= oldest.requestedAt) return false;
+                pending.delete(oldest.requestId);
+            }
+        }
+        const cleared = observeLiveRootQuestion(event);
+        if (!entry) return cleared;
+        if (recovered && !entry.agentId) suppressRecoveredDurableQuestion(event.data.toolCallId);
+        if (pending.has(requestId)) return cleared;
+        pending.set(requestId, entry);
+        if (elicitation) boundPendingElicitations();
+        else boundPendingUserInputs();
+        return true;
+    }
+
+    async function reconcileQuestionEvents() {
+        if (shuttingDown) return;
+        const generation = conversationGeneration;
+        const stream = questionEventStream ??= {
+            sessionId: copilotSessionId,
+            cursor: undefined,
+            startCursor: undefined,
+            inputsOverflowed: false,
+            elicitationsOverflowed: false,
+            inputs: new Map(),
+            elicitations: new Map(),
+            completed: new Map(),
+            inFlight: false,
+            unsupported: false,
+            error: null,
+        };
+        if (stream.inFlight || stream.unsupported) return;
+        stream.inFlight = true;
+        const current = () => !shuttingDown && questionEventStream === stream
+            && generation === conversationGeneration && stream.sessionId === copilotSessionId;
+        const report = (message) => {
+            if (current() && stream.error !== message) {
+                stream.error = message;
+                console.error("[copilot-projects] question event recovery:", message);
+            }
+        };
+        let timeout = null;
+        try {
+            if (!ownsSharedFiles()) return;
+            if (typeof session.connection?.sendRequest !== "function") {
+                throw Object.assign(new Error("question event API unavailable"), { code: -32601 });
+            }
+            const startedAt = Date.now();
+            for (let page = 0; page < MAX_QUESTION_EVENT_PAGES; page++) {
+                timeout = setTimeout(
+                    () => report("event read is slow; keeping the existing questions while it finishes"),
+                    PENDING_QUESTIONS_TIMEOUT_MS
+                );
+                // Keep the single-flight guard until the RPC settles, even when it is slow.
+                const result = await session.connection.sendRequest("session.eventLog.read", {
+                    sessionId: stream.sessionId,
+                    ...(stream.cursor === undefined ? {} : { cursor: stream.cursor }),
+                    types: QUESTION_EVENT_TYPES,
+                    agentScope: "all",
+                    direction: "forward",
+                    includeEphemeral: true,
+                    max: QUESTION_EVENT_PAGE_SIZE,
+                    waitMs: 0,
+                });
+                clearTimeout(timeout);
+                timeout = null;
+                if (!current()) return;
+                if (!Array.isArray(result?.events) || result.events.length > QUESTION_EVENT_PAGE_SIZE
+                        || typeof result.cursor !== "string" || !result.cursor
+                        || typeof result.hasMore !== "boolean"
+                        || !["ok", "expired"].includes(result.cursorStatus)) {
+                    throw new Error("invalid question event page");
+                }
+                if (result.cursorStatus === "expired") {
+                    stream.cursor = undefined;
+                    stream.startCursor = undefined;
+                    stream.inputsOverflowed = false;
+                    stream.elicitationsOverflowed = false;
+                    stream.inputs.clear();
+                    stream.elicitations.clear();
+                    stream.completed.clear();
+                    report("cursor expired; restarting retained question history");
+                    return;
+                }
+                if (result.hasMore && result.cursor === stream.cursor) {
+                    throw new Error("question event cursor did not advance");
+                }
+                // Stage the whole catch-up before publishing: a later page may complete a request.
+                for (const event of result.events) {
+                    const requestId = event?.data?.requestId;
+                    if (!QUESTION_EVENT_TYPES.includes(event?.type)
+                            || typeof requestId !== "string" || !requestId || requestId.length > 200
+                            || !Number.isFinite(Date.parse(event.timestamp))) continue;
+                    if (event.type.endsWith(".completed")) {
+                        noteQuestionCompleted(requestId);
+                        stream.completed.set(requestId, event);
+                        while (stream.completed.size > MAX_QUESTION_COMPLETIONS) {
+                            stream.completed.delete(stream.completed.keys().next().value);
+                        }
+                    } else if (!stream.completed.has(requestId) && !completedQuestionRequests.has(requestId)) {
+                        const entry = event.type === "elicitation.requested"
+                            ? elicitationEntry(event) : userInputEntry(event);
+                        if (!entry) continue;
+                        const pending = event.type === "elicitation.requested" ? stream.elicitations : stream.inputs;
+                        const maximum = event.type === "elicitation.requested" ? MAX_ELICITATIONS : MAX_USER_INPUTS;
+                        if (!pending.has(requestId)) pending.set(requestId, event);
+                        while (pending.size > maximum) {
+                            if (pending === stream.inputs) stream.inputsOverflowed = true;
+                            else stream.elicitationsOverflowed = true;
+                            pending.delete(pending.keys().next().value);
+                        }
+                    }
+                }
+                stream.cursor = result.cursor;
+                if (!result.hasMore && (
+                    (stream.inputsOverflowed && stream.inputs.size < MAX_USER_INPUTS)
+                    || (stream.elicitationsOverflowed && stream.elicitations.size < MAX_ELICITATIONS)
+                )) {
+                    // Completions freed capped slots; reselect with their tombstones before publishing.
+                    stream.cursor = stream.startCursor;
+                    stream.inputsOverflowed = false;
+                    stream.elicitationsOverflowed = false;
+                    stream.inputs.clear();
+                    stream.elicitations.clear();
+                } else if (!result.hasMore) {
+                    let changed = false;
+                    for (const event of stream.completed.values()) {
+                        changed = applyQuestionEvent(event, true) || changed;
+                    }
+                    for (const event of [...stream.inputs.values(), ...stream.elicitations.values()]) {
+                        changed = applyQuestionEvent(event, true) || changed;
+                    }
+                    stream.inputs.clear();
+                    stream.elicitations.clear();
+                    stream.completed.clear();
+                    stream.startCursor = stream.cursor;
+                    stream.inputsOverflowed = false;
+                    stream.elicitationsOverflowed = false;
+                    stream.error = null;
+                    if (changed) publish();
+                    return;
+                }
+                if (Date.now() - startedAt >= PENDING_QUESTIONS_TIMEOUT_MS) return;
+            }
+        } catch (error) {
+            if (!current()) return;
+            stream.unsupported = error?.code === -32601;
+            report(stream.unsupported ? "event API unavailable; keeping terminal fallback" : String(error));
+        } finally {
+            clearTimeout(timeout);
+            stream.inFlight = false;
+        }
+    }
+
+    async function recoverPendingQuestions(generation) {
+        if (generation !== conversationGeneration || shuttingDown) return;
+        const recovery = {
+            sessionId: copilotSessionId,
+            completed: new Set(),
+        };
+        pendingQuestionRecovery = recovery;
+        let timeout = null;
+        const current = () => !shuttingDown
+            && pendingQuestionRecovery === recovery
+            && generation === conversationGeneration
+            && recovery.sessionId === copilotSessionId;
+        try {
+            if (typeof session.connection?.sendRequest !== "function") {
+                throw Object.assign(new Error("pending question RPC unavailable"), { code: -32601 });
+            }
+            const result = await Promise.race([
+                session.connection.sendRequest("session.ui.pendingRequests", {
+                    sessionId: recovery.sessionId,
+                }),
+                new Promise((_, reject) => {
+                    timeout = setTimeout(
+                        () => reject(new Error("pending question recovery timed out")),
+                        PENDING_QUESTIONS_TIMEOUT_MS
+                    );
+                }),
+            ]);
+            if (!current()) return;
+            if (!Array.isArray(result?.userInputRequests)
+                    || !Array.isArray(result?.elicitationRequests)) {
+                throw new Error("invalid pending question snapshot");
+            }
+            for (const [items, pending, parse, maximum] of [
+                [result.userInputRequests, pendingUserInputs, userInputEntry, MAX_USER_INPUTS],
+                [result.elicitationRequests, pendingElicitations, elicitationEntry, MAX_ELICITATIONS],
+            ]) {
+                for (const data of items.slice(-maximum)) {
+                    if (recovery.completed.has(data?.requestId) || completedQuestionRequests.has(data?.requestId)) continue;
+                    const entry = parse({ data });
+                    if (!entry) continue;
+                    // Live events win over an older snapshot, including their agent ownership.
+                    if (!pending.has(entry.requestId)) {
+                        if (pending.size >= maximum) continue;
+                        pending.set(entry.requestId, entry);
+                    }
+                    if (!pending.get(entry.requestId).agentId) {
+                        suppressRecoveredDurableQuestion(data.toolCallId);
+                    }
+                }
+            }
+            publish();
+        } catch (error) {
+            if (!current()) return;
+            if (error?.code === -32601) {
+                console.error("[copilot-projects] pending snapshot unavailable; using question event recovery");
+            } else {
+                console.error("[copilot-projects] pending question recovery failed:", error);
+            }
+        } finally {
+            clearTimeout(timeout);
+            if (pendingQuestionRecovery === recovery) pendingQuestionRecovery = null;
+        }
+    }
+
     function clearDurableAskUser() {
         const changed = durableAskUser !== null
             || durableAskUserScan !== null;
@@ -2301,7 +2570,8 @@ if (validSessionId && socketPath) {
                 || userInputByteLength(message)
                     > MAX_ELICITATION_MESSAGE_BYTES
                 || typeof toolCallId !== "string" || !toolCallId
-                || toolCallId.length > 200) {
+                || toolCallId.length > 200
+                || recoveredQuestionToolCallIds.has(toolCallId)) {
             return null;
         }
         const requestedAt = normalizedTimestamp(event.timestamp);
@@ -2340,7 +2610,8 @@ if (validSessionId && socketPath) {
 
     // Answer a pending elicitation from the host-written response file. Mirrors
     // processUserInputResponse: owner-only, validates against the pending record,
-    // and keeps the elicitation retryable when a response is rejected.
+    // and retains the card on preflight/indeterminate failures. Explicit
+    // success:false retires the no-longer-pending request with a rejected receipt.
     async function processElicitationResponse() {
         if (!ownsSharedFiles()) return;
         let encoded;
@@ -2496,27 +2767,17 @@ if (validSessionId && socketPath) {
                 result,
             });
             if (!operationAuthorityCurrent(executionContext)) return;
+            // False means the request is no longer pending, not that our answer succeeded.
+            const resolved = typeof rpcResult?.success === "boolean";
+            if (resolved) {
+                noteQuestionCompleted(requestId);
+                pendingElicitations.delete(requestId);
+            }
             if (operation.mode === "legacy") {
-                if (rpcResult?.success === true) {
-                    pendingElicitations.delete(requestId);
-                    removeCapturedHandoff(
-                        elicitationResponsePath,
-                        encoded,
-                        executionContext
-                    );
-                    publish();
-                } else {
-                    removeCapturedHandoff(
-                        elicitationResponsePath,
-                        encoded,
-                        executionContext
-                    );
-                }
+                removeCapturedHandoff(elicitationResponsePath, encoded, executionContext);
+                if (resolved) publish();
             } else {
                 const outcome = rpcReceiptOutcome(rpcResult);
-                if (outcome.state === "applied") {
-                    pendingElicitations.delete(requestId);
-                }
                 const published = publishTerminalReceipt(
                     operation.context,
                     outcome.state,
@@ -3494,6 +3755,8 @@ if (validSessionId && socketPath) {
         // empty and would otherwise blank the model line the rotation event
         // just taught us.
         const preservedModel = currentModel;
+        const pendingQuestions = recoverPendingQuestions(generation);
+        reconcileQuestionEvents();
         let history = [];
 
         durableTranscriptAuthoritative = durableHistoryAvailable();
@@ -3585,6 +3848,8 @@ if (validSessionId && socketPath) {
             }
         }
         queuedTranscriptEvents.length = 0;
+        await pendingQuestions;
+        if (stale()) return;
         publish();
         if (durableTranscriptAuthoritative) {
             scheduleDurableReconcile(0);
@@ -3622,6 +3887,10 @@ if (validSessionId && socketPath) {
         pendingUserInputs.clear();
         inFlightUserInputResponses.clear();
         pendingElicitations.clear();
+        recoveredQuestionToolCallIds.clear();
+        completedQuestionRequests.clear();
+        pendingQuestionRecovery = null;
+        questionEventStream = null;
         inFlightElicitationResponses.clear();
         pendingPermissionRequests.clear();
         completedPermissionRequests.clear();
@@ -4387,57 +4656,13 @@ if (validSessionId && socketPath) {
     process.once("SIGINT", () => { shutdown("SIGINT").catch(() => process.exit(130)); });
     process.once("exit", cleanupSharedFiles);
 
-    session.on("user_input.requested", (event) => {
-        const cleared = observeLiveRootQuestion(event);
-        const entry = userInputEntry(event);
-        // A rejected entry is never exposed remotely; the terminal keeps the
-        // exact prompt so nothing is lost.
-        if (!entry) {
-            if (cleared) publish();
-            return;
-        }
-        pendingUserInputs.set(entry.requestId, entry);
-        boundPendingUserInputs();
-        publish();
-    });
-
-    session.on("user_input.completed", (event) => {
-        const requestId = event.data?.requestId;
-        const cleared = observeLiveRootQuestion(event);
-        const entry = pendingUserInputs.get(requestId);
-        if (entry) {
-            pendingUserInputs.delete(requestId);
-            recordInputCompletion(entry.agentId || copilotSessionId, event);
-        }
-        if (entry || cleared) {
-            publish();
-        }
-    });
-
-    session.on("elicitation.requested", (event) => {
-        const cleared = observeLiveRootQuestion(event);
-        const entry = elicitationEntry(event);
-        if (!entry) {
-            if (cleared) publish();
-            return;
-        }
-        pendingElicitations.set(entry.requestId, entry);
-        boundPendingElicitations();
-        publish();
-    });
-
-    session.on("elicitation.completed", (event) => {
-        const requestId = event.data?.requestId;
-        const cleared = observeLiveRootQuestion(event);
-        const entry = pendingElicitations.get(requestId);
-        if (entry) {
-            pendingElicitations.delete(requestId);
-            recordInputCompletion(entry.agentId || copilotSessionId, event);
-        }
-        if (entry || cleared) {
-            publish();
-        }
-    });
+    function onQuestionEvent(event) {
+        if (applyQuestionEvent(event)) publish();
+    }
+    session.on("user_input.requested", onQuestionEvent);
+    session.on("user_input.completed", onQuestionEvent);
+    session.on("elicitation.requested", onQuestionEvent);
+    session.on("elicitation.completed", onQuestionEvent);
 
     // Both user_input.requested and elicitation.requested are gated events: the
     // runtime only delivers them to consumers that register interest, otherwise
@@ -4493,6 +4718,7 @@ if (validSessionId && socketPath) {
         // heartbeat exact while collapsing the steady-state cost from two
         // full snapshot writes per tick to one.
         publish();
+        reconcileQuestionEvents();
         refreshRuntimeActivity();
         refreshSchedules();
         refreshModels();
