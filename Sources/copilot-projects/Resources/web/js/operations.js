@@ -34,6 +34,24 @@ function negotiatedOperationSupport(protocolInfo, session) {
   }
 }
 
+function workflowSupports(protocolInfo, session, kind, now = Date.now()) {
+  const workflow = session?.workflow;
+  const age = now - workflow?.observedAtMilliseconds;
+  return protocolInfo?.capabilities?.includes('native-session-workflows') === true
+    && negotiatedOperationSupport(protocolInfo, session) === REMOTE_OPERATION_SUPPORT.RECEIPTS
+    && workflow?.version === 1 && Number.isFinite(age) && age >= 0 && age <= 15000
+    && Array.isArray(workflow.capabilities) && workflow.capabilities.includes(kind);
+}
+
+const NATIVE_PROMPT_UNAVAILABLE_MESSAGE =
+  'Native tracker metadata is unavailable. Reload the tracker or use Terminal.';
+
+function legacyPromptSupported(protocolInfo, session) {
+  return protocolInfo?.capabilities?.includes('native-session-workflows') !== true
+    || (session?.workflow?.legacyPromptFallback === true
+      && negotiatedOperationSupport(protocolInfo, session) !== REMOTE_OPERATION_SUPPORT.UNAVAILABLE);
+}
+
 function isSyntheticDurableElicitation(request) {
   return typeof request?.requestId === 'string'
     && request.requestId.startsWith('synthetic::durable-ask-user::');
@@ -58,6 +76,9 @@ function remoteOperationMessage(record) {
       : 'Outcome unknown \u2014 check the terminal before trying again.';
   }
   if (record.state === 'rejected') {
+    if (['session-abort', 'set-session-budget', 'answer-session-budget'].includes(record.kind)) {
+      return 'Copilot did not apply this action. Check its current state before trying again.';
+    }
     if (record.errorCode === 'target-unavailable') {
       return 'The conversation changed before Copilot could apply this. You can try again.';
     }
@@ -239,7 +260,11 @@ function createOperationController(options = {}) {
       if (!receipt) continue;
       const state = REMOTE_OPERATION_STATES.has(receipt.state)
         ? receipt.state : 'indeterminate';
-      if (recordIsTerminal(record) || record.state === 'indeterminate') continue;
+      if (recordIsTerminal(record)) continue;
+      if (record.state === 'indeterminate' && (
+        !['session-abort', 'set-session-budget', 'answer-session-budget'].includes(record.kind)
+        || !['applied', 'rejected'].includes(state)
+      )) continue;
       if (state === 'accepted' && record.state === 'accepted') continue;
       const previousState = record.state;
       record.state = state;

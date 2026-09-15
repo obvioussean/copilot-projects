@@ -127,6 +127,13 @@ if (validSessionId && socketPath) {
         sessionsDir, `${appSessionId}.set-model-request.json`
     );
     const setModelRequestName = `${appSessionId}.set-model-request.json`;
+    const workflowKinds = [
+        "session-send", "session-abort", "set-session-budget", "answer-session-budget",
+    ];
+    const workflowPaths = new Map(workflowKinds.map((kind) => [
+        kind, join(sessionsDir, `${appSessionId}.${kind}.json`),
+    ]));
+    const taskResultPath = join(sessionsDir, `${appSessionId}.task-result.json`);
     const closeSessionRequestPath = join(
         sessionsDir, `${appSessionId}.close-session-request`
     );
@@ -214,6 +221,7 @@ if (validSessionId && socketPath) {
     let synthesizedTaskCompletionContent = null;
     let transcriptInitialized = false;
     let transcriptPublishTimer = null;
+    let transcriptDeltaPublishTimer = null;
     let durableReconcileTimer = null;
     let durableReconcileRun = null;
     let durableReconcileQueued = false;
@@ -246,6 +254,22 @@ if (validSessionId && socketPath) {
     let conversationGeneration = 0;
     const trackerInstanceId = randomUUID();
     let conversationEpoch = `${trackerInstanceId}:${conversationGeneration}`;
+    let workflowRuntime = null;
+    let workflowRefresh = null;
+    let workflowRefreshAt = 0;
+    let workflowObservation = null;
+    let workflowContext = null;
+    let pendingBudgetRequest = null;
+    const pendingBudgetIds = new Set();
+    let workflowResultRevision = 0;
+    let workflowSummary = null;
+    let workflowTaskStatus = "finished";
+    const workflowChecks = new Map();
+    const workflowPRs = new Set();
+    const workflowPRTools = new Set();
+    const liveMessageStreams = new Map();
+    let workflowLiveTurnId = null;
+    const unavailableWorkflowActions = new Set();
     // Id of the lifecycle event that performed the most recent rotation. The
     // SDK delivers one event to BOTH the named and the generic listener; the
     // one that fires second must not re-enter it as ordinary conversation
@@ -302,6 +326,7 @@ if (validSessionId && socketPath) {
         "answer-user-input",
         "answer-elicitation",
         "set-model",
+        ...workflowKinds,
     ]);
 
     function truncatedText(value, maximumLength) {
@@ -1251,6 +1276,13 @@ if (validSessionId && socketPath) {
                 idleAtMilliseconds: runtimeIdleAtMilliseconds,
                 error: null,
             };
+            if (workflowObservation && workflowRuntime) {
+                workflowObservation.observedAtMilliseconds = observedAtMilliseconds;
+                workflowObservation.limitsKnown = Object.hasOwn(metadata, "sessionLimits")
+                    && (metadata.sessionLimits === null || finiteNonnegative(metadata.sessionLimits?.maxAiCredits));
+                workflowObservation.maxAiCredits = workflowObservation.limitsKnown
+                    ? metadata.sessionLimits?.maxAiCredits ?? null : null;
+            }
             // Unchanged observations ride the next heartbeat; actual transitions
             // and input completions publish immediately.
             if (changed || token.forcePublish) publish();
@@ -1288,6 +1320,524 @@ if (validSessionId && socketPath) {
         }
     }
 
+    function workflowContextToken() {
+        return { generation: conversationGeneration, copilotSessionId, conversationEpoch };
+    }
+
+    function workflowRPC(method, params, context) {
+        if (method === "status.get") return session.connection.sendRequest(method, {});
+        return session.connection.sendRequest(method, {
+            ...params, sessionId: context.copilotSessionId,
+        });
+    }
+
+    async function workflowRead(method, params, context) {
+        let timeout;
+        try {
+            return await Promise.race([
+                workflowRPC(method, params, context),
+                new Promise((_, reject) => {
+                    timeout = setTimeout(() => reject(new Error("workflow-read-timeout")), 3_000);
+                }),
+            ]);
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
+    function finiteNonnegative(value) {
+        return typeof value === "number" && Number.isFinite(value) && value >= 0;
+    }
+
+    function workflowHasPendingInput() {
+        return pendingUserInputs.size > 0 || pendingElicitations.size > 0
+            || pendingPermissionRequests.size > 0 || durableAskUser !== null
+            || pendingBudgetIds.size > 0;
+    }
+
+    function workflowSnapshot() {
+        const observation = workflowObservation;
+        const fresh = observation && runtimeActivity?.error == null
+            && !terminalDisconnectError && Date.now() - observation.observedAtMilliseconds <= 15_000;
+        const capabilities = fresh ? observation.capabilities.filter(
+            (kind) => !unavailableWorkflowActions.has(kind)
+        ) : [];
+        return {
+            version: 1,
+            observedAtMilliseconds: observation?.observedAtMilliseconds ?? 0,
+            capabilities,
+            sendReady: fresh === true && !workflowHasPendingInput(),
+            legacyPromptFallback: workflowRuntime === false || runtimeActivityUnsupported
+                || observation?.legacyPromptFallback === true
+                || unavailableWorkflowActions.has("session-send"),
+            totalAiCredits: observation?.totalAiCredits ?? null,
+            contextTokens: workflowContext?.currentTokens ?? null,
+            contextTokenLimit: workflowContext?.tokenLimit ?? null,
+            limitsKnown: observation?.limitsKnown === true,
+            maxAiCredits: observation?.maxAiCredits ?? null,
+            budgetRequest: pendingBudgetRequest,
+            agents: [...activeSubagents.values()].slice(0, 64).map(({ id, name, description }) => ({
+                id: String(id), name, description,
+            })),
+            schedules: schedules.slice(0, 32).map((entry) =>
+                boundedMetadataText(entry.description || entry.prompt || entry.id || "Scheduled work")
+            ),
+            error: observation ? observation.error : "Runtime information is not available yet",
+        };
+    }
+
+    async function refreshWorkflow(force = false) {
+        if (shuttingDown || !ownsSharedFiles()
+                || runtimeActivityUnsupported
+                || workflowRefresh?.generation === conversationGeneration
+                || (!force && workflowObservation && Date.now() - workflowRefreshAt < 30_000)) return;
+        const context = workflowContextToken();
+        workflowRefresh = context;
+        const observedAtMilliseconds = Date.now();
+        workflowRefreshAt = observedAtMilliseconds;
+        try {
+            if (workflowRuntime === null) {
+                const status = await workflowRead("status.get", {}, context);
+                const version = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(status?.version || "");
+                workflowRuntime = status?.protocolVersion === 3 && version !== null
+                    && Number(version[1]) === 1
+                    && (Number(version[2]) > 0 || Number(version[3]) >= 84);
+            }
+            if (!workflowRuntime) throw new Error("unsupported-runtime");
+            const metadata = await workflowRead("session.metadata.snapshot", {}, context);
+            if (metadata?.sessionId !== context.copilotSessionId || typeof metadata.isRemote !== "boolean") {
+                throw new Error("unsupported-session");
+            }
+            if (metadata.isRemote) {
+                throw Object.assign(new Error("remote-session"), { legacyPromptFallback: true });
+            }
+            const limitsKnown = Object.hasOwn(metadata, "sessionLimits")
+                && (metadata.sessionLimits === null
+                    || finiteNonnegative(metadata.sessionLimits?.maxAiCredits));
+            let totalAiCredits = null;
+            let usageError = null;
+            try {
+                const metrics = await workflowRead("session.usage.getMetrics", {}, context);
+                if (finiteNonnegative(metrics?.totalNanoAiu)) {
+                    totalAiCredits = metrics.totalNanoAiu / 1e9;
+                } else {
+                    usageError = "Session credit usage is unavailable";
+                }
+            } catch (error) {
+                usageError = "Session credit usage is unavailable";
+                console.error("[copilot-projects] workflow usage query failed:", error);
+            }
+            if (!operationAuthorityCurrent(context)) return;
+            workflowObservation = {
+                observedAtMilliseconds,
+                capabilities: [
+                    "session-send", "session-abort", "answer-session-budget",
+                    ...(limitsKnown ? ["set-session-budget"] : []),
+                ],
+                totalAiCredits, limitsKnown,
+                maxAiCredits: metadata.sessionLimits?.maxAiCredits ?? null,
+                error: usageError,
+            };
+            publish();
+        } catch (error) {
+            if (!operationAuthorityCurrent(context)) return;
+            workflowObservation = {
+                observedAtMilliseconds, capabilities: [], limitsKnown: false,
+                legacyPromptFallback: error?.legacyPromptFallback === true || error?.code === -32601,
+                error: "Native workflows require a supported local Copilot runtime",
+            };
+            console.error("[copilot-projects] workflow metadata query failed:", error);
+            publish();
+        } finally {
+            if (workflowRefresh === context) workflowRefresh = null;
+        }
+    }
+
+    function validWorkflowAction(action, kind) {
+        if (!action || action.kind !== kind) return false;
+        const absent = (...keys) => keys.every((key) => action[key] == null);
+        switch (kind) {
+        case "session-send":
+            return typeof action.prompt === "string" && action.prompt.trim().length > 0
+                && Buffer.byteLength(action.prompt) <= 8_192
+                && ["enqueue", "immediate"].includes(action.mode)
+                && absent("maxAiCredits", "requestId", "additionalAiCredits");
+        case "session-abort":
+            return absent("prompt", "mode", "maxAiCredits", "requestId", "additionalAiCredits");
+        case "set-session-budget":
+            return absent("prompt", "mode", "requestId", "additionalAiCredits")
+                && (action.maxAiCredits == null
+                    || (finiteNonnegative(action.maxAiCredits) && action.maxAiCredits >= 30));
+        case "answer-session-budget":
+            return absent("prompt", "mode", "maxAiCredits")
+                && typeof action.requestId === "string" && action.requestId.length > 0
+                && Buffer.byteLength(action.requestId) <= 200
+                && (action.additionalAiCredits == null
+                    || (finiteNonnegative(action.additionalAiCredits) && action.additionalAiCredits > 0));
+        default:
+            return false;
+        }
+    }
+
+    async function invokeWorkflowAction(action, context) {
+        switch (action.kind) {
+        case "session-send": {
+            const result = await workflowRPC("session.send", {
+                prompt: action.prompt, mode: action.mode,
+            }, context);
+            return typeof result?.messageId === "string" && result.messageId.length > 0
+                ? { state: "applied" } : { state: "indeterminate", errorCode: "rpc-indeterminate" };
+        }
+        case "session-abort":
+            return rpcReceiptOutcome(await workflowRPC("session.abort", {}, context));
+        case "set-session-budget": {
+            await workflowRPC("session.options.update", {
+                sessionLimits: action.maxAiCredits == null ? null : { maxAiCredits: action.maxAiCredits },
+            }, context);
+            if (!operationAuthorityCurrent(context)) return { state: "indeterminate" };
+            const metadata = await workflowRead("session.metadata.snapshot", {}, context);
+            return Object.hasOwn(metadata, "sessionLimits")
+                && (metadata.sessionLimits?.maxAiCredits ?? null) === (action.maxAiCredits ?? null)
+                ? { state: "applied" } : { state: "indeterminate", errorCode: "rpc-indeterminate" };
+        }
+        case "answer-session-budget":
+            return rpcReceiptOutcome(await workflowRPC("session.ui.handlePendingSessionLimitsExhausted", {
+                requestId: action.requestId,
+                response: action.additionalAiCredits == null
+                    ? { action: "cancel" }
+                    : { action: "add", additionalAiCredits: action.additionalAiCredits },
+            }, context));
+        }
+    }
+
+    async function processWorkflowAction(kind) {
+        if (!ownsSharedFiles()) return;
+        const path = workflowPaths.get(kind);
+        let encoded;
+        try {
+            const stat = lstatSync(path);
+            if (stat.size > 65_536 || !stat.isFile()) {
+                console.error("[copilot-projects] oversized or invalid session action");
+                return;
+            }
+            encoded = readFileSync(path, "utf8");
+        } catch (error) {
+            if (error?.code !== "ENOENT") {
+                console.error("[copilot-projects] could not read session action:", error);
+            }
+            return;
+        }
+        let request;
+        try { request = JSON.parse(encoded); } catch {
+            console.error("[copilot-projects] invalid session action JSON");
+            removeCapturedHandoff(path, encoded);
+            return;
+        }
+        if (!request || typeof request !== "object") {
+            removeCapturedHandoff(path, encoded);
+            return;
+        }
+        const operation = parseOperationMetadata(request, kind);
+        if (["busy", "inflight"].includes(operation.mode)) return;
+        if (operation.mode === "terminal") {
+            if (publish()) removeCapturedHandoff(path, encoded, operation.context);
+            return;
+        }
+        if (operation.mode === "indeterminate") {
+            if (publishTerminalReceipt(operation.context, "indeterminate", "execution-ownership-lost")) {
+                removeCapturedHandoff(path, encoded, operation.context);
+            }
+            return;
+        }
+        if (operation.mode !== "new") {
+            removeCapturedHandoff(path, encoded);
+            return;
+        }
+        const action = request.action;
+        const context = operation.context;
+        const workflow = workflowSnapshot();
+        const valid = request.schemaVersion === 1 && validWorkflowAction(action, kind)
+            && workflow.capabilities.includes(kind)
+            && (kind !== "session-send" || workflow.sendReady)
+            && (kind !== "set-session-budget" || pendingBudgetRequest === null)
+            && (kind !== "answer-session-budget"
+                || pendingBudgetRequest?.requestId === action.requestId);
+        if (!valid || !operationAuthorityCurrent(context)) {
+            publishRejectedPreflight(context, "target-unavailable", path, encoded);
+            return;
+        }
+        if (!publishAcceptedReceipt(context)) return;
+        const key = operationExecutionKey(context.conversationEpoch, context.operationId);
+        activeOperationKeys.add(key);
+        const timeout = setTimeout(() => {
+            if (publishTerminalReceipt(context, "indeterminate", "receipt-timeout")) {
+                removeCapturedHandoff(path, encoded, context);
+            }
+        }, 10_000);
+        try {
+            const outcome = await invokeWorkflowAction(action, context);
+            if (!operationAuthorityCurrent(context)) return;
+            if (publishTerminalReceipt(context, outcome.state, outcome.errorCode)) {
+                removeCapturedHandoff(path, encoded, context);
+            }
+            if (kind === "answer-session-budget" && outcome.state !== "indeterminate"
+                    && pendingBudgetRequest?.requestId === action.requestId) {
+                pendingBudgetRequest = null;
+                pendingBudgetIds.delete(action.requestId);
+            }
+            refreshWorkflow(true);
+        } catch (error) {
+            if (!operationAuthorityCurrent(context)) return;
+            const unsupported = error?.code === -32601;
+            if (unsupported) unavailableWorkflowActions.add(kind);
+            console.error("[copilot-projects] native session action failed:", error);
+            if (publishTerminalReceipt(
+                context, unsupported ? "rejected" : "indeterminate",
+                unsupported ? "unsupported-runtime" : "rpc-indeterminate"
+            )) removeCapturedHandoff(path, encoded, context);
+        } finally {
+            clearTimeout(timeout);
+            activeOperationKeys.delete(key);
+        }
+    }
+
+    function workflowCheckTitle(event) {
+        if (event.data.mcpServerName || !["bash", "shell", "powershell"].includes(event.data.toolName)) {
+            return null;
+        }
+        const command = event.data.arguments?.command;
+        // Only name simple direct checks. Compound shells can mask a failure;
+        // the UI reports an exit status, never an inferred test-pass count.
+        if (typeof command !== "string" || /[;&|<>`$\r\n]/.test(command)) return null;
+        const match = /^\s*((?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|lint|typecheck|build)\b|node\s+--test\b|swift\s+test\b|go\s+test\b|cargo\s+test\b|dotnet\s+test\b|(?:python3?\s+-m\s+)?pytest\b)/.exec(command);
+        return match ? match[1].trim() : null;
+    }
+
+    function observeWorkflowEvent(event) {
+        const root = !event.agentId;
+        if (root && event.type === "user.message" && classifyUserMessage(event)) {
+            workflowLiveTurnId = event.id;
+            liveMessageStreams.clear();
+            workflowResultRevision += 1;
+            workflowChecks.clear();
+            workflowPRs.clear();
+            workflowPRTools.clear();
+            workflowSummary = null;
+            workflowTaskStatus = "finished";
+        }
+        if (root && event.type === "assistant.turn_start") workflowResultRevision += 1;
+        if (root && ["assistant.message_delta", "assistant.message"].includes(event.type)
+                && typeof event.data.messageId === "string") {
+            const id = boundedMetadataText(event.data.messageId);
+            const turnId = workflowLiveTurnId || pendingTranscriptTurn?.id;
+            if (turnId) {
+                const previous = liveMessageStreams.get(id);
+                const content = event.type === "assistant.message"
+                    ? event.data.content
+                    : (previous?.content || "") + (event.data.deltaContent || "");
+                liveMessageStreams.set(id, {
+                    id, turnId, content: boundedText(content),
+                    timestamp: normalizedTimestamp(event.timestamp),
+                });
+                while (liveMessageStreams.size > 8) {
+                    liveMessageStreams.delete(liveMessageStreams.keys().next().value);
+                }
+                if (event.type === "assistant.message_delta") {
+                    if (!transcriptDeltaPublishTimer) {
+                        transcriptDeltaPublishTimer = setTimeout(() => {
+                            transcriptDeltaPublishTimer = null;
+                            publishTranscript();
+                        }, 2_000);
+                    }
+                } else {
+                    schedulePublishTranscript();
+                }
+            }
+        }
+        if (root && event.type === "session.task_complete") {
+            workflowSummary = truncatedText(event.data.summary, 8_192) || null;
+            if (event.data.success === false) workflowTaskStatus = "blocked";
+        }
+        if (root && event.type === "session.error") workflowTaskStatus = "blocked";
+        const toolKey = `${event.agentId || copilotSessionId}:${event.data?.toolCallId}`;
+        if (event.type === "tool.execution_start" && workflowChecks.size < 64) {
+            const title = workflowCheckTitle(event);
+            if (title) workflowChecks.set(toolKey, { id: toolKey, title, exitCode: null });
+            const command = event.data.arguments?.command;
+            if (!event.data.mcpServerName && event.data.toolName === "bash"
+                    && typeof command === "string" && /^\s*gh\s+pr\s+(create|view)\b/.test(command)
+                    && !/[;&|<>`$\r\n]/.test(command) && workflowPRTools.size < 64) {
+                workflowPRTools.add(toolKey);
+            }
+        }
+        if (event.type === "tool.execution_complete") {
+            const check = workflowChecks.get(toolKey);
+            if (check) {
+                const exits = (event.data.result?.contents || []).filter((entry) =>
+                    ["shell_exit", "terminal"].includes(entry.type) && Number.isSafeInteger(entry.exitCode)
+                );
+                if (exits.length === 1) {
+                    check.exitCode = exits[0].exitCode;
+                    check.workingDirectory = truncatedText(exits[0].cwd, 1_024) || null;
+                }
+            }
+            // A link is a destination reported by a tool, not a claim about PR state.
+            for (const entry of event.data.result?.contents || []) {
+                if (entry.type === "resource_link" && typeof entry.uri === "string"
+                        && /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/[1-9]\d*$/.test(entry.uri)
+                        && workflowPRs.size < 8) workflowPRs.add(entry.uri);
+            }
+            if (workflowPRTools.has(toolKey) && event.data.success === true) {
+                for (const match of (event.data.result?.content || "").matchAll(
+                    /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/[1-9]\d*/g
+                )) {
+                    if (workflowPRs.size < 8) workflowPRs.add(match[0]);
+                }
+            }
+        }
+        if (root && event.type === "session.usage_info") {
+            const { currentTokens, tokenLimit } = event.data;
+            workflowContext = Number.isSafeInteger(currentTokens) && currentTokens >= 0
+                && Number.isSafeInteger(tokenLimit) && tokenLimit > 0
+                ? { currentTokens, tokenLimit } : null;
+            publish();
+        }
+        if (event.type === "session_limits_exhausted.requested") {
+            const { requestId, maxAiCredits, usedAiCredits } = event.data;
+            if (typeof requestId === "string" && requestId.length > 0 && requestId.length <= 200
+                    && finiteNonnegative(maxAiCredits) && finiteNonnegative(usedAiCredits)) {
+                pendingBudgetIds.add(requestId);
+                if (root) pendingBudgetRequest = { requestId, maxAiCredits, usedAiCredits };
+                publish();
+            }
+        }
+        if (event.type === "session_limits_exhausted.completed") {
+            pendingBudgetIds.delete(event.data.requestId);
+            if (pendingBudgetRequest?.requestId === event.data.requestId) pendingBudgetRequest = null;
+            publish();
+            refreshWorkflow(true);
+        }
+        if (root && ["session.usage_checkpoint", "session.session_limits_changed"].includes(event.type)) {
+            refreshWorkflow(true);
+        }
+        if (root && event.type === "session.idle") {
+            pendingBudgetIds.clear();
+            pendingBudgetRequest = null;
+            const context = workflowContextToken();
+            const revision = workflowResultRevision;
+            const turnId = workflowLiveTurnId || pendingTranscriptTurn?.id;
+            const turn = pendingTranscriptTurn?.id === turnId
+                ? pendingTranscriptTurn : transcriptTurns.find((entry) => entry.id === turnId);
+            workflowLiveTurnId = null;
+            const checks = [...workflowChecks.values()].map((check) => ({ ...check }));
+            const summary = workflowSummary
+                || truncatedText(turn?.assistantMessages.at(-1)?.content, 8_192) || null;
+            const status = event.data.aborted === true ? "stopped" : workflowTaskStatus;
+            const pullRequests = [...workflowPRs];
+            queueMicrotask(() => {
+                if (turnId && operationAuthorityCurrent(context) && revision === workflowResultRevision) {
+                    captureTaskResult(context, revision, {
+                        turnId, checks, summary, status, pullRequests,
+                    });
+                }
+            });
+            refreshWorkflow(true);
+        }
+    }
+
+    function boundedWorkflowDiff(value) {
+        if (!value || !Array.isArray(value.changes) || typeof value.isFallback !== "boolean"
+                || !["session", "unstaged", "branch"].includes(value.mode)) return null;
+        const changes = [];
+        let bytes = 0;
+        let truncated = false;
+        for (const entry of value.changes) {
+            if (changes.length >= 50) { truncated = true; break; }
+            if (typeof entry.path !== "string" || typeof entry.diff !== "string") continue;
+            const change = {
+                path: truncatedText(entry.path, 2_048),
+                diff: truncatedText(entry.diff, 24_000),
+                truncated: entry.isTruncated === true || entry.diff.length > 24_000,
+            };
+            const size = Buffer.byteLength(JSON.stringify(change));
+            if (bytes + size > 96 * 1_024) { truncated = true; break; }
+            changes.push(change);
+            bytes += size;
+        }
+        return {
+            requestedMode: "session", mode: value.mode, isFallback: value.isFallback,
+            unavailableReason: truncatedText(value.unavailableReason, 200) || null,
+            changes, truncated,
+        };
+    }
+
+    async function captureTaskResult(context, revision, result) {
+        const current = () => revision === workflowResultRevision && operationAuthorityCurrent(context);
+        if (!workflowRuntime || !result.turnId || !current()) return;
+        const temporary = `${taskResultPath}.${process.pid}.tmp`;
+        const saveFailure = (error) => {
+            if (!current()) return;
+            console.error("[copilot-projects] could not capture task result:", error);
+            const failure = {
+                schemaVersion: 1,
+                copilotSessionId: context.copilotSessionId,
+                conversationEpoch: context.conversationEpoch,
+                result: {
+                    turnId: result.turnId, capturedAt: new Date().toISOString(), status: result.status,
+                    summary: null, branch: null, repository: null, diff: null,
+                    checks: [], pullRequests: [],
+                    error: "Task result capture failed. Inspect the terminal for current evidence.",
+                },
+            };
+            try {
+                const encoded = JSON.stringify(failure);
+                if (Buffer.byteLength(encoded) > 256 * 1_024) throw new Error("task-result-too-large");
+                if (!current()) return;
+                writeFileSync(temporary, encoded, { mode: 0o600 });
+                if (!current()) return;
+                renameSync(temporary, taskResultPath);
+            } catch (writeError) {
+                if (!current()) return;
+                console.error(
+                    "[copilot-projects] could not persist task result failure; previous result may remain:",
+                    writeError
+                );
+            }
+        };
+        const [metadata, diff] = await Promise.allSettled([
+            workflowRead("session.metadata.snapshot", {}, context),
+            workflowRead("session.workspaces.diff", { mode: "session" }, context),
+        ]);
+        if (!current()) return;
+        const snapshot = metadata.status === "fulfilled" ? metadata.value : null;
+        if (snapshot?.sessionId !== context.copilotSessionId || snapshot.isRemote !== false) {
+            saveFailure(metadata.status === "rejected"
+                ? metadata.reason : new Error("invalid task result session metadata"));
+            return;
+        }
+        const normalizedDiff = diff.status === "fulfilled" ? boundedWorkflowDiff(diff.value) : null;
+        const envelope = {
+            schemaVersion: 1,
+            copilotSessionId: context.copilotSessionId,
+            conversationEpoch: context.conversationEpoch,
+            result: {
+                ...result, capturedAt: new Date().toISOString(),
+                branch: truncatedText(snapshot.workspace?.branch, 512) || null,
+                repository: truncatedText(snapshot.workspace?.repository, 512) || null,
+                diff: normalizedDiff,
+                error: normalizedDiff ? null : "Diff unavailable; inspect the working tree in the terminal",
+            },
+        };
+        try {
+            const encoded = JSON.stringify(envelope);
+            if (Buffer.byteLength(encoded) > 256 * 1_024) throw new Error("task-result-too-large");
+            writeFileSync(temporary, encoded, { mode: 0o600 });
+            renameSync(temporary, taskResultPath);
+        } catch (error) {
+            saveFailure(error);
+        }
+    }
+
     function publish(error) {
         if (!ownsSharedFiles()) return false;
         if (isTerminalDisconnect(error)) {
@@ -1321,6 +1871,7 @@ if (validSessionId && socketPath) {
             conversationEpoch,
             operationReceiptVersion: OPERATION_RECEIPT_VERSION,
             operationReceipts: operationReceiptSnapshot(),
+            workflow: workflowSnapshot(),
             ...(reportedError ? { error: reportedError } : {}),
         };
         const temporaryPath = `${snapshotPath}.${process.pid}.tmp`;
@@ -2269,13 +2820,20 @@ if (validSessionId && socketPath) {
         if (!turn.userContent
                 && turn.assistantMessages.length === 0
                 && turn.tools.length === 0) return null;
+        const assistantMessages = turn.assistantMessages.slice();
+        for (const stream of liveMessageStreams.values()) {
+            if (stream.turnId === turn.id && !assistantMessages.some((message) => message.id === stream.id)
+                    && assistantMessages.length < MAX_TRANSCRIPT_ASSISTANT_MESSAGES) {
+                assistantMessages.push({ id: stream.id, timestamp: stream.timestamp, content: stream.content });
+            }
+        }
         return {
             id: turn.id,
             startedAt: turn.startedAt,
             endedAt: null,
             kind: turn.kind,
             userContent: turn.userContent,
-            assistantMessages: turn.assistantMessages,
+            assistantMessages,
             tools: turn.tools,
             isAborted: false,
         };
@@ -2451,6 +3009,8 @@ if (validSessionId && socketPath) {
             return;
         }
         clearTimeout(transcriptPublishTimer);
+        clearTimeout(transcriptDeltaPublishTimer);
+        transcriptDeltaPublishTimer = null;
         transcriptPublishTimer = null;
         writeTranscriptSnapshot();
     }
@@ -2493,12 +3053,18 @@ if (validSessionId && socketPath) {
         if (typeof value !== "string" || value.length === 0) return;
         ensureSyntheticTranscriptTurn(event);
         const content = boundedText(value);
+        const id = boundedMetadataText(event.data.messageId || event.id);
+        const existing = pendingTranscriptTurn.assistantMessages.find((message) => message.id === id);
+        if (existing) {
+            existing.content = content;
+            return;
+        }
         if (pendingTranscriptTurn.assistantMessages.length
                 >= MAX_TRANSCRIPT_ASSISTANT_MESSAGES) {
             pendingTranscriptTurn.assistantMessages.shift();
         }
         pendingTranscriptTurn.assistantMessages.push({
-            id: boundedMetadataText(event.data.messageId || event.id),
+            id,
             timestamp: normalizedTimestamp(event.timestamp),
             content,
         });
@@ -2819,6 +3385,7 @@ if (validSessionId && socketPath) {
                 && event.id === rotationConsumedEventId) {
             return;
         }
+        observeWorkflowEvent(event);
         if (!transcriptInitialized) {
             queuedTranscriptEvents.push(event);
         } else {
@@ -2921,6 +3488,8 @@ if (validSessionId && socketPath) {
 
     function resetDurableCursor(identity) {
         clearTimeout(transcriptPublishTimer);
+        clearTimeout(transcriptDeltaPublishTimer);
+        transcriptDeltaPublishTimer = null;
         transcriptPublishTimer = null;
         if (durableHistoryIdentity === null || durableBaselineComplete) {
             durableFallbackTurns = [...transcriptTurns];
@@ -3270,7 +3839,21 @@ if (validSessionId && socketPath) {
     // to the conversation, and the SDK contract does not require
     // re-registering interest when the conversation rotates.
     function resetConversationState(transitionAt) {
+        clearTimeout(transcriptDeltaPublishTimer);
+        transcriptDeltaPublishTimer = null;
         conversationEpoch = `${trackerInstanceId}:${conversationGeneration}`;
+        workflowObservation = null;
+        workflowContext = null;
+        pendingBudgetRequest = null;
+        pendingBudgetIds.clear();
+        workflowResultRevision += 1;
+        workflowSummary = null;
+        workflowTaskStatus = "finished";
+        workflowChecks.clear();
+        workflowPRs.clear();
+        workflowPRTools.clear();
+        workflowLiveTurnId = null;
+        liveMessageStreams.clear();
         foregroundSessionActive = false;
         foregroundObservationStartedAt = 0;
         operationReceipts.clear();
@@ -3392,6 +3975,8 @@ if (validSessionId && socketPath) {
             removeFile(userInputResponsePath);
             removeFile(elicitationResponsePath);
             removeFile(setModelRequestPath);
+            for (const path of workflowPaths.values()) removeFile(path);
+            removeFile(taskResultPath);
         }
         if (event) applyModelFromEvent(event);
         // Republish the (now empty) per-conversation state immediately so
@@ -3402,6 +3987,7 @@ if (validSessionId && socketPath) {
         bootstrapConversation(generation).catch(() => {});
         refreshSchedules();
         refreshModels();
+        refreshWorkflow();
         return true;
     }
 
@@ -3921,6 +4507,7 @@ if (validSessionId && socketPath) {
         // A switch request from a previous session in this tab must never be
         // executed against the newly joined session.
         removeFile(setModelRequestPath);
+        for (const path of workflowPaths.values()) removeFile(path);
     }
     let userInputWatcher = null;
     try {
@@ -3936,6 +4523,11 @@ if (validSessionId && socketPath) {
             }
             if (!filename || filename === closeSessionRequestName) {
                 processCloseSessionRequest();
+            }
+            for (const kind of workflowKinds) {
+                if (!filename || filename === `${appSessionId}.${kind}.json`) {
+                    processWorkflowAction(kind);
+                }
             }
         });
     } catch {}
@@ -3997,6 +4589,7 @@ if (validSessionId && socketPath) {
     function cleanupSharedFiles() {
         if (timer) clearInterval(timer);
         clearTimeout(transcriptPublishTimer);
+        clearTimeout(transcriptDeltaPublishTimer);
         clearTimeout(durableReconcileTimer);
         if (userInputWatcher) {
             try { userInputWatcher.close(); } catch {}
@@ -4023,6 +4616,7 @@ if (validSessionId && socketPath) {
             removeFile(userInputResponsePath);
             removeFile(elicitationResponsePath);
             removeFile(setModelRequestPath);
+            for (const path of workflowPaths.values()) removeFile(path);
         }
     }
     async function shutdown(signal) {
@@ -4076,11 +4670,13 @@ if (validSessionId && socketPath) {
     refreshSchedules();
     refreshModels();
     refreshRuntimeActivity(true);
+    refreshWorkflow();
 
     processUserInputResponse();
     processElicitationResponse();
     processSetModelRequest();
     processCloseSessionRequest();
+    for (const kind of workflowKinds) processWorkflowAction(kind);
 
     timer = setInterval(() => {
         refreshForegroundAuthoritySoon();
@@ -4101,10 +4697,12 @@ if (validSessionId && socketPath) {
         refreshRuntimeActivity();
         refreshSchedules();
         refreshModels();
+        refreshWorkflow();
         processUserInputResponse();
         processElicitationResponse();
         processSetModelRequest();
         processCloseSessionRequest();
+        for (const kind of workflowKinds) processWorkflowAction(kind);
         scheduleDurableReconcile(0);
     }, DURABLE_RECONCILE_POLL_MS);
     foregroundHandlingReady = true;

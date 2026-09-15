@@ -72,6 +72,7 @@ struct AgentActivitySnapshot: Codable, Equatable {
     var runtimeActivity: RuntimeActivitySnapshot? = nil
     var inputCompletions: [String: Int64]? = nil
     var sessionIdleAtMilliseconds: Int64? = nil
+    var workflow: RemoteSessionWorkflow? = nil
 
     func runtimeForegroundActivity(
         expectedSessionId: String?,
@@ -102,6 +103,7 @@ struct AgentActivitySnapshot: Codable, Equatable {
         trackedUserInputs?.isEmpty == false
             || trackedElicitations?.isEmpty == false
             || pendingPermissionRequestIds?.isEmpty == false
+            || workflow?.budgetRequest != nil
     }
 
     func isFresh(at now: Date = Date(), ttl: TimeInterval = 15) -> Bool {

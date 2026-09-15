@@ -379,7 +379,12 @@ struct DetailView: View {
                     controller: transcript,
                     isOpen: model.isTranscriptDrawerOpen(sessionId: sessionId),
                     onClose: { model.closeTranscriptDrawer(sessionId: sessionId) },
-                    onOpen: { model.openTranscriptDrawer(sessionId: sessionId) }
+                    onOpen: { model.openTranscriptDrawer(sessionId: sessionId) },
+                    workflow: model.sessionWorkflow(sessionId: sessionId),
+                    operation: model.sessionOperationProjection(sessionId: sessionId),
+                    onAction: { action in
+                        await model.performLocalSessionAction(sessionId: sessionId, action: action)
+                    }
                 )
                 .id(sessionId)
                 .animation(.easeOut(duration: 0.18), value:

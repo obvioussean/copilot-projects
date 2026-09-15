@@ -5,9 +5,17 @@ import {documentShim, loadFragments, plain, readFragment} from './support/fragme
 
 const epoch = '00000000-0000-4000-8000-000000000001';
 const nextEpoch = '00000000-0000-4000-8000-000000000002';
+// Literal pre-workflow host capabilities, including its receipt and delivery protocols.
 const protocol = (value = epoch) => ({
-  revision: 1, capabilities: ['replay-safe-control'], controlDeliveryEpoch: value,
+  revision: 1,
+  capabilities: ['conversation-epochs', 'sdk-operation-receipts', 'transcript-window', 'replay-safe-control'],
+  controlDeliveryEpoch: value,
 });
+function nativeProtocol() {
+  const info = protocol();
+  info.capabilities.push('native-session-workflows');
+  return info;
+}
 
 function sourceSection(start, end) {
   const source = readFragment('main');
@@ -20,21 +28,37 @@ function sourceSection(start, end) {
 function client(info = protocol()) {
   const {document, FakeNode} = documentShim();
   FakeNode.prototype.replaceChildren = function(...nodes) { this.children = nodes; this._text = undefined; };
-  const node = () => {
-    const element = new FakeNode('div');
+  const node = (tag = 'div') => {
+    const element = new FakeNode(tag);
+    const listeners = new Map();
     element.classList = {toggle() {}};
     element.focus = () => {};
     element.value = '';
+    element.dataset = {};
+    element.addEventListener = (event, handler) => listeners.set(event, handler);
+    element.click = () => { if (!element.disabled) return listeners.get('click')?.(); };
     return element;
   };
-  document.querySelector = () => node();
+  const elements = new Map([
+    ['#native-prompt-controls', node()],
+    ['#native-prompt-mode', node('select')],
+    ['#native-stop', node('button')],
+  ]);
+  elements.get('#native-prompt-controls').append(
+    elements.get('#native-prompt-mode'), elements.get('#native-stop')
+  );
+  document.querySelector = selector => {
+    if (!elements.has(selector)) elements.set(selector, node());
+    return elements.get(selector);
+  };
   document.querySelectorAll = () => [];
   let uuid = 0;
   let timerID = 0;
   const timers = new Map();
   const calls = [];
   const context = loadFragments(['operations', 'control-delivery'], {
-    document, selected: 'A', writable: true, closingSession: false,
+    document, selected: 'A', selectedConversationEpoch: 'conversation-A',
+    writable: true, closingSession: false,
     selectionGeneration: 0, conversationRequestGeneration: 0,
     workspaceProtocolInfo: info,
     sessionState: new Map([
@@ -49,16 +73,23 @@ function client(info = protocol()) {
     lease: node(), input: node(), terminal: node(), inputDeliveryNotice: node(),
     inputDeliveryText: node(), discardPendingInput: node(), QUEUE_CAP: 25,
     updateCloseSessionState() {}, renderModelLine() {},
+    RECEIPT_TIMEOUT_MS: 20000,
     newUUID: () => `00000000-0000-4000-8000-${String(++uuid).padStart(12, '0')}`,
     setTimeout: (callback, delay) => { const id = ++timerID; timers.set(id, {callback, delay}); return id; },
     clearTimeout: id => timers.delete(id),
     control: async message => { calls.push(plain(message)); return {status: 204, ok: true}; },
   });
   context.controlDeliveries = context.createControlDeliveryAllocator();
+  context.sdkOperations = context.createOperationController({newOperationId: context.newUUID});
   vm.runInContext(sourceSection('function selectTerminalInputSession(', '// ---- Model picker'), context);
+  vm.runInContext(sourceSection('function operationContext(', 'function clearModelOperationState('), context);
   vm.runInContext(sourceSection('function updatePromptState(message)', 'function clearUserInputSubmission('), context);
+  vm.runInContext(sourceSection(
+    "document.querySelector('#native-stop')?.addEventListener(",
+    "document.querySelector('#workflow-set-limit')?.addEventListener("
+  ), context);
   return {
-    context, calls, timers,
+    context, calls, timers, elements,
     addPrompt(text, sessionId = context.selected) {
       const item = context.controlAction(context.newUUID(), 'prompt', sessionId, text);
       context.sessionQueue(sessionId, true).push(item);
@@ -79,6 +110,7 @@ async function settle() {
 
 function switchSession(context, id) {
   context.selected = id;
+  context.selectedConversationEpoch = context.sessionState.get(id)?.conversationEpoch || null;
   context.selectionGeneration += 1;
   context.conversationRequestGeneration += 1;
   context.selectTerminalInputSession(id);
@@ -93,6 +125,502 @@ test('replay support needs both the capability and a valid host epoch', () => {
   assert.equal(c.controlDeliverySupport(protocol(null)).kind, 'unavailable');
   assert.equal(c.controlDeliverySupport(protocol('not-an-epoch')).kind, 'unavailable');
   assert.deepEqual(plain(c.controlDeliverySupport(protocol())), {kind: 'replay-safe', epoch});
+});
+
+test('native prompt delivery waits for the exact SDK receipt, not HTTP acceptance', async () => {
+  const {context: c, calls} = client(nativeProtocol());
+  const session = c.sessionState.get('A');
+  Object.assign(session, {
+    operationSupport: 'receipts',
+    workflow: {version: 1, observedAtMilliseconds: Date.now(),
+      capabilities: ['session-send'], sendReady: true},
+  });
+  assert.equal(c.enqueuePrompt('native work'), true);
+  await settle();
+  assert.equal(calls[0].type, 'session-send');
+  assert.equal(c.sessionQueue('A').length, 1);
+  await c.flushQueue();
+  assert.equal(calls.length, 1);
+  session.operationReceipts = [{
+    operationId: calls[0].requestId, conversationEpoch: 'conversation-A',
+    kind: 'session-send', state: 'applied', updatedAtMilliseconds: Date.now(),
+  }];
+  c.reconcileWorkflowPrompts();
+  assert.equal(c.sessionQueue('A').length, 0);
+});
+
+test('native prompt uncertainty is never replayed and a late receipt resolves it off-tab', async () => {
+  const {context: c, calls} = client(nativeProtocol());
+  const session = c.sessionState.get('A');
+  Object.assign(session, {
+    operationSupport: 'receipts',
+    workflow: {version: 1, observedAtMilliseconds: Date.now(),
+      capabilities: ['session-send'], sendReady: true},
+  });
+
+  c.control = async message => { calls.push(plain(message)); return null; };
+  c.enqueuePrompt('uncertain native work');
+  await settle();
+  assert.ok(c.sessionQueue('A')[0].blockedReason);
+  await c.flushQueue();
+  assert.equal(calls.length, 1);
+  switchSession(c, 'B');
+  session.operationReceipts = [{
+    operationId: calls[0].requestId, conversationEpoch: 'conversation-A',
+    kind: 'session-send', state: 'applied', updatedAtMilliseconds: Date.now(),
+  }];
+  c.reconcileWorkflowPrompts();
+  assert.equal(c.sessionQueue('A').length, 0);
+  assert.equal(c.selected, 'B');
+});
+
+test('old hosts retain legacy prompts even with a negative per-session fallback flag', async () => {
+  for (const fallback of [false, true]) {
+    const {context: c, calls} = client();
+    c.sessionState.get('A').workflow = {
+      version: 1, observedAtMilliseconds: 0, capabilities: [], sendReady: false,
+      legacyPromptFallback: fallback,
+    };
+    c.prompt.value = 'compatibility';
+    c.updatePromptState();
+    assert.equal(c.promptSubmit.disabled, false);
+    assert.equal(c.enqueuePrompt(c.prompt.value), true);
+    await settle();
+    assert.deepEqual(calls.map(call => call.type), ['prompt']);
+  }
+});
+
+test('current hosts preserve drafts and block new prompts without explicit available fallback', async () => {
+  const message = 'Native tracker metadata is unavailable. Reload the tracker or use Terminal.';
+  for (const state of [
+    {operationSupport: 'receipts'},
+    {operationSupport: 'legacy'},
+    {operationSupport: 'receipts', workflow: {legacyPromptFallback: false}},
+    {operationSupport: 'receipts', workflow: {}},
+    {operationSupport: 'unavailable', workflow: {legacyPromptFallback: true}},
+    {workflow: {legacyPromptFallback: true}},
+  ]) {
+    const {context: c, calls} = client(nativeProtocol());
+    Object.assign(c.sessionState.get('A'), state);
+    c.prompt.value = 'keep this draft';
+    c.updatePromptState();
+    assert.equal(c.promptSubmit.disabled, true);
+    assert.equal(c.promptStatus.textContent, message);
+    assert.equal(c.enqueuePrompt(c.prompt.value), false);
+    await settle();
+    assert.equal(c.prompt.value, 'keep this draft');
+    assert.equal(c.sessionQueue('A').length, 0);
+    assert.equal(calls.length, 0);
+    assert.equal(c.promptStatus.textContent, message);
+  }
+});
+
+test('missing native tracker metadata displays the reload or Terminal remedy in the warning', () => {
+  const {context: c, elements} = client(nativeProtocol());
+  c.sessionState.get('A').operationSupport = 'legacy';
+  c.renderWorkflow();
+  assert.equal(elements.get('#session-workflow').hidden, true);
+  assert.equal(elements.get('#native-prompt-controls').hidden, true);
+  assert.equal(elements.get('#prompt-warning').textContent,
+    'Native tracker metadata is unavailable. Reload the tracker or use Terminal.');
+});
+
+test('rendered workflow controls gate send and abort independently across capability and lease states', () => {
+  for (const {send, abort, legacyPromptFallback} of [
+    {send: false, abort: false},
+    {send: false, abort: true},
+    {send: false, abort: true, legacyPromptFallback: true},
+    {send: true, abort: false},
+    {send: true, abort: true},
+  ]) {
+    for (const writable of [false, true]) {
+      const {context: c, elements} = client(nativeProtocol());
+      Object.assign(c.sessionState.get('A'), {
+        operationSupport: 'receipts',
+        workflow: {
+          version: 1, observedAtMilliseconds: Date.now(), sendReady: true, legacyPromptFallback,
+          capabilities: [...(send ? ['session-send'] : []), ...(abort ? ['session-abort'] : [])],
+        },
+      });
+      c.writable = writable;
+      c.prompt.value = 'current draft';
+      c.updatePromptState();
+      const container = elements.get('#native-prompt-controls');
+      const mode = elements.get('#native-prompt-mode');
+      const stop = elements.get('#native-stop');
+      assert.equal(mode.tagName, 'select');
+      assert.equal(stop.tagName, 'button');
+      assert.ok(container.children.includes(mode) && container.children.includes(stop));
+      assert.equal(container.hidden, !(send || abort));
+      assert.equal(mode.hidden, !send);
+      assert.equal(mode.disabled, !writable || !send);
+      assert.equal(stop.hidden, !abort);
+      assert.equal(stop.disabled, !writable || !abort);
+      assert.equal(c.promptSubmit.disabled, !writable || !(send || legacyPromptFallback === true));
+      assert.equal(elements.get('#prompt-warning').textContent, send
+        ? 'Native messages keep your desktop draft unchanged.'
+        : (legacyPromptFallback === true
+          ? 'Sending clears any unsent desktop draft.'
+          : 'Native tracker metadata is unavailable. Reload the tracker or use Terminal.'));
+    }
+  }
+});
+
+test('session switches reset rendered child controls before the missing-workflow early return', () => {
+  const {context: c, elements} = client(nativeProtocol());
+  Object.assign(c.sessionState.get('A'), {
+    operationSupport: 'receipts',
+    workflow: {version: 1, observedAtMilliseconds: Date.now(), sendReady: true,
+      capabilities: ['session-send', 'session-abort']},
+  });
+  c.updatePromptState();
+  const mode = elements.get('#native-prompt-mode');
+  const stop = elements.get('#native-stop');
+  assert.equal(stop.disabled, false);
+  assert.equal(mode.disabled, false);
+  switchSession(c, 'B');
+  c.updatePromptState();
+  assert.equal(elements.get('#native-prompt-controls').hidden, true);
+  assert.equal(mode.hidden, true);
+  assert.equal(mode.disabled, true);
+  assert.equal(stop.hidden, true);
+  assert.equal(stop.disabled, true);
+  switchSession(c, 'A');
+  c.writable = false;
+  c.updatePromptState();
+  assert.equal(elements.get('#native-prompt-controls').hidden, false);
+  assert.equal(mode.hidden, false);
+  assert.equal(mode.disabled, true);
+  assert.equal(stop.hidden, false);
+  assert.equal(stop.disabled, true);
+});
+
+test('the rendered Stop button dispatches independently of in-flight and uncertain native sends', async () => {
+  for (const uncertain of [false, true]) {
+    const {context: c, calls, elements} = client(nativeProtocol());
+    Object.assign(c.sessionState.get('A'), {
+      operationSupport: 'receipts',
+      workflow: {version: 1, observedAtMilliseconds: Date.now(), sendReady: true,
+        capabilities: ['session-send', 'session-abort']},
+    });
+    let finishSend;
+    c.control = message => {
+      calls.push(plain(message));
+      return message.type === 'session-send'
+        ? new Promise(resolve => { finishSend = resolve; }) : Promise.resolve({status: 204});
+    };
+    c.enqueuePrompt('unresolved native send');
+    if (uncertain) {
+      finishSend(null);
+      await settle();
+    }
+    c.renderWorkflow();
+    const stop = elements.get('#native-stop');
+    assert.equal(elements.get('#native-prompt-controls').hidden, false);
+    assert.equal(stop.hidden, false);
+    assert.equal(stop.disabled, false);
+    await stop.click();
+    assert.deepEqual(calls.map(message => message.type), ['session-send', 'session-abort']);
+    assert.equal(calls[1].sessionId, 'A');
+    assert.equal(calls[1].conversationEpoch, 'conversation-A');
+    assert.notEqual(calls[1].requestId, calls[0].requestId);
+    assert.deepEqual(JSON.parse(calls[1].data), {kind: 'session-abort'});
+    assert.equal(stop.disabled, true, 'the Stop action still waits for its own receipt');
+    await stop.click();
+    assert.equal(calls.length, 2);
+    assert.equal(c.sessionQueue('A')[0].id, calls[0].requestId);
+    if (!uncertain) {
+      finishSend(null);
+      await settle();
+    }
+  }
+});
+
+test('abort-only rendering keeps the existing explicit retry guard for an unknown Stop outcome', async () => {
+  const {context: c, calls, elements} = client(nativeProtocol());
+  Object.assign(c.sessionState.get('A'), {
+    operationSupport: 'receipts',
+    workflow: {version: 1, observedAtMilliseconds: Date.now(), sendReady: false,
+      capabilities: ['session-abort'], legacyPromptFallback: true},
+  });
+  c.prompt.value = 'legacy composer draft';
+  c.updatePromptState();
+  assert.equal(c.promptSubmit.disabled, false);
+  assert.equal(elements.get('#prompt-warning').textContent, 'Sending clears any unsent desktop draft.');
+  const previous = c.sdkOperations.prepare({
+    sessionId: 'A', conversationEpoch: 'conversation-A', support: 'receipts',
+    kind: 'session-abort', targetId: 'session-abort', payloadContext: null,
+  });
+  c.renderWorkflow();
+  const stop = elements.get('#native-stop');
+  assert.equal(stop.hidden, false);
+  assert.equal(stop.disabled, true);
+  c.sdkOperations.markHostAccepted(previous.record.operationId);
+  c.renderWorkflow();
+  assert.equal(stop.disabled, true);
+  c.sdkOperations.markIndeterminate(previous.record.operationId);
+  c.renderWorkflow();
+  assert.equal(elements.get('#native-prompt-controls').hidden, false);
+  assert.equal(elements.get('#native-prompt-mode').hidden, true);
+  assert.equal(stop.disabled, false);
+  await stop.click();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].type, 'session-abort');
+  assert.notEqual(calls[0].requestId, previous.record.operationId);
+  assert.equal(stop.disabled, true);
+  assert.equal(c.prompt.value, 'legacy composer draft');
+  assert.equal(c.sessionQueue('A').length, 0);
+});
+
+test('explicit available fallback remains usable before or after the inner observation TTL', async () => {
+  for (const operationSupport of ['legacy', 'receipts']) {
+    for (const observedAtMilliseconds of [0, Date.now() - 30000]) {
+      const {context: c, calls} = client(nativeProtocol());
+      Object.assign(c.sessionState.get('A'), {
+        operationSupport,
+        workflow: {
+          version: 1, observedAtMilliseconds, capabilities: [], sendReady: false,
+          legacyPromptFallback: true,
+        },
+      });
+      c.prompt.value = 'supported compatibility';
+      c.updatePromptState();
+      assert.equal(c.promptSubmit.disabled, false);
+      assert.equal(c.enqueuePrompt(c.prompt.value), true);
+      await settle();
+      assert.deepEqual(calls.map(call => call.type), ['prompt']);
+    }
+  }
+});
+
+test('unprepared legacy prompts wait if current host eligibility disappears before dispatch', async () => {
+  for (const loss of ['native-advertisement', 'workflow', 'outer-support']) {
+    const {context: c, calls} = client(loss === 'native-advertisement' ? protocol() : nativeProtocol());
+    const state = c.sessionState.get('A');
+    Object.assign(state, {
+      promptable: false, operationSupport: 'receipts',
+      workflow: {legacyPromptFallback: true},
+    });
+    c.enqueuePrompt('wait for idle');
+    await settle();
+    const item = c.sessionQueue('A')[0];
+    assert.equal(item.prepared, false);
+    assert.equal(calls.length, 0);
+    if (loss === 'outer-support') state.operationSupport = 'unavailable';
+    else state.workflow = undefined;
+    c.workspaceProtocolInfo = nativeProtocol();
+    state.promptable = true;
+    c.updatePromptState();
+    await settle();
+    assert.equal(calls.length, 0);
+    assert.equal(item.prepared, false);
+    assert.equal(c.sessionQueue('A')[0].id, item.id);
+    assert.match(c.promptStatus.textContent, /unavailable.*Terminal/);
+    state.operationSupport = 'receipts';
+    state.workflow = {legacyPromptFallback: true};
+    c.updatePromptState();
+    await settle();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].type, 'prompt');
+    assert.equal(calls[0].requestId, item.id);
+  }
+});
+
+test('an exact prepared legacy ACK is consumed even after current fallback becomes unavailable', async () => {
+  for (const reliable of [false, true]) {
+    const {context: c, calls} = client(reliable ? nativeProtocol() : null);
+    const state = c.sessionState.get('A');
+    Object.assign(state, {operationSupport: 'receipts', workflow: {legacyPromptFallback: true}});
+    let finish;
+    c.control = message => {
+      calls.push(plain(message));
+      return new Promise(resolve => { finish = resolve; });
+    };
+    c.enqueuePrompt('already dispatched');
+    const item = c.sessionQueue('A')[0];
+    assert.equal(item.prepared, true);
+    assert.equal(!!item.delivery, reliable);
+    c.workspaceProtocolInfo = nativeProtocol();
+    state.operationSupport = 'unavailable';
+    state.workflow = undefined;
+    finish({status: 204});
+    await settle();
+    assert.equal(c.sessionQueue('A').length, 0);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].requestId, item.id);
+  }
+});
+
+test('already-bound reliable legacy prompts reconcile identical replay despite unavailable workflow', async () => {
+  const probe = client(nativeProtocol());
+  const {context: c, calls} = probe;
+  const state = c.sessionState.get('A');
+  Object.assign(state, {operationSupport: 'receipts', workflow: {legacyPromptFallback: true}});
+  c.control = async message => {
+    calls.push(plain(message));
+    return calls.length === 1 ? null : {status: 204};
+  };
+  c.enqueuePrompt('confirm the original dispatch');
+  await settle();
+  assert.equal(c.sessionQueue('A')[0].prepared, true);
+  state.operationSupport = 'unavailable';
+  state.workflow = undefined;
+  state.promptable = false;
+  probe.runRetry();
+  await settle();
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1], calls[0]);
+  assert.equal(c.sessionQueue('A').length, 0);
+});
+
+test('a prepared legacy refusal can retry without a delivery envelope after capability changes', async () => {
+  const probe = client(null);
+  const {context: c, calls} = probe;
+  c.control = async message => {
+    calls.push(plain(message));
+    return {status: calls.length === 1 ? 409 : 204};
+  };
+  c.enqueuePrompt('same prepared request');
+  await settle();
+  const item = c.sessionQueue('A')[0];
+  assert.equal(item.prepared, true);
+  assert.equal(item.delivery, null);
+  c.workspaceProtocolInfo = nativeProtocol();
+  c.sessionState.get('A').operationSupport = 'unavailable';
+  probe.runRetry();
+  await settle();
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1], calls[0]);
+  assert.equal(calls[1].delivery, undefined);
+  assert.equal(c.sessionQueue('A').length, 0);
+});
+
+test('native queue entries never downgrade when workflow or host capabilities disappear', async () => {
+  for (const attempted of [false, true]) {
+    const {context: c, calls} = client(nativeProtocol());
+    const state = c.sessionState.get('A');
+    const workflow = {
+      version: 1, observedAtMilliseconds: Date.now(),
+      capabilities: ['session-send'], sendReady: attempted,
+    };
+    Object.assign(state, {operationSupport: 'receipts', workflow});
+    c.control = async message => { calls.push(plain(message)); return null; };
+    c.enqueuePrompt('native only');
+    await settle();
+    const item = c.sessionQueue('A')[0];
+    const originalEpoch = item.nativeEpoch;
+    assert.equal(item.nativeMode, 'enqueue');
+    for (const next of [undefined, {legacyPromptFallback: true}]) {
+      state.workflow = next;
+      c.updatePromptState();
+      await c.flushQueue();
+      await settle();
+      assert.equal(calls.length, attempted ? 1 : 0);
+    }
+    c.workspaceProtocolInfo = protocol();
+    c.updatePromptState();
+    await c.flushQueue();
+    await settle();
+    assert.equal(calls.length, attempted ? 1 : 0);
+    assert.equal(item.nativeMode, 'enqueue');
+    assert.equal(item.nativeEpoch, originalEpoch);
+    c.workspaceProtocolInfo = nativeProtocol();
+    state.workflow = {...workflow, sendReady: true, observedAtMilliseconds: Date.now()};
+    c.updatePromptState();
+    await settle();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].type, 'session-send');
+    assert.equal(calls[0].requestId, item.id);
+    assert.equal(calls[0].conversationEpoch, originalEpoch);
+  }
+});
+
+test('non-Copilot terminals retain raw input, key and command controls without workflow support', async () => {
+  const {context: c, calls} = client(nativeProtocol());
+  Object.assign(c.sessionState.get('A'), {
+    promptable: false, conversationEpoch: null, operationSupport: 'unavailable',
+  });
+  c.prompt.value = 'not a Copilot session';
+  c.updatePromptState();
+  assert.equal(c.promptSubmit.disabled, true);
+  assert.equal(c.enqueuePrompt(c.prompt.value), false);
+  assert.equal(c.canAcceptTerminalInput(), true);
+  assert.equal(c.sendInput('echo hello'), true);
+  await settle();
+  assert.equal(c.sendKey('enter'), true);
+  await settle();
+  assert.equal(c.sendCommand('pwd'), true);
+  await settle();
+  assert.deepEqual(calls.map(({type, data}) => ({type, data})), [
+    {type: 'input', data: 'echo hello'},
+    {type: 'key', data: 'enter'},
+    {type: 'command', data: 'pwd'},
+  ]);
+  assert.equal(c.pendingActions.length, 0);
+  assert.equal(c.prompt.value, 'not a Copilot session');
+});
+
+test('a prepared legacy ACK cannot dispatch a following unprepared prompt after fallback loss', async () => {
+  const {context: c, calls, addPrompt} = client(nativeProtocol());
+  const state = c.sessionState.get('A');
+  Object.assign(state, {operationSupport: 'receipts', workflow: {legacyPromptFallback: true}});
+  let finish;
+  c.control = message => {
+    calls.push(plain(message));
+    return new Promise(resolve => { finish = resolve; });
+  };
+  const first = addPrompt('already dispatched');
+  const pending = c.flushQueue();
+  const next = addPrompt('not yet dispatched');
+  state.workflow = undefined;
+  finish({status: 204});
+  await pending;
+  await settle();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].requestId, first.id);
+  assert.equal(c.sessionQueue('A')[0].id, next.id);
+  assert.equal(next.prepared, false);
+  c.awaitingPromptStart = false;
+  c.updatePromptState();
+  await settle();
+  assert.equal(calls.length, 1);
+});
+
+test('new legacy dispatch gating never changes a prepared payload or envelope', async () => {
+  const {context: c, addPrompt, calls} = client();
+  const item = addPrompt('prepared before capability negotiation changed');
+  c.prepareControlAction(item, c.workspaceProtocolInfo, 'conversation-A', c.controlDeliveries);
+  const message = plain(c.controlActionMessage(item));
+  c.workspaceProtocolInfo = nativeProtocol();
+  c.sessionState.get('A').operationSupport = 'unavailable';
+  await c.flushQueue();
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], message);
+  assert.equal(c.sessionQueue('A').length, 0);
+});
+
+test('native receipt correlation still rejects another operation or conversation', async () => {
+  const {context: c, calls} = client(nativeProtocol());
+  const state = c.sessionState.get('A');
+  Object.assign(state, {
+    operationSupport: 'receipts',
+    workflow: {version: 1, observedAtMilliseconds: Date.now(),
+      capabilities: ['session-send'], sendReady: true},
+  });
+  c.enqueuePrompt('receipt-bound native work');
+  await settle();
+  const item = c.sessionQueue('A')[0];
+  for (const fields of [
+    {operationId: 'another-operation', conversationEpoch: item.nativeEpoch},
+    {operationId: item.id, conversationEpoch: 'another-conversation'},
+  ]) {
+    state.operationReceipts = [{
+      ...fields, kind: 'session-send', state: 'applied', updatedAtMilliseconds: Date.now(),
+    }];
+    c.reconcileWorkflowPrompts();
+    assert.equal(c.sessionQueue('A')[0].id, item.id);
+    assert.equal(calls.length, 1);
+  }
 });
 
 test('delivery sequences are independent per session/lane and immutable after dispatch', () => {
