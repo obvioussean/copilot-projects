@@ -307,7 +307,9 @@ function renderWorkflow() {
   document.querySelector('#native-prompt-controls').hidden = !native;
   document.querySelector('#prompt-warning').textContent = native
     ? 'Native messages keep your desktop draft unchanged.'
-    : 'Sending clears any unsent desktop draft.';
+    : (legacyPromptSupported(workspaceProtocolInfo, session)
+      ? 'Sending clears any unsent desktop draft.'
+      : NATIVE_PROMPT_UNAVAILABLE_MESSAGE);
   if (!workflow) return;
   const total = Number.isFinite(workflow.totalAiCredits)
     ? `Session total: ${workflow.totalAiCredits.toFixed(3)} AI credits.` : 'Session credit usage unavailable.';
@@ -901,8 +903,8 @@ function enqueuePrompt(value) {
     entry.nativeMode = document.querySelector('#native-prompt-mode')?.value === 'immediate'
       ? 'immediate' : 'enqueue';
     entry.nativeEpoch = state.conversationEpoch;
-  } else if (state.workflow && state.workflow.legacyPromptFallback !== true) {
-    updatePromptState('Native controls are unavailable. Use Terminal.');
+  } else if (!legacyPromptSupported(workspaceProtocolInfo, state)) {
+    updatePromptState(NATIVE_PROMPT_UNAVAILABLE_MESSAGE);
     return false;
   }
   q.push(entry);
@@ -932,6 +934,7 @@ async function flushQueue() {
   if (entry.nativeMode) {
     return flushNativePrompt(entry, state);
   }
+  if (!entry.prepared && !legacyPromptSupported(workspaceProtocolInfo, state)) return;
   const replaying = entry.outcomeUnknown && canReplayControlAction(
     entry, workspaceProtocolInfo, nonEmptyOperationToken(state?.conversationEpoch)
   );
@@ -1451,11 +1454,11 @@ function updatePromptState(message) {
     promptFallbackTimer = null;
   }
   const q = selected ? (promptQueues.get(selected) || []) : [];
+  const native = workflowSupports(workspaceProtocolInfo, state, 'session-send');
+  const legacy = legacyPromptSupported(workspaceProtocolInfo, state);
   promptSubmit.disabled = !(selected && writable
     && prompt.value.trim() && q.length < QUEUE_CAP
-    && (!state?.workflow || state.workflow.legacyPromptFallback === true
-      || (workflowSupports(workspaceProtocolInfo, state, 'session-send')
-      && state.workflow.sendReady)));
+    && (legacy || (native && state.workflow.sendReady)));
   if (message) {
     promptStatus.textContent = message;
   } else if (!selected) {
@@ -1464,6 +1467,8 @@ function updatePromptState(message) {
     promptStatus.textContent = 'View only';
   } else if (q[0]?.blockedReason) {
     promptStatus.textContent = q[0].blockedReason;
+  } else if (!native && !legacy && !q[0]?.prepared && !q[0]?.nativeAttempted) {
+    promptStatus.textContent = NATIVE_PROMPT_UNAVAILABLE_MESSAGE;
   } else if (q.length) {
     promptStatus.textContent = `${q.length} queued`;
   } else if (awaitingPromptStart) {

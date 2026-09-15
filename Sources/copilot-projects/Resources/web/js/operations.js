@@ -43,6 +43,15 @@ function workflowSupports(protocolInfo, session, kind, now = Date.now()) {
     && Array.isArray(workflow.capabilities) && workflow.capabilities.includes(kind);
 }
 
+const NATIVE_PROMPT_UNAVAILABLE_MESSAGE =
+  'Native tracker metadata is unavailable. Reload the tracker or use Terminal.';
+
+function legacyPromptSupported(protocolInfo, session) {
+  return protocolInfo?.capabilities?.includes('native-session-workflows') !== true
+    || (session?.workflow?.legacyPromptFallback === true
+      && negotiatedOperationSupport(protocolInfo, session) !== REMOTE_OPERATION_SUPPORT.UNAVAILABLE);
+}
+
 function isSyntheticDurableElicitation(request) {
   return typeof request?.requestId === 'string'
     && request.requestId.startsWith('synthetic::durable-ask-user::');

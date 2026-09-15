@@ -6,6 +6,8 @@ import { bindings, fixture, loadFragments, plain } from "./support/fragments.mjs
 const NAMES = [
   "REMOTE_OPERATION_SUPPORT",
   "negotiatedOperationSupport",
+  "workflowSupports",
+  "legacyPromptSupported",
   "isSyntheticDurableElicitation",
   "remoteOperationControlMessage",
   "remoteOperationMessage",
@@ -87,6 +89,79 @@ test("operation support negotiation matches the shared Swift contract", () => {
     "legacy",
     "an explicit legacy tracker remains legacy"
   );
+});
+
+test("legacy prompts require an old host or explicit available fallback, not an inner timestamp", () => {
+  const { legacyPromptSupported } = operationClient();
+  const oldHost = {
+    revision: 1,
+    capabilities: ["conversation-epochs", "sdk-operation-receipts", "transcript-window"],
+  };
+  const nativeHost = {
+    ...oldHost,
+    capabilities: [...oldHost.capabilities, "native-session-workflows"],
+  };
+  const current = { operationSupport: "receipts", conversationEpoch: "tracker-instance:2" };
+  const fallback = {
+    version: 1, observedAtMilliseconds: 0, capabilities: [],
+    sendReady: false, legacyPromptFallback: true,
+  };
+  const cases = [
+    ["oldest host", undefined, undefined, true],
+    ["pre-workflow host", oldHost, current, true],
+    ["old host with negative fallback", oldHost,
+      { ...current, workflow: { ...fallback, legacyPromptFallback: false } }, true],
+    ["missing current workflow", nativeHost, current, false],
+    ["legacy tracker without workflow", nativeHost, { operationSupport: "legacy" }, false],
+    ["missing session", nativeHost, undefined, false],
+    ["false fallback", nativeHost,
+      { ...current, workflow: { ...fallback, legacyPromptFallback: false } }, false],
+    ["missing fallback flag", nativeHost,
+      { ...current, workflow: { ...fallback, legacyPromptFallback: undefined } }, false],
+    ["nonboolean fallback", nativeHost,
+      { ...current, workflow: { ...fallback, legacyPromptFallback: "true" } }, false],
+    ["unsupported before first observation", nativeHost, { ...current, workflow: fallback }, true],
+    ["unsupported with old observation", nativeHost,
+      { ...current, workflow: { ...fallback, observedAtMilliseconds: Date.now() - 30000 } }, true],
+    ["explicit fallback on a live legacy tracker", nativeHost,
+      { operationSupport: "legacy", workflow: fallback }, true],
+    ["unavailable outer snapshot", nativeHost,
+      { ...current, operationSupport: "unavailable", workflow: fallback }, false],
+    ["missing outer support", nativeHost,
+      { ...current, operationSupport: undefined, workflow: fallback }, false],
+    ["unknown outer support", nativeHost,
+      { ...current, operationSupport: "future-mode", workflow: fallback }, false],
+    ["invalid receipt identity", nativeHost,
+      { ...current, conversationEpoch: "", workflow: fallback }, false],
+  ];
+  for (const [name, protocolInfo, state, expected] of cases) {
+    assert.equal(legacyPromptSupported(protocolInfo, state), expected, name);
+  }
+});
+
+test("native action observations still require freshness and receipt support", () => {
+  const { workflowSupports } = operationClient();
+  const now = 100000;
+  const protocolInfo = {
+    revision: 1, capabilities: ["sdk-operation-receipts", "native-session-workflows"],
+  };
+  const state = {
+    operationSupport: "receipts", conversationEpoch: "tracker-instance:2",
+    workflow: {
+      version: 1, observedAtMilliseconds: now, capabilities: ["session-send"],
+      sendReady: true, legacyPromptFallback: false,
+    },
+  };
+  for (const [age, expected] of [[0, true], [15000, true], [15001, false], [-1, false]]) {
+    state.workflow.observedAtMilliseconds = now - age;
+    assert.equal(workflowSupports(protocolInfo, state, "session-send", now), expected);
+  }
+  state.workflow.observedAtMilliseconds = now;
+  assert.equal(workflowSupports(protocolInfo, state, "session-abort", now), false);
+  assert.equal(workflowSupports(protocolInfo, { ...state, operationSupport: "unavailable" },
+    "session-send", now), false);
+  assert.equal(workflowSupports(protocolInfo, { ...state, conversationEpoch: "" },
+    "session-send", now), false);
 });
 
 test("receipt requests keep the old data JSON and add only outer correlation", () => {

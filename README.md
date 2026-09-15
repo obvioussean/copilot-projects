@@ -90,8 +90,14 @@ Limits are checked by Copilot after model calls and can be exceeded by the last
 call. A new budget request sends the existing Mac/APNs/web notification flow.
 
 Capabilities require fresh runtime evidence; unsupported or unavailable operations
-stay disabled. Restart/reload the tracker in existing CLI sessions to activate an
-updated tracker. Deploy the Mac host before clients using the new protocol.
+stay disabled. A host advertising native workflows treats missing session workflow
+state as unknown, not permission to use the legacy composer. Legacy composer sends
+require an older host or explicit fallback from a currently available tracker.
+Unsupported-runtime proof can remain valid without a recent native-action
+observation; raw terminal input is independent of these composer checks.
+Older trackers on a newer host remain blocked even with a fresh heartbeat:
+restart/reload the tracker to activate the updated workflow metadata, or use Terminal.
+Deploy the Mac host before clients using the new protocol.
 
 An optional offline integration test exercises the installed CLI/SDK pair against
 a loopback model fixture, without real model requests:
