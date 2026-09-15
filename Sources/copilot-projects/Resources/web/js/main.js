@@ -430,33 +430,37 @@ function reconcileWorkflowPrompts() {
 }
 
 async function flushNativePrompt(entry, state) {
+  // Keep the no-op guard outside try: finally refreshes the UI and re-enters flushQueue.
   if (entry.nativeAttempted || !writable || !state.workflow?.sendReady
       || !workflowSupports(workspaceProtocolInfo, state, 'session-send')) return;
-  if (entry.nativeEpoch !== state.conversationEpoch) {
-    entry.blockedReason = 'The conversation changed. Review this message before sending again.';
-    return;
-  }
-  entry.nativeAttempted = true;
-  entry.outcomeUnknown = true;
-  entry.receiptTimer = setTimeout(() => {
+  try {
+    if (entry.nativeEpoch !== state.conversationEpoch) {
+      entry.blockedReason = 'The conversation changed. Review this message before sending again.';
+      return;
+    }
+    entry.nativeAttempted = true;
+    entry.outcomeUnknown = true;
+    entry.receiptTimer = setTimeout(() => {
+      if (!sessionQueue(entry.sessionId).includes(entry)) return;
+      entry.blockedReason = 'Outcome unknown. Check the terminal before discarding.';
+      if (selected === entry.sessionId) { renderQueue(); updatePromptState(); }
+    }, RECEIPT_TIMEOUT_MS);
+    const response = await control({
+      type: 'session-send', sessionId: entry.sessionId, requestId: entry.id,
+      conversationEpoch: entry.nativeEpoch,
+      data: JSON.stringify({ kind: 'session-send', prompt: entry.data, mode: entry.nativeMode })
+    });
+    reconcileWorkflowPrompts();
     if (!sessionQueue(entry.sessionId).includes(entry)) return;
-    entry.blockedReason = 'Outcome unknown. Check the terminal before discarding.';
-    if (selected === entry.sessionId) updatePromptState();
-  }, RECEIPT_TIMEOUT_MS);
-  const response = await control({
-    type: 'session-send', sessionId: entry.sessionId, requestId: entry.id,
-    conversationEpoch: entry.nativeEpoch,
-    data: JSON.stringify({ kind: 'session-send', prompt: entry.data, mode: entry.nativeMode })
-  });
-  reconcileWorkflowPrompts();
-  if (!sessionQueue(entry.sessionId).includes(entry)) return;
-  if (response?.status !== 204) {
-    entry.blockedReason = [400, 403, 409, 422].includes(response?.status)
-      ? 'Copilot did not accept this message. Remove it before sending again.'
-      : 'Outcome unknown. Check the terminal before discarding.';
-    if (response?.status === 403 && selected === entry.sessionId) writable = false;
+    if (response?.status !== 204) {
+      entry.blockedReason = [400, 403, 409, 422].includes(response?.status)
+        ? 'Copilot did not accept this message. Remove it before sending again.'
+        : 'Outcome unknown. Check the terminal before discarding.';
+      if (response?.status === 403 && selected === entry.sessionId) writable = false;
+    }
+  } finally {
+    if (selected === entry.sessionId) { renderQueue(); updatePromptState(); }
   }
-  if (selected === entry.sessionId) { renderQueue(); updatePromptState(); }
 }
 function clearModelOperationState(closePicker) {
   if (modelOperationTimer) clearTimeout(modelOperationTimer);
@@ -865,6 +869,9 @@ function removeQueuedPrompt(sessionId, itemId) {
   clearTimeout(q[index].receiptTimer);
   q.splice(index, 1);
   if (!q.length) promptQueues.delete(sessionId);
+}
+function promptQueueSignature(sessionId) {
+  return JSON.stringify(sessionQueue(sessionId).map((entry) => [entry.id, entry.blockedReason]));
 }
 function renderQueue() {
   const sessionId = selected;
@@ -1728,6 +1735,7 @@ function renderSessionButton(session, active) {
 }
 function renderWorkspace(data) {
   const active = selected;
+  const queueSignature = promptQueueSignature(active);
   const activeWasPresent = !!active && sessionState.has(active);
   workspaceProtocolInfo = data?.protocolInfo || null;
   const nextProjectId = data.selectedProjectId || null;
@@ -1760,7 +1768,6 @@ function renderWorkspace(data) {
       sessionState.set(session.id, session);
       sessions.append(renderSessionButton(session, active));
     });
-    reconcileWorkflowPrompts();
   });
   renderAttentionSummary();
   renderSelectedAttention();
@@ -1781,11 +1788,13 @@ function renderWorkspace(data) {
   }
   for (const id of promptQueues.keys()) {
     if (liveSessionIds.has(id)) continue;
+    for (const entry of sessionQueue(id)) clearTimeout(entry.receiptTimer);
     promptQueues.delete(id);
     promptFlushes.delete(id);
     clearTimeout(promptRetryTimers.get(id));
     promptRetryTimers.delete(id);
   }
+  reconcileWorkflowPrompts();
   updateNewSessionState();
   // Select a just-created session once the host's snapshot includes it, without
   // ever changing the host Mac's own selection.
@@ -1808,6 +1817,7 @@ function renderWorkspace(data) {
   reconcileSelectedOperationReceipts();
   syncUserInputCards();
   syncElicitationCards();
+  if (selected === active && promptQueueSignature(active) !== queueSignature) renderQueue();
   updatePromptState();
 }
 function currentUserInputs() {

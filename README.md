@@ -79,6 +79,8 @@ Native actions retain the writer lease, conversation identity, and SDK operation
 receipt checks. HTTP acceptance is not completion. A send's `applied` receipt
 means Copilot accepted the message, not that it finished the task. Unknown
 outcomes are never automatically resubmitted or downgraded to terminal input.
+The web queue removes the confirmed message when its receipt arrives, without
+another click or tab switch; messages still awaiting confirmation stay visible.
 Stop has its own handoff lane, so an unresolved send cannot block cancellation.
 
 The session drawer and native/web conversation views include a **Latest task

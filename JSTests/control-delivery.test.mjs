@@ -70,6 +70,14 @@ function client(info = protocol()) {
     promptQueues: new Map(), promptFlushes: new Map(), promptRetryTimers: new Map(),
     awaitingPromptStart: false, promptFallbackTimer: null,
     promptQueue: node(), promptStatus: node(), promptForm: node(), prompt: node(), promptSubmit: node(),
+    sessions: Object.assign(node(), {contains: () => false}),
+    hostSelectedProjectId: null, pendingCreatedSessionId: null, pendingFocusSession: null,
+    syncCreateProjectOptions() {}, sessionAttention: () => null,
+    renderSessionButton: () => node('button'),
+    renderAttentionSummary() {}, renderSelectedAttention() {}, prunePromptDrafts() {},
+    invalidateConversationOperations() {},
+    updateNewSessionState() {}, updateSelectedConversationEpoch() {},
+    reconcileSelectedOperationReceipts() {}, syncUserInputCards() {}, syncElicitationCards() {},
     lease: node(), input: node(), terminal: node(), inputDeliveryNotice: node(),
     inputDeliveryText: node(), discardPendingInput: node(), QUEUE_CAP: 25,
     updateCloseSessionState() {}, renderModelLine() {},
@@ -84,6 +92,7 @@ function client(info = protocol()) {
   vm.runInContext(sourceSection('function selectTerminalInputSession(', '// ---- Model picker'), context);
   vm.runInContext(sourceSection('function operationContext(', 'function clearModelOperationState('), context);
   vm.runInContext(sourceSection('function updatePromptState(message)', 'function clearUserInputSubmission('), context);
+  vm.runInContext(sourceSection('function renderWorkspace(data)', 'function currentUserInputs('), context);
   vm.runInContext(sourceSection(
     "document.querySelector('#native-stop')?.addEventListener(",
     "document.querySelector('#workflow-set-limit')?.addEventListener("
@@ -106,6 +115,13 @@ function client(info = protocol()) {
 
 async function settle() {
   for (let index = 0; index < 20; index += 1) await Promise.resolve();
+}
+
+function workspace(context, projects = [[...context.sessionState.values()]]) {
+  return {
+    protocolInfo: context.workspaceProtocolInfo,
+    projects: projects.map((sessions, index) => ({id: `project-${index}`, name: `Project ${index}`, sessions})),
+  };
 }
 
 function switchSession(context, id) {
@@ -147,6 +163,283 @@ test('native prompt delivery waits for the exact SDK receipt, not HTTP acceptanc
   }];
   c.reconcileWorkflowPrompts();
   assert.equal(c.sessionQueue('A').length, 0);
+});
+
+test('workspace delivery receipt removes the rendered queued message while Copilot is working', async () => {
+  const {context: c, calls} = client(nativeProtocol());
+  const session = c.sessionState.get('A');
+  Object.assign(session, {
+    operationSupport: 'receipts',
+    workflow: {version: 1, observedAtMilliseconds: Date.now(),
+      capabilities: ['session-send'], sendReady: true},
+  });
+  c.enqueuePrompt('already being acted on');
+  await settle();
+  assert.equal(c.promptQueue.hidden, false);
+  assert.match(c.promptQueue.textContent, /already being acted on/);
+  session.status = 'running';
+  session.promptable = false;
+  session.operationReceipts = [{
+    operationId: calls[0].requestId, conversationEpoch: 'conversation-A',
+    kind: 'session-send', state: 'applied', updatedAtMilliseconds: Date.now(),
+  }];
+  c.renderWorkspace(workspace(c));
+  assert.equal(c.sessionQueue('A').length, 0);
+  assert.equal(c.promptQueue.hidden, true, 'the empty queue must disappear without another user action');
+  assert.equal(c.promptQueue.children.length, 0);
+  assert.equal(c.promptStatus.textContent, 'Copilot is working');
+  assert.equal(calls.length, 1, 'delivery reconciliation must not resend the message');
+});
+
+test('workspace reconciliation preserves another queued message and its rendered card', async () => {
+  const {context: c, calls} = client(nativeProtocol());
+  const session = c.sessionState.get('A');
+  Object.assign(session, {
+    operationSupport: 'receipts',
+    workflow: {version: 1, observedAtMilliseconds: Date.now(),
+      capabilities: ['session-send'], sendReady: true},
+  });
+  c.enqueuePrompt('delivered first');
+  c.enqueuePrompt('still waiting');
+  await settle();
+  session.workflow.sendReady = false;
+  session.operationReceipts = [{
+    operationId: calls[0].requestId, conversationEpoch: 'conversation-A',
+    kind: 'session-send', state: 'applied', updatedAtMilliseconds: Date.now(),
+  }];
+  c.renderWorkspace(workspace(c));
+  assert.equal(c.sessionQueue('A').length, 1);
+  assert.equal(c.promptQueue.hidden, false);
+  assert.equal(c.promptQueue.children.length, 1);
+  assert.match(c.promptQueue.textContent, /still waiting/);
+  assert.doesNotMatch(c.promptQueue.textContent, /delivered first/);
+  assert.equal(c.promptStatus.textContent, '1 queued');
+  assert.equal(calls.length, 1);
+});
+
+test('workspace reconciliation waits until every project session has been populated', async () => {
+  const {context: c, calls} = client(nativeProtocol());
+  const session = c.sessionState.get('A');
+  Object.assign(session, {
+    operationSupport: 'receipts',
+    workflow: {version: 1, observedAtMilliseconds: Date.now(),
+      capabilities: ['session-send'], sendReady: true},
+  });
+  c.enqueuePrompt('waiting for the receipt');
+  await settle();
+  const entry = c.sessionQueue('A')[0];
+  c.renderWorkspace(workspace(c, [[c.sessionState.get('B')], [session]]));
+  assert.equal(c.sessionQueue('A')[0], entry);
+  assert.equal(entry.blockedReason, null, 'a later project is not a changed conversation');
+  assert.equal(c.promptStatus.textContent, '1 queued');
+  assert.equal(calls.length, 1);
+});
+
+test('a receipt observed at HTTP completion refreshes the queue and composer immediately', async () => {
+  const {context: c, calls} = client(nativeProtocol());
+  const session = c.sessionState.get('A');
+  Object.assign(session, {
+    operationSupport: 'receipts', status: 'running', promptable: false,
+    workflow: {version: 1, observedAtMilliseconds: Date.now(),
+      capabilities: ['session-send'], sendReady: true},
+  });
+  let finish;
+  c.control = message => {
+    calls.push(plain(message));
+    return new Promise(resolve => { finish = resolve; });
+  };
+  c.enqueuePrompt('receipt before HTTP');
+  session.operationReceipts = [{
+    operationId: calls[0].requestId, conversationEpoch: 'conversation-A',
+    kind: 'session-send', state: 'applied', updatedAtMilliseconds: Date.now(),
+  }];
+  finish({status: 204});
+  await settle();
+  assert.equal(c.sessionQueue('A').length, 0);
+  assert.equal(c.promptQueue.hidden, true);
+  assert.equal(c.promptQueue.children.length, 0);
+  assert.equal(c.promptStatus.textContent, 'Copilot is working');
+  assert.equal(calls.length, 1);
+});
+
+test('native timeout renders the unknown outcome on its card and a late receipt clears it', async () => {
+  const {context: c, calls, timers} = client(nativeProtocol());
+  const session = c.sessionState.get('A');
+  Object.assign(session, {
+    operationSupport: 'receipts',
+    workflow: {version: 1, observedAtMilliseconds: Date.now(),
+      capabilities: ['session-send'], sendReady: true},
+  });
+  c.enqueuePrompt('unconfirmed message');
+  await settle();
+  const entry = c.sessionQueue('A')[0];
+  timers.get(entry.receiptTimer).callback();
+  assert.match(c.promptQueue.textContent, /Outcome unknown/);
+  assert.match(c.promptStatus.textContent, /Outcome unknown/);
+  await c.flushQueue();
+  assert.equal(calls.length, 1);
+  session.operationReceipts = [{
+    operationId: entry.id, conversationEpoch: 'conversation-A',
+    kind: 'session-send', state: 'applied', updatedAtMilliseconds: Date.now(),
+  }];
+  c.renderWorkspace(workspace(c));
+  assert.equal(c.promptQueue.hidden, true);
+  assert.equal(c.promptQueue.children.length, 0);
+  assert.equal(timers.has(entry.receiptTimer), false);
+});
+
+test('workspace negative receipts render the outcome instead of leaving a stale queue card', async () => {
+  for (const outcome of ['rejected', 'indeterminate']) {
+    const {context: c, calls, timers} = client(nativeProtocol());
+    const session = c.sessionState.get('A');
+    Object.assign(session, {
+      operationSupport: 'receipts',
+      workflow: {version: 1, observedAtMilliseconds: Date.now(),
+        capabilities: ['session-send'], sendReady: true},
+    });
+    c.enqueuePrompt('not confirmed as delivered');
+    await settle();
+    const entry = c.sessionQueue('A')[0];
+    session.operationReceipts = [{
+      operationId: entry.id, conversationEpoch: 'conversation-A',
+      kind: 'session-send', state: outcome, updatedAtMilliseconds: Date.now(),
+    }];
+    c.renderWorkspace(workspace(c));
+    assert.equal(c.sessionQueue('A')[0], entry);
+    assert.equal(c.promptQueue.hidden, false);
+    assert.match(c.promptQueue.textContent, outcome === 'rejected' ? /Copilot rejected/ : /Outcome unknown/);
+    assert.equal(c.promptStatus.textContent, entry.blockedReason);
+    assert.equal(timers.has(entry.receiptTimer), false);
+    assert.equal(calls.length, 1);
+  }
+});
+
+test('unrelated activity and receipts preserve the exact waiting queue card', async () => {
+  const {context: c, calls} = client(nativeProtocol());
+  const session = c.sessionState.get('A');
+  Object.assign(session, {
+    operationSupport: 'receipts',
+    workflow: {version: 1, observedAtMilliseconds: Date.now(),
+      capabilities: ['session-send'], sendReady: true},
+  });
+  c.enqueuePrompt('needs its own confirmation');
+  await settle();
+  const entry = c.sessionQueue('A')[0];
+  const card = c.promptQueue.children[0];
+  session.status = 'running';
+  session.promptable = false;
+  const receipt = {
+    operationId: entry.id, conversationEpoch: 'conversation-A',
+    kind: 'session-send', state: 'applied', updatedAtMilliseconds: Date.now(),
+  };
+  for (const receipts of [
+    [],
+    [{...receipt, operationId: 'another-message'}],
+    [{...receipt, conversationEpoch: 'another-conversation'}],
+    [{...receipt, kind: 'session-abort'}],
+    [{...receipt, state: 'accepted'}],
+  ]) {
+    session.operationReceipts = receipts;
+    c.renderWorkspace(workspace(c));
+    assert.equal(c.sessionQueue('A')[0], entry);
+    assert.equal(c.promptQueue.children[0], card, 'unchanged snapshots must not replace the focused remove button');
+    assert.equal(c.promptQueue.hidden, false);
+    assert.equal(c.promptStatus.textContent, '1 queued');
+    assert.equal(calls.length, 1);
+  }
+});
+
+test('off-tab receipts do not redraw or consume the selected session queue', async () => {
+  const {context: c, calls, addPrompt} = client(nativeProtocol());
+  const session = c.sessionState.get('A');
+  Object.assign(session, {
+    operationSupport: 'receipts',
+    workflow: {version: 1, observedAtMilliseconds: Date.now(),
+      capabilities: ['session-send'], sendReady: true},
+  });
+  c.enqueuePrompt('delivered off-tab');
+  await settle();
+  const entry = c.sessionQueue('A')[0];
+  switchSession(c, 'B');
+  c.sessionState.get('B').promptable = false;
+  const waiting = addPrompt('belongs to B');
+  c.renderQueue();
+  const card = c.promptQueue.children[0];
+  session.operationReceipts = [{
+    operationId: entry.id, conversationEpoch: 'conversation-A',
+    kind: 'session-send', state: 'applied', updatedAtMilliseconds: Date.now(),
+  }];
+  c.renderWorkspace(workspace(c));
+  assert.equal(c.sessionQueue('A').length, 0);
+  assert.equal(c.sessionQueue('B')[0], waiting);
+  assert.equal(c.promptQueue.children[0], card);
+  assert.match(c.promptQueue.textContent, /belongs to B/);
+  assert.equal(c.selected, 'B');
+  assert.equal(calls.length, 1);
+});
+
+test('an applied receipt advances the next ready native message exactly once', async () => {
+  const {context: c, calls} = client(nativeProtocol());
+  const session = c.sessionState.get('A');
+  Object.assign(session, {
+    operationSupport: 'receipts',
+    workflow: {version: 1, observedAtMilliseconds: Date.now(),
+      capabilities: ['session-send'], sendReady: true},
+  });
+  c.enqueuePrompt('first native message');
+  c.enqueuePrompt('second native message');
+  await settle();
+  const second = c.sessionQueue('A')[1];
+  session.operationReceipts = [{
+    operationId: calls[0].requestId, conversationEpoch: 'conversation-A',
+    kind: 'session-send', state: 'applied', updatedAtMilliseconds: Date.now(),
+  }];
+  c.renderWorkspace(workspace(c));
+  await settle();
+  c.renderWorkspace(workspace(c));
+  await settle();
+  assert.deepEqual(calls.map(call => call.requestId), [session.operationReceipts[0].operationId, second.id]);
+  assert.equal(c.sessionQueue('A')[0], second);
+  assert.equal(c.promptQueue.children.length, 1);
+  assert.match(c.promptQueue.textContent, /second native message/);
+  assert.doesNotMatch(c.promptQueue.textContent, /first native message/);
+});
+
+test('removing a session removes its visible queue and cancels its receipt timer', async () => {
+  const {context: c, timers} = client(nativeProtocol());
+  const session = c.sessionState.get('A');
+  Object.assign(session, {
+    operationSupport: 'receipts',
+    workflow: {version: 1, observedAtMilliseconds: Date.now(),
+      capabilities: ['session-send'], sendReady: true},
+  });
+  c.enqueuePrompt('removed session message');
+  await settle();
+  const timer = c.sessionQueue('A')[0].receiptTimer;
+  c.renderWorkspace(workspace(c, [[c.sessionState.get('B')]]));
+  assert.equal(c.sessionQueue('A').length, 0);
+  assert.equal(c.promptQueue.hidden, true);
+  assert.equal(c.promptQueue.children.length, 0);
+  assert.equal(timers.has(timer), false);
+});
+
+test('a conversation change before native dispatch renders the blocked message without sending', async () => {
+  const {context: c, calls} = client(nativeProtocol());
+  const session = c.sessionState.get('A');
+  Object.assign(session, {
+    operationSupport: 'receipts',
+    workflow: {version: 1, observedAtMilliseconds: Date.now(),
+      capabilities: ['session-send'], sendReady: false},
+  });
+  c.enqueuePrompt('bound to the original conversation');
+  session.conversationEpoch = 'new-conversation';
+  session.workflow.sendReady = true;
+  c.renderWorkspace(workspace(c));
+  await settle();
+  assert.equal(c.sessionQueue('A').length, 1);
+  assert.match(c.promptQueue.textContent, /The conversation changed/);
+  assert.match(c.promptStatus.textContent, /The conversation changed/);
+  assert.equal(calls.length, 0);
 });
 
 test('native prompt uncertainty is never replayed and a late receipt resolves it off-tab', async () => {
