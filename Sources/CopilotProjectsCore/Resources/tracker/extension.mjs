@@ -1938,9 +1938,10 @@ if (validSessionId && socketPath) {
 
     // Answer a pending question from the host-written response file. Legacy
     // invalid/stale responses only remove the file; correlated validation
-    // failures publish a rejected receipt. The pending question and its exact
-    // terminal fallback are preserved until an applied result or
-    // `user_input.completed`.
+    // failures publish a rejected receipt. Preflight failures and indeterminate
+    // RPC outcomes retain the pending question. Explicit boolean RPC results or
+    // completion events retire it: success:false means the ID is no longer
+    // pending, while the losing answer's receipt remains rejected.
     async function processUserInputResponse() {
         // Only the owner reconciles remote answers: a spawned classifier helper
         // shares this session dir and would otherwise delete the owner's pending
@@ -2609,7 +2610,8 @@ if (validSessionId && socketPath) {
 
     // Answer a pending elicitation from the host-written response file. Mirrors
     // processUserInputResponse: owner-only, validates against the pending record,
-    // and keeps the elicitation retryable when a response is rejected.
+    // and retains the card on preflight/indeterminate failures. Explicit
+    // success:false retires the no-longer-pending request with a rejected receipt.
     async function processElicitationResponse() {
         if (!ownsSharedFiles()) return;
         let encoded;
