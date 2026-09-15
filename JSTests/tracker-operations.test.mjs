@@ -19,6 +19,7 @@ const originalSetInterval = globalThis.setInterval;
 const originalClearInterval = globalThis.clearInterval;
 const originalWatch = fs.watch;
 const originalWriteFileSync = fs.writeFileSync;
+const originalRenameSync = fs.renameSync;
 const realMkdirSync = fs.mkdirSync.bind(fs);
 const realReadFileSync = fs.readFileSync.bind(fs);
 const realWriteFileSync = fs.writeFileSync.bind(fs);
@@ -46,6 +47,13 @@ fs.writeFileSync = (path, ...args) => {
   }
   return result;
 };
+fs.renameSync = (from, to) => {
+  const runtime = [...runtimes].find((entry) => String(from).startsWith(entry.root));
+  if (runtime?.failRename?.(String(to))) {
+    throw new Error("injected tracker rename failure");
+  }
+  return originalRenameSync(from, to);
+};
 syncBuiltinESMExports();
 
 const fakeSDKURL = `data:text/javascript,${encodeURIComponent(`
@@ -68,6 +76,7 @@ test.after(() => {
   globalThis.clearInterval = originalClearInterval;
   fs.watch = originalWatch;
   fs.writeFileSync = originalWriteFileSync;
+  fs.renameSync = originalRenameSync;
   syncBuiltinESMExports();
   realRmSync(runtimeParent, { recursive: true, force: true });
 });
@@ -84,7 +93,20 @@ class FakeSession {
     this.history = [];
     this.processing = false;
     this.runtimeCalls = [];
-    this.metadataHandler = async ({ sessionId }) => ({ sessionId, isRemote: false });
+    this.workflowCalls = [];
+    this.statusHandler = async () => ({ version: "1.0.84-8", protocolVersion: 3 });
+    this.sessionLimits = null;
+    this.metadataHandler = async ({ sessionId }) => ({
+      sessionId, isRemote: false, sessionLimits: this.sessionLimits,
+      workspace: { branch: "fixture", repository: "fixture/repo" },
+    });
+    this.sendHandler = async () => ({ messageId: randomUUID() });
+    this.usageHandler = async () => ({ totalNanoAiu: 2_000_000_000 });
+    this.diffHandler = async () => ({
+      requestedMode: "session", mode: "unstaged", isFallback: true,
+      unavailableReason: "file-change-tracking-disabled", changes: [],
+    });
+    this.budgetHandler = async () => ({ success: true });
     this.processingHandler = async () => ({ processing: this.processing });
     this.abortHandler = async () => this.emit("session.idle", { aborted: true });
     this.enqueueHandler = async () => ({ queued: true });
@@ -141,12 +163,28 @@ class FakeSession {
     };
     this.connection = {
       sendRequest: async (method, params) => {
+        if (method === "status.get") return this.statusHandler();
         if (method === "session.getForeground") {
           return { sessionId: this.foregroundSessionId ?? this.sessionId };
         }
         this.runtimeCalls.push({ method, ...params });
         if (method === "session.metadata.snapshot") return this.metadataHandler(params);
         if (method === "session.metadata.isProcessing") return this.processingHandler(params);
+        if (method === "session.usage.getMetrics") return this.usageHandler(params);
+        if (method === "session.workspaces.diff") return this.diffHandler(params);
+        this.workflowCalls.push({ method, ...params });
+        if (method === "session.send") return this.sendHandler(params);
+        if (method === "session.abort") {
+          await this.abortHandler();
+          return { success: true };
+        }
+        if (method === "session.options.update") {
+          this.sessionLimits = params.sessionLimits;
+          return { success: true };
+        }
+        if (method === "session.ui.handlePendingSessionLimitsExhausted") {
+          return this.budgetHandler(params);
+        }
         throw Object.assign(new Error(`Unknown RPC: ${method}`), { code: -32601 });
       },
     };
@@ -239,10 +277,11 @@ async function createRuntime(t, configure = () => {}) {
     watchCallback: null,
     intervalCallback: null,
     failWrite: null,
+    failRename: null,
     activityWrites: [],
   };
   runtime.session = new FakeSession(runtime.copilotSessionId);
-  configure(runtime.session);
+  configure(runtime.session, runtime);
   runtimes.add(runtime);
 
   const environmentKeys = [
@@ -311,6 +350,10 @@ async function createRuntime(t, configure = () => {}) {
     () => readSnapshot(runtime).availableModels?.length === 1,
     "tracker did not publish the fake SDK model catalog"
   );
+  await waitFor(
+    () => readSnapshot(runtime).workflow?.observedAtMilliseconds > 0,
+    "tracker did not settle its initial workflow observation"
+  );
 
   t.after(() => {
     runtimes.delete(runtime);
@@ -347,6 +390,602 @@ function operationFields(runtime, kind, operationId = `operation-${uuid()}`, fil
     payloadFingerprint: fill.repeat(64),
   };
 }
+
+async function workflowReady(runtime) {
+  return waitFor(() => {
+    const workflow = readSnapshot(runtime).workflow;
+    return workflow?.capabilities.includes("session-send") && workflow.sendReady && workflow;
+  }, "native workflow did not become available");
+}
+
+function workflowHandoff(runtime, kind, action, fields = operationFields(runtime, kind)) {
+  const path = join(runtime.sessions, `${runtime.appSessionId}.${kind}.json`);
+  const payload = {
+    schemaVersion: 1, copilotSessionId: readSnapshot(runtime).copilotSessionId,
+    ...fields, action: { kind, ...action },
+  };
+  writeHandoff(runtime, path, payload);
+  trigger(runtime, `${runtime.appSessionId}.${kind}.json`);
+  return { path, payload, operationId: fields.operationId };
+}
+
+test("native send uses explicit owner and mode, and exact replay cannot submit twice", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await workflowReady(runtime);
+  for (const mode of ["enqueue", "immediate"]) {
+    const request = workflowHandoff(runtime, "session-send", { prompt: "Keep my desktop draft", mode });
+    await waitFor(() => receipt(runtime, request.operationId)?.state === "applied", "send not accepted");
+    const count = runtime.session.workflowCalls.length;
+    writeHandoff(runtime, request.path, request.payload);
+    trigger(runtime, `${runtime.appSessionId}.session-send.json`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(runtime.session.workflowCalls.length, count);
+    const call = runtime.session.workflowCalls.at(-1);
+    assert.equal(call.method, "session.send");
+    assert.equal(call.sessionId, runtime.copilotSessionId);
+    assert.equal(call.mode, mode);
+    assert.equal(call.prompt, "Keep my desktop draft");
+    assert.equal(Object.hasOwn(call, "source"), false);
+  }
+  assert.deepEqual(runtime.session.closeCalls, []);
+});
+
+test("native stop is independent of an unresolved send and never closes the terminal", {
+  concurrency: false,
+}, async (t) => {
+  let completeSend;
+  const runtime = await createRuntime(t, (session) => {
+    session.sendHandler = () => new Promise((resolve) => { completeSend = resolve; });
+  });
+  await workflowReady(runtime);
+  const send = workflowHandoff(runtime, "session-send", { prompt: "work", mode: "enqueue" });
+  await waitFor(() => completeSend, "send not invoked");
+  const stop = workflowHandoff(runtime, "session-abort", {});
+  await waitFor(() => receipt(runtime, stop.operationId)?.state === "applied", "stop blocked behind send");
+  assert.deepEqual(runtime.session.closeCalls, []);
+  completeSend({ messageId: "accepted-send" });
+  await waitFor(() => receipt(runtime, send.operationId)?.state === "applied", "send outcome missing");
+});
+
+test("native sends are fenced by permissions and budget decisions", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await workflowReady(runtime);
+  await runtime.session.emit("permission.requested", { requestId: "permission-1" });
+  const permission = workflowHandoff(runtime, "session-send", { prompt: "continue", mode: "immediate" });
+  await waitFor(() => receipt(runtime, permission.operationId)?.state === "rejected", "permission fence missing");
+  await runtime.session.emit("permission.completed", { requestId: "permission-1" });
+  await runtime.session.emit("session_limits_exhausted.requested", {
+    requestId: "budget-1", usedAiCredits: 32, maxAiCredits: 30,
+  });
+  const budget = workflowHandoff(runtime, "session-send", { prompt: "continue", mode: "enqueue" });
+  await waitFor(() => receipt(runtime, budget.operationId)?.state === "rejected", "budget fence missing");
+  assert.equal(runtime.session.workflowCalls.filter((call) => call.method === "session.send").length, 0);
+});
+
+test("native actions after rotation never use the SDK's stale join-time session", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await workflowReady(runtime);
+  const old = operationFields(runtime, "session-send");
+  const next = uuid();
+  runtime.session.foregroundSessionId = next;
+  await runtime.session.emit("session.start", { sessionId: next });
+  await workflowReady(runtime);
+  const action = workflowHandoff(runtime, "session-send", { prompt: "new conversation", mode: "enqueue" });
+  await waitFor(() => receipt(runtime, action.operationId)?.state === "applied", "rotated send missing");
+  assert.equal(runtime.session.workflowCalls.at(-1).sessionId, next);
+  const count = runtime.session.workflowCalls.length;
+  workflowHandoff(runtime, "session-send", { prompt: "old conversation", mode: "enqueue" }, old);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(runtime.session.workflowCalls.length, count);
+});
+
+test("old runtime and missing budget metadata never advertise unsupported controls", {
+  concurrency: false,
+}, async (t) => {
+  const old = await createRuntime(t, (session) => {
+    session.statusHandler = async () => ({ version: "1.0.70", protocolVersion: 3 });
+  });
+  await waitFor(() => readSnapshot(old).workflow?.error, "missing unsupported state");
+  assert.deepEqual(readSnapshot(old).workflow.capabilities, []);
+  assert.equal(readSnapshot(old).workflow.legacyPromptFallback, true);
+  const current = await createRuntime(t, (session) => {
+    session.metadataHandler = async ({ sessionId }) => ({ sessionId, isRemote: false });
+  });
+  await workflowReady(current);
+  assert.equal(readSnapshot(current).workflow.capabilities.includes("set-session-budget"), false);
+});
+
+test("unknown native outcomes are not replayed and missing methods disable only their action", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    session.sendHandler = async () => { throw new Error("reply lost"); };
+  });
+  await workflowReady(runtime);
+  const request = workflowHandoff(runtime, "session-send", { prompt: "once", mode: "enqueue" });
+  await waitFor(() => receipt(runtime, request.operationId)?.state === "indeterminate", "unknown not preserved");
+  writeHandoff(runtime, request.path, request.payload);
+  trigger(runtime, `${runtime.appSessionId}.session-send.json`);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(runtime.session.workflowCalls.filter((call) => call.method === "session.send").length, 1);
+  runtime.session.sendHandler = async () => {
+    throw Object.assign(new Error("method not found"), { code: -32601 });
+  };
+  const absent = workflowHandoff(runtime, "session-send", { prompt: "not supported", mode: "enqueue" });
+  await waitFor(() => receipt(runtime, absent.operationId)?.state === "rejected", "missing method not rejected");
+  assert.equal(readSnapshot(runtime).workflow.capabilities.includes("session-send"), false);
+  assert.equal(readSnapshot(runtime).workflow.capabilities.includes("session-abort"), true);
+});
+
+test("budget changes read back the exact limit and answers use the current pending id", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await workflowReady(runtime);
+  const invalid = workflowHandoff(runtime, "set-session-budget", { maxAiCredits: 1 });
+  await waitFor(() => receipt(runtime, invalid.operationId)?.state === "rejected", "invalid minimum accepted");
+  const set = workflowHandoff(runtime, "set-session-budget", { maxAiCredits: 30 });
+  await waitFor(() => receipt(runtime, set.operationId)?.state === "applied", "budget change not verified");
+  assert.deepEqual(runtime.session.sessionLimits, { maxAiCredits: 30 });
+  await runtime.session.emit("session_limits_exhausted.requested", {
+    requestId: "budget-current", usedAiCredits: 31, maxAiCredits: 30,
+  });
+  const stale = workflowHandoff(runtime, "answer-session-budget", { requestId: "budget-old", additionalAiCredits: 10 });
+  await waitFor(() => receipt(runtime, stale.operationId)?.state === "rejected", "stale decision accepted");
+  const answer = workflowHandoff(runtime, "answer-session-budget", { requestId: "budget-current", additionalAiCredits: 10 });
+  await waitFor(() => receipt(runtime, answer.operationId)?.state === "applied", "budget decision missing");
+  const call = runtime.session.workflowCalls.find((entry) =>
+    entry.method === "session.ui.handlePendingSessionLimitsExhausted"
+  );
+  assert.deepEqual(call.response, { action: "add", additionalAiCredits: 10 });
+  const unset = workflowHandoff(runtime, "set-session-budget", { maxAiCredits: null });
+  await waitFor(() => receipt(runtime, unset.operationId)?.state === "applied", "budget removal missing");
+  assert.equal(runtime.session.sessionLimits, null);
+});
+
+test("usage uses accumulated runtime totals without summing child or ephemeral usage", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await workflowReady(runtime);
+  await runtime.session.emit("assistant.usage", { cost: 90, inputTokens: 100 }, { agentId: uuid() });
+  await runtime.session.emit("session.usage_info", { currentTokens: 400, tokenLimit: 1000 });
+  assert.equal(readSnapshot(runtime).workflow.totalAiCredits, 2);
+  assert.equal(readSnapshot(runtime).workflow.contextTokens, 400);
+  runtime.session.usageHandler = async () => { throw new Error("usage unavailable"); };
+  await runtime.session.emit("session.usage_checkpoint", { totalNanoAiu: 9e9 });
+  await waitFor(() => readSnapshot(runtime).workflow.totalAiCredits === null, "usage failure fabricated a total");
+});
+
+function taskResultPath(runtime) {
+  return join(runtime.sessions, `${runtime.appSessionId}.task-result.json`);
+}
+
+async function waitForTaskResult(runtime, turnId) {
+  return waitFor(() => {
+    const path = taskResultPath(runtime);
+    if (!realExistsSync(path)) return false;
+    const envelope = JSON.parse(realReadFileSync(path, "utf8"));
+    return envelope.result.turnId === turnId && envelope;
+  }, `task result for ${turnId} was not saved`);
+}
+
+async function finishResultTask(runtime, {
+  status = "finished", summary = "Current task result", checkId = uuid(),
+} = {}) {
+  const turnId = uuid();
+  await runtime.session.emit("user.message", { content: summary }, { id: turnId });
+  await runtime.session.emit("assistant.turn_start");
+  await runtime.session.emit("tool.execution_start", {
+    toolCallId: checkId, toolName: "bash", arguments: { command: "npm test" },
+  });
+  await runtime.session.emit("tool.execution_complete", {
+    toolCallId: checkId, success: true,
+    result: { contents: [
+      { type: "shell_exit", exitCode: 0, cwd: "/fixture" },
+      { type: "resource_link", uri: "https://github.com/example/project/pull/1" },
+    ] },
+  });
+  await runtime.session.emit("session.task_complete", { summary, success: status !== "blocked" });
+  await runtime.session.emit("session.idle", { aborted: status === "stopped" });
+  return turnId;
+}
+
+test("latest task result preserves diff provenance and only structured check exits", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await workflowReady(runtime);
+  await runtime.session.emit("user.message", { content: "run checks" });
+  await runtime.session.emit("assistant.turn_start");
+  await runtime.session.emit("tool.execution_start", { toolCallId: "test", toolName: "bash", arguments: { command: "npm test" } });
+  await runtime.session.emit("tool.execution_complete", {
+    toolCallId: "test", success: true,
+    result: { content: "ignored prose", contents: [{ type: "shell_exit", exitCode: 1, shellId: "test", cwd: "/fixture" }] },
+  });
+  await runtime.session.emit("tool.execution_start", { toolCallId: "async", toolName: "bash", arguments: { command: "swift test" } });
+  await runtime.session.emit("tool.execution_complete", { toolCallId: "async", success: true, result: { content: "still running" } });
+  await runtime.session.emit("tool.execution_start", { toolCallId: "masked", toolName: "bash", arguments: { command: "npm test || true" } });
+  await runtime.session.emit("session.task_complete", { summary: "A check failed", success: false });
+  await runtime.session.emit("session.idle");
+  const path = join(runtime.sessions, `${runtime.appSessionId}.task-result.json`);
+  await waitFor(() => realExistsSync(path), "task result not saved");
+  const result = JSON.parse(realReadFileSync(path, "utf8")).result;
+  assert.equal(result.status, "blocked");
+  assert.equal(result.diff.mode, "unstaged");
+  assert.equal(result.diff.isFallback, true);
+  assert.equal(result.diff.unavailableReason, "file-change-tracking-disabled");
+  assert.deepEqual(result.checks.map((check) => check.exitCode), [1, null]);
+});
+
+test("failed captures supersede prior successful evidence with the current turn's minimal error", {
+  concurrency: false,
+}, async (t) => {
+  for (const failure of [
+    "metadata-timeout", "metadata-identity", "metadata-remote", "metadata-missing",
+    "oversize", "primary-write", "primary-rename",
+  ]) {
+    await t.test(failure, { concurrency: false }, async (t) => {
+      const runtime = await createRuntime(t);
+      await workflowReady(runtime);
+      const oldTurn = await finishResultTask(runtime, { summary: "Old successful evidence" });
+      const old = await waitForTaskResult(runtime, oldTurn);
+      assert.equal(old.result.checks[0].exitCode, 0);
+      assert.ok(old.result.diff && old.result.branch && old.result.pullRequests.length);
+      const errors = [];
+      t.mock.method(console, "error", (...args) => errors.push(args.map(String).join(" ")));
+      let writeAttempts = 0;
+      let renameAttempts = 0;
+      if (failure === "metadata-timeout") {
+        const schedule = globalThis.setTimeout;
+        t.mock.method(globalThis, "setTimeout", (callback, delay, ...args) =>
+          schedule(callback, delay === 3000 ? 10 : delay, ...args));
+        runtime.session.metadataHandler = () => new Promise(() => {});
+      } else if (failure === "metadata-identity") {
+        runtime.session.metadataHandler = async () => ({
+          sessionId: uuid(), isRemote: false, workspace: { branch: "wrong-owner", repository: "wrong/repo" },
+        });
+      } else if (failure === "metadata-remote") {
+        runtime.session.metadataHandler = async ({ sessionId }) => ({ sessionId, isRemote: true });
+      } else if (failure === "metadata-missing") {
+        runtime.session.metadataHandler = async () => null;
+      } else if (failure === "primary-write") {
+        runtime.failWrite = path => path === `${taskResultPath(runtime)}.${process.pid}.tmp`
+          && ++writeAttempts === 1;
+      } else if (failure === "primary-rename") {
+        runtime.failRename = path => path === taskResultPath(runtime) && ++renameAttempts === 1;
+      }
+      const status = failure === "metadata-identity" ? "stopped" : failure === "oversize" ? "blocked" : "finished";
+      const turnId = await finishResultTask(runtime, {
+        status, summary: "New task evidence",
+        checkId: failure === "oversize" ? "x".repeat(300 * 1024) : uuid(),
+      });
+      const captured = await waitForTaskResult(runtime, turnId);
+      assert.equal(captured.schemaVersion, 1);
+      assert.equal(captured.copilotSessionId, runtime.copilotSessionId);
+      assert.equal(captured.conversationEpoch, readSnapshot(runtime).conversationEpoch);
+      assert.equal(captured.result.status, status);
+      assert.ok(Number.isFinite(Date.parse(captured.result.capturedAt)));
+      assert.equal(captured.result.summary, null);
+      assert.equal(captured.result.branch, null);
+      assert.equal(captured.result.repository, null);
+      assert.equal(captured.result.diff, null);
+      assert.deepEqual(captured.result.checks, []);
+      assert.deepEqual(captured.result.pullRequests, []);
+      assert.match(captured.result.error, /capture failed.*terminal/);
+      assert.equal(fs.statSync(taskResultPath(runtime)).mode & 0o777, 0o600);
+      assert.ok(errors.some(message => message.includes("could not capture task result")));
+      if (failure === "primary-write") assert.equal(writeAttempts, 2);
+      if (failure === "primary-rename") assert.equal(renameAttempts, 2);
+    });
+  }
+});
+
+test("a failure without a previous sidecar still publishes a decodable current-turn error", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await workflowReady(runtime);
+  runtime.session.metadataHandler = async () => null;
+  const turnId = await finishResultTask(runtime);
+  const envelope = await waitForTaskResult(runtime, turnId);
+  assert.equal(envelope.result.turnId, turnId);
+  assert.match(envelope.result.error, /capture failed/);
+  assert.deepEqual(envelope.result.checks, []);
+  assert.deepEqual(envelope.result.pullRequests, []);
+});
+
+test("unwritable primary and minimal error results stop after two attempts and report durable failure", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await workflowReady(runtime);
+  const originalTurn = await finishResultTask(runtime, { summary: "Previously captured" });
+  await waitForTaskResult(runtime, originalTurn);
+  const before = realReadFileSync(taskResultPath(runtime), "utf8");
+  const errors = [];
+  t.mock.method(console, "error", (...args) => errors.push(args.map(String).join(" ")));
+  let attempts = 0;
+  runtime.failWrite = path => {
+    if (path !== `${taskResultPath(runtime)}.${process.pid}.tmp`) return false;
+    attempts += 1;
+    return true;
+  };
+  await finishResultTask(runtime);
+  await waitFor(() => errors.some(message => message.includes("previous result may remain")),
+    "final durable result failure was not surfaced");
+  assert.equal(attempts, 2);
+  assert.equal(realReadFileSync(taskResultPath(runtime), "utf8"), before);
+  runtime.failWrite = null;
+  const recoveredTurn = await finishResultTask(runtime, { summary: "Recovered valid capture" });
+  const recovered = await waitForTaskResult(runtime, recoveredTurn);
+  assert.equal(recovered.result.error, null);
+  assert.equal(recovered.result.summary, "Recovered valid capture");
+});
+
+test("diff-only failure keeps actual current-turn evidence without borrowing an older diff", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await workflowReady(runtime);
+  await waitForTaskResult(runtime, await finishResultTask(runtime, { summary: "Old result" }));
+  runtime.session.diffHandler = async () => { throw new Error("diff unavailable"); };
+  const turnId = await finishResultTask(runtime, { summary: "Actual new result" });
+  const envelope = await waitForTaskResult(runtime, turnId);
+  assert.equal(envelope.result.summary, "Actual new result");
+  assert.equal(envelope.result.branch, "fixture");
+  assert.equal(envelope.result.diff, null);
+  assert.equal(envelope.result.checks[0].exitCode, 0);
+  assert.match(envelope.result.error, /Diff unavailable/);
+});
+
+test("late success or failure from capture A leaves capture B's successful bytes unchanged", {
+  concurrency: false,
+}, async (t) => {
+  for (const invalidMetadata of [false, true]) {
+    await t.test(invalidMetadata ? "late failure" : "late success", { concurrency: false }, async (t) => {
+      const runtime = await createRuntime(t);
+      await workflowReady(runtime);
+      await waitForTaskResult(runtime, await finishResultTask(runtime, { summary: "Previous result" }));
+      const previous = realReadFileSync(taskResultPath(runtime), "utf8");
+      const metadata = runtime.session.metadataHandler;
+      const diff = runtime.session.diffHandler;
+      let finishA;
+      runtime.session.diffHandler = () => new Promise(resolve => { finishA = resolve; });
+      if (invalidMetadata) runtime.session.metadataHandler = async () => null;
+      await finishResultTask(runtime, { summary: "Capture A" });
+      await waitFor(() => finishA, "capture A did not start");
+      assert.equal(realReadFileSync(taskResultPath(runtime), "utf8"), previous,
+        "capture start must not delete or publish a pending result");
+      runtime.session.metadataHandler = metadata;
+      runtime.session.diffHandler = diff;
+      const turnB = await finishResultTask(runtime, { summary: "Capture B" });
+      await waitForTaskResult(runtime, turnB);
+      const winner = realReadFileSync(taskResultPath(runtime), "utf8");
+      finishA(await diff());
+      await new Promise(resolve => setTimeout(resolve, 30));
+      assert.equal(realReadFileSync(taskResultPath(runtime), "utf8"), winner);
+    });
+  }
+});
+
+test("an old capture failure after conversation rotation cannot replace the new conversation result", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await workflowReady(runtime);
+  const metadata = runtime.session.metadataHandler;
+  const diff = runtime.session.diffHandler;
+  let finishOld;
+  runtime.session.metadataHandler = async () => null;
+  runtime.session.diffHandler = () => new Promise(resolve => { finishOld = resolve; });
+  await finishResultTask(runtime, { summary: "Old conversation" });
+  await waitFor(() => finishOld, "old capture did not start");
+  runtime.session.metadataHandler = metadata;
+  runtime.session.diffHandler = diff;
+  const next = uuid();
+  runtime.session.foregroundSessionId = next;
+  await runtime.session.emit("session.start", { sessionId: next });
+  await workflowReady(runtime);
+  const currentTurn = await finishResultTask(runtime, { summary: "New conversation" });
+  const current = await waitForTaskResult(runtime, currentTurn);
+  assert.equal(current.copilotSessionId, next);
+  const winner = realReadFileSync(taskResultPath(runtime), "utf8");
+  finishOld(await diff());
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(realReadFileSync(taskResultPath(runtime), "utf8"), winner);
+});
+
+test("loss of the file owner while awaiting capture prevents any failure-result publication", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await workflowReady(runtime);
+  await waitForTaskResult(runtime, await finishResultTask(runtime));
+  const winner = realReadFileSync(taskResultPath(runtime), "utf8");
+  let finish;
+  runtime.session.metadataHandler = async () => null;
+  runtime.session.diffHandler = () => new Promise(resolve => { finish = resolve; });
+  await finishResultTask(runtime);
+  await waitFor(() => finish, "capture did not start");
+  realWriteFileSync(runtime.ownerPath, JSON.stringify({
+    copilotSessionId: runtime.copilotSessionId, pid: 1,
+  }));
+  finish({ mode: "session", isFallback: false, changes: [] });
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(realReadFileSync(taskResultPath(runtime), "utf8"), winner);
+});
+
+test("primary write failure rechecks owner and revision before attempting a minimal error write", {
+  concurrency: false,
+}, async (t) => {
+  for (const loss of ["owner", "revision"]) {
+    await t.test(loss, { concurrency: false }, async (t) => {
+      const runtime = await createRuntime(t);
+      await workflowReady(runtime);
+      await waitForTaskResult(runtime, await finishResultTask(runtime));
+      const winner = realReadFileSync(taskResultPath(runtime), "utf8");
+      let attempts = 0;
+      runtime.failWrite = path => {
+        if (path !== `${taskResultPath(runtime)}.${process.pid}.tmp`) return false;
+        attempts += 1;
+        if (loss === "owner") {
+          realWriteFileSync(runtime.ownerPath, JSON.stringify({
+            copilotSessionId: runtime.copilotSessionId, pid: 1,
+          }));
+        } else {
+          void runtime.session.emit("user.message", { content: "New revision" });
+        }
+        return true;
+      };
+      await finishResultTask(runtime);
+      await waitFor(() => attempts > 0, "primary write was not attempted");
+      await new Promise(resolve => setTimeout(resolve, 30));
+      assert.equal(attempts, 1, "obsolete failure must not attempt the minimal write");
+      assert.equal(realReadFileSync(taskResultPath(runtime), "utf8"), winner);
+    });
+  }
+});
+
+test("minimal error publication rechecks owner and revision before its atomic rename", {
+  concurrency: false,
+}, async (t) => {
+  for (const loss of ["owner", "revision"]) {
+    await t.test(loss, { concurrency: false }, async (t) => {
+      const runtime = await createRuntime(t);
+      await workflowReady(runtime);
+      await waitForTaskResult(runtime, await finishResultTask(runtime));
+      const winner = realReadFileSync(taskResultPath(runtime), "utf8");
+      let attempts = 0;
+      runtime.failWrite = path => {
+        if (path !== `${taskResultPath(runtime)}.${process.pid}.tmp`) return false;
+        attempts += 1;
+        if (attempts === 1) return true;
+        if (loss === "owner") {
+          realWriteFileSync(runtime.ownerPath, JSON.stringify({
+            copilotSessionId: runtime.copilotSessionId, pid: 1,
+          }));
+        } else {
+          void runtime.session.emit("user.message", { content: "New revision before rename" });
+        }
+        return false;
+      };
+      await finishResultTask(runtime);
+      await waitFor(() => attempts === 2, "minimal write was not attempted");
+      await new Promise(resolve => setTimeout(resolve, 30));
+      assert.equal(realReadFileSync(taskResultPath(runtime), "utf8"), winner);
+    });
+  }
+});
+
+test("live deltas are replaced by final messages without duplicate transcript text", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await runtime.session.emit("user.message", { content: "stream" });
+  await runtime.session.emit("assistant.message_delta", { messageId: "stream-1", deltaContent: "par" });
+  await runtime.session.emit("assistant.message_delta", { messageId: "stream-1", deltaContent: "tial" });
+  await runtime.session.emit("assistant.message", { messageId: "stream-1", content: "complete" });
+  await runtime.session.emit("session.idle");
+  const path = join(runtime.sessions, `${runtime.appSessionId}.transcript.json`);
+  await waitFor(() => JSON.parse(realReadFileSync(path, "utf8")).turns.length, "transcript missing");
+  const messages = JSON.parse(realReadFileSync(path, "utf8")).turns.at(-1).assistantMessages;
+  assert.deepEqual(messages.map((message) => message.content), ["complete"]);
+});
+
+test("a late diff cannot become the result of a newer task", {
+  concurrency: false,
+}, async (t) => {
+  let finishDiff;
+  const runtime = await createRuntime(t, (session) => {
+    session.diffHandler = () => new Promise((resolve) => { finishDiff = resolve; });
+  });
+  await workflowReady(runtime);
+  await runtime.session.emit("user.message", { content: "first task" });
+  await runtime.session.emit("session.idle");
+  await waitFor(() => finishDiff, "result capture did not start");
+  await runtime.session.emit("user.message", { content: "second task" });
+  finishDiff({ requestedMode: "session", mode: "session", isFallback: false, changes: [] });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(realExistsSync(join(runtime.sessions, `${runtime.appSessionId}.task-result.json`)), false);
+});
+
+test("an unknown native send outcome upgrades when its exact late SDK reply arrives", {
+  concurrency: false,
+}, async (t) => {
+  let finish;
+  const runtime = await createRuntime(t, (session) => {
+    session.sendHandler = () => new Promise((resolve) => { finish = resolve; });
+  });
+  await workflowReady(runtime);
+  const setTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (callback, delay, ...args) =>
+    setTimeout(callback, delay === 10_000 ? 5 : delay, ...args);
+  t.after(() => { globalThis.setTimeout = setTimeout; });
+  const request = workflowHandoff(runtime, "session-send", { prompt: "once", mode: "enqueue" });
+  await waitFor(() => receipt(runtime, request.operationId)?.state === "indeterminate", "deadline not reported");
+  finish({ messageId: "late-success" });
+  await waitFor(() => receipt(runtime, request.operationId)?.state === "applied", "late authoritative reply lost");
+  assert.equal(runtime.session.workflowCalls.filter((call) => call.method === "session.send").length, 1);
+});
+
+test("durable history streams the pending turn but result identity follows newer live input", {
+  concurrency: false,
+}, async (t) => {
+  const event = (id, type, data) => ({ id, type, timestamp: new Date().toISOString(), data });
+  const pendingID = uuid();
+  const runtime = await createRuntime(t, (session, fixture) => {
+    const directory = join(fixture.root, "copilot-home", "session-state", fixture.copilotSessionId);
+    realMkdirSync(directory, { recursive: true });
+    realWriteFileSync(join(directory, "events.jsonl"), [
+      event("old-user", "user.message", { content: "old task" }),
+      event("old-final", "assistant.message", { messageId: "old", content: "old result" }),
+      event("old-idle", "session.idle", {}),
+      event(pendingID, "user.message", { content: "current task" }),
+      event("current-start", "assistant.turn_start", {}),
+    ].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+  });
+  const home = process.env.COPILOT_HOME;
+  process.env.COPILOT_HOME = join(runtime.root, "copilot-home");
+  t.after(() => {
+    if (home === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = home;
+  });
+  await workflowReady(runtime);
+  await runtime.session.emit("assistant.message_delta", { messageId: "current", deltaContent: "live text" });
+  const transcript = join(runtime.sessions, `${runtime.appSessionId}.transcript.json`);
+  await waitFor(() => JSON.parse(realReadFileSync(transcript, "utf8")).turns
+    .find((turn) => turn.id === pendingID)?.assistantMessages.some((message) => message.content === "live text"),
+  "durable-authoritative transcript did not expose live text", 4_000);
+  const liveID = uuid();
+  await runtime.session.emit("user.message", { content: "new input before journal catches up" }, { id: liveID });
+  await runtime.session.emit("session.task_complete", { summary: "current result", success: true });
+  await runtime.session.emit("session.idle");
+  const resultPath = join(runtime.sessions, `${runtime.appSessionId}.task-result.json`);
+  await waitFor(() => realExistsSync(resultPath), "current result not captured");
+  assert.equal(JSON.parse(realReadFileSync(resultPath, "utf8")).result.turnId, liveID);
+});
+
+test("duplicate idle never recaptures a completed task with a new diff or timestamp", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await workflowReady(runtime);
+  await runtime.session.emit("user.message", { content: "one task" });
+  await runtime.session.emit("session.idle");
+  const path = join(runtime.sessions, `${runtime.appSessionId}.task-result.json`);
+  await waitFor(() => realExistsSync(path), "initial task result missing");
+  const captured = realReadFileSync(path, "utf8");
+  await runtime.session.emit("session.idle");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(realReadFileSync(path, "utf8"), captured);
+});
 
 function requestClose(runtime) {
   const name = `${runtime.appSessionId}.close-session-request`;

@@ -1,6 +1,7 @@
 import Foundation
 import Darwin
 import CopilotProjectsCore
+import CopilotProjectsProtocol
 
 struct InputWaitContext: Codable, Equatable {
     let senderSessionId: String
@@ -289,6 +290,14 @@ enum SessionArtifacts {
 
     static func removeFiles(sessionId: String) {
         let fm = FileManager.default
+        for suffix in RemoteSessionActionKind.allCases.map({ "\($0.rawValue).json" })
+            + ["task-result.json"] {
+            let path = Paths.sessionsDir.appendingPathComponent("\(sessionId).\(suffix)").path
+            if fm.fileExists(atPath: path) {
+                do { try fm.removeItem(atPath: path) }
+                catch { NSLog("copilot-projects: could not remove session workflow file: \(error)") }
+            }
+        }
         for path in [
             Paths.dtachSocketPath(sessionId: sessionId),
             Paths.statusMarkerPath(sessionId: sessionId),

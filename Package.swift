@@ -8,6 +8,7 @@ let package = Package(
         .iOS("17.0"),
     ],
     products: [
+        .library(name: "CopilotProjectsUI", targets: ["CopilotProjectsUI"]),
         .library(
             name: "CopilotProjectsProtocol",
             targets: ["CopilotProjectsProtocol"]
@@ -35,6 +36,11 @@ let package = Package(
     ],
     targets: [
         .target(
+            name: "CopilotProjectsUI",
+            dependencies: ["CopilotProjectsProtocol"],
+            path: "Sources/CopilotProjectsUI"
+        ),
+        .target(
             name: "SessionDomain",
             path: "Packages/SessionDomain/Sources/SessionDomain"
         ),
@@ -59,6 +65,7 @@ let package = Package(
         .executableTarget(
             name: "copilot-projects",
             dependencies: [
+                "CopilotProjectsUI",
                 "CopilotProjectsCore",
                 "CopilotProjectsProtocol",
                 "SessionDomain",

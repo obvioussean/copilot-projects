@@ -296,6 +296,168 @@ function operationTargetContext(kind, targetId, sessionId = selected) {
 function operationUnavailableMessage() {
   return 'Copilot controls are temporarily unavailable.';
 }
+
+function renderWorkflow() {
+  const panel = document.querySelector('#session-workflow');
+  if (!panel) return;
+  const session = selected && sessionState.get(selected);
+  const workflow = session?.workflow;
+  panel.hidden = !workflow;
+  const sendSupported = workflowSupports(workspaceProtocolInfo, session, 'session-send');
+  const abortSupported = workflowSupports(workspaceProtocolInfo, session, 'session-abort');
+  const enabled = (kind, target = kind) => {
+    const record = sdkOperations.recordForTarget(operationTargetContext(kind, target));
+    return writable && workflowSupports(workspaceProtocolInfo, session, kind)
+      && !['submitting', 'accepted'].includes(record?.state)
+      && (kind === 'session-abort' || record?.state !== 'indeterminate');
+  };
+  document.querySelector('#native-prompt-controls').hidden = !(sendSupported || abortSupported);
+  const mode = document.querySelector('#native-prompt-mode');
+  mode.hidden = !sendSupported;
+  mode.disabled = !writable || !sendSupported;
+  const stop = document.querySelector('#native-stop');
+  stop.hidden = !abortSupported;
+  stop.disabled = !enabled('session-abort');
+  document.querySelector('#prompt-warning').textContent = sendSupported
+    ? 'Native messages keep your desktop draft unchanged.'
+    : (legacyPromptSupported(workspaceProtocolInfo, session)
+      ? 'Sending clears any unsent desktop draft.'
+      : NATIVE_PROMPT_UNAVAILABLE_MESSAGE);
+  if (!workflow) return;
+  const total = Number.isFinite(workflow.totalAiCredits)
+    ? `Session total: ${workflow.totalAiCredits.toFixed(3)} AI credits.` : 'Session credit usage unavailable.';
+  const limit = workflow.limitsKnown
+    ? (workflow.maxAiCredits == null ? 'No session soft limit.'
+      : `Current-window soft limit: ${workflow.maxAiCredits} AI credits.`) : 'Budget state unavailable.';
+  const context = Number.isSafeInteger(workflow.contextTokens) && workflow.contextTokenLimit > 0
+    ? ` Context: ${workflow.contextTokens} / ${workflow.contextTokenLimit} tokens.` : '';
+  document.querySelector('#workflow-detail').textContent =
+    `${total} ${limit}${context} Totals and the current budget window are separate; model calls can exceed a soft limit.`;
+  document.querySelector('#workflow-background').textContent = [
+    ...(workflow.agents || []).map((agent) => `${agent.name}: ${agent.description || ''}`),
+    ...(workflow.schedules || [])
+  ].join('\n');
+  const request = workflow.budgetRequest;
+  document.querySelector('#workflow-budget-edit').hidden = !!request;
+  document.querySelector('#workflow-budget-answer').hidden = !request;
+  document.querySelector('#workflow-set-limit').disabled = !enabled('set-session-budget');
+  document.querySelector('#workflow-unset-limit').disabled = !enabled('set-session-budget')
+    || workflow.maxAiCredits == null;
+  if (request) {
+    if (panel.dataset.budgetRequest !== request.requestId) {
+      panel.open = true;
+      panel.dataset.budgetRequest = request.requestId;
+    }
+    document.querySelector('#workflow-budget-question').textContent =
+      `Budget decision needed: ${request.usedAiCredits} / ${request.maxAiCredits} AI credits in this window.`;
+    document.querySelector('#workflow-continue').disabled = !enabled('answer-session-budget', request.requestId);
+    document.querySelector('#workflow-cancel-budget').disabled = !enabled('answer-session-budget', request.requestId);
+  }
+}
+
+async function submitWorkflowAction(kind, extra = {}) {
+  const context = operationContext();
+  if (!writable || !workflowSupports(workspaceProtocolInfo, context.session, kind)) return;
+  const status = document.querySelector('#workflow-operation-status');
+  if (kind === 'set-session-budget' && extra.maxAiCredits != null
+      && (!Number.isFinite(extra.maxAiCredits) || extra.maxAiCredits < 30)) {
+    status.textContent = 'Enter a soft limit of at least 30 AI credits.';
+    return;
+  }
+  if (kind === 'answer-session-budget' && extra.additionalAiCredits != null
+      && (!Number.isFinite(extra.additionalAiCredits) || extra.additionalAiCredits <= 0)) {
+    status.textContent = 'Enter a positive number of additional AI credits.';
+    return;
+  }
+  const targetId = extra.requestId || kind;
+  const previous = sdkOperations.recordForTarget(operationTargetContext(kind, targetId));
+  if (previous?.state === 'applied'
+      || (kind === 'session-abort' && previous?.state === 'indeterminate')) {
+    sdkOperations.discard(previous.operationId);
+  }
+  const plan = sdkOperations.prepare({
+    sessionId: context.sessionId, conversationEpoch: context.conversationEpoch,
+    support: context.support, kind, targetId, payloadContext: null
+  });
+  if (plan.mode !== REMOTE_OPERATION_SUPPORT.RECEIPTS) return;
+  status.textContent = 'Waiting for Copilot to confirm...';
+  renderWorkflow();
+  const timer = setTimeout(() => {
+    const record = sdkOperations.markIndeterminate(plan.record.operationId, 'receipt-timeout');
+    if (record && selected === context.sessionId) {
+      status.textContent = remoteOperationMessage(record);
+      renderWorkflow();
+    }
+  }, RECEIPT_TIMEOUT_MS);
+  plan.record.workflowTimer = timer;
+  const response = await control(remoteOperationControlMessage(
+    kind, context.sessionId, JSON.stringify({ kind, ...extra }), plan
+  ));
+  const outcome = sdkOperations.resolveHTTP(plan.record.operationId, response?.status ?? null);
+  if (selected !== context.sessionId || selectedConversationEpoch !== context.conversationEpoch) return;
+  if (outcome.outcome === 'rejected' || outcome.outcome === 'indeterminate') {
+    clearTimeout(timer);
+    status.textContent = outcome.outcome === 'rejected'
+      ? 'This session action was not accepted.' : 'Outcome unknown. Check the terminal before trying again.';
+  }
+  renderWorkflow();
+}
+
+function reconcileWorkflowPrompts() {
+  for (const [sessionId, queue] of promptQueues) {
+    const session = sessionState.get(sessionId);
+    for (const entry of [...queue]) {
+      if (!entry.nativeMode || !entry.nativeAttempted) continue;
+      if (session?.conversationEpoch !== entry.nativeEpoch) {
+        entry.blockedReason = 'Outcome unknown after the conversation changed. Check the terminal.';
+        continue;
+      }
+      const receipt = (session.operationReceipts || []).find((item) =>
+        item.operationId === entry.id && item.kind === 'session-send'
+        && item.conversationEpoch === entry.nativeEpoch
+      );
+      if (receipt?.state === 'applied') {
+        clearTimeout(entry.receiptTimer);
+        removeQueuedPrompt(sessionId, entry.id);
+      } else if (receipt?.state === 'rejected' || receipt?.state === 'indeterminate') {
+        clearTimeout(entry.receiptTimer);
+        entry.blockedReason = receipt.state === 'rejected'
+          ? 'Copilot rejected this message. Remove it before sending again.'
+          : 'Outcome unknown. Check the terminal before discarding.';
+      }
+    }
+  }
+}
+
+async function flushNativePrompt(entry, state) {
+  if (entry.nativeAttempted || !writable || !state.workflow?.sendReady
+      || !workflowSupports(workspaceProtocolInfo, state, 'session-send')) return;
+  if (entry.nativeEpoch !== state.conversationEpoch) {
+    entry.blockedReason = 'The conversation changed. Review this message before sending again.';
+    return;
+  }
+  entry.nativeAttempted = true;
+  entry.outcomeUnknown = true;
+  entry.receiptTimer = setTimeout(() => {
+    if (!sessionQueue(entry.sessionId).includes(entry)) return;
+    entry.blockedReason = 'Outcome unknown. Check the terminal before discarding.';
+    if (selected === entry.sessionId) updatePromptState();
+  }, RECEIPT_TIMEOUT_MS);
+  const response = await control({
+    type: 'session-send', sessionId: entry.sessionId, requestId: entry.id,
+    conversationEpoch: entry.nativeEpoch,
+    data: JSON.stringify({ kind: 'session-send', prompt: entry.data, mode: entry.nativeMode })
+  });
+  reconcileWorkflowPrompts();
+  if (!sessionQueue(entry.sessionId).includes(entry)) return;
+  if (response?.status !== 204) {
+    entry.blockedReason = [400, 403, 409, 422].includes(response?.status)
+      ? 'Copilot did not accept this message. Remove it before sending again.'
+      : 'Outcome unknown. Check the terminal before discarding.';
+    if (response?.status === 403 && selected === entry.sessionId) writable = false;
+  }
+  if (selected === entry.sessionId) { renderQueue(); updatePromptState(); }
+}
 function clearModelOperationState(closePicker) {
   if (modelOperationTimer) clearTimeout(modelOperationTimer);
   modelOperationTimer = null;
@@ -700,6 +862,7 @@ function removeQueuedPrompt(sessionId, itemId) {
   const q = promptQueues.get(sessionId);
   const index = q?.findIndex((item) => item.id === itemId) ?? -1;
   if (index < 0) return;
+  clearTimeout(q[index].receiptTimer);
   q.splice(index, 1);
   if (!q.length) promptQueues.delete(sessionId);
 }
@@ -714,7 +877,7 @@ function renderQueue() {
     item.setAttribute('role', 'listitem');
     const text = document.createElement('span');
     text.className = 'queue-text';
-    text.textContent = entry.data;
+    text.textContent = entry.data + (entry.blockedReason ? `\n${entry.blockedReason}` : '');
     const remove = document.createElement('button');
     remove.type = 'button';
     remove.className = 'queue-remove';
@@ -740,7 +903,17 @@ function enqueuePrompt(value) {
     updatePromptState(`Queue is full (${QUEUE_CAP} max)`);
     return false;
   }
-  q.push(controlAction(newUUID(), 'prompt', selected, value));
+  const entry = controlAction(newUUID(), 'prompt', selected, value);
+  const state = sessionState.get(selected);
+  if (workflowSupports(workspaceProtocolInfo, state, 'session-send')) {
+    entry.nativeMode = document.querySelector('#native-prompt-mode')?.value === 'immediate'
+      ? 'immediate' : 'enqueue';
+    entry.nativeEpoch = state.conversationEpoch;
+  } else if (!legacyPromptSupported(workspaceProtocolInfo, state)) {
+    updatePromptState(NATIVE_PROMPT_UNAVAILABLE_MESSAGE);
+    return false;
+  }
+  q.push(entry);
   renderQueue();
   updatePromptState();
   return true;
@@ -764,6 +937,10 @@ async function flushQueue() {
   const entry = sessionQueue(id)[0];
   if (!entry || entry.blockedReason) return;
   const state = sessionState.get(id);
+  if (entry.nativeMode) {
+    return flushNativePrompt(entry, state);
+  }
+  if (!entry.prepared && !legacyPromptSupported(workspaceProtocolInfo, state)) return;
   const replaying = entry.outcomeUnknown && canReplayControlAction(
     entry, workspaceProtocolInfo, nonEmptyOperationToken(state?.conversationEpoch)
   );
@@ -1237,12 +1414,32 @@ function closeModelPicker() {
 modelLine.onclick = openModelPicker;
 modelPickerBack.onclick = () => renderModelList();
 modelPickerClose.onclick = () => closeModelPicker();
+document.querySelector('#native-stop')?.addEventListener('click', () =>
+  submitWorkflowAction('session-abort'));
+document.querySelector('#workflow-set-limit')?.addEventListener('click', () =>
+  submitWorkflowAction('set-session-budget', {
+    maxAiCredits: Number(document.querySelector('#workflow-limit').value)
+  }));
+document.querySelector('#workflow-unset-limit')?.addEventListener('click', () =>
+  submitWorkflowAction('set-session-budget', { maxAiCredits: null }));
+document.querySelector('#workflow-continue')?.addEventListener('click', () => {
+  const request = sessionState.get(selected)?.workflow?.budgetRequest;
+  if (request) submitWorkflowAction('answer-session-budget', {
+    requestId: request.requestId,
+    additionalAiCredits: Number(document.querySelector('#workflow-additional').value)
+  });
+});
+document.querySelector('#workflow-cancel-budget')?.addEventListener('click', () => {
+  const request = sessionState.get(selected)?.workflow?.budgetRequest;
+  if (request) submitWorkflowAction('answer-session-budget', { requestId: request.requestId });
+});
 modelPicker.addEventListener('close', () => {
   modelPickerModelId = null;
   setModelPickerStatus('');
 });
 
 function updatePromptState(message) {
+  renderWorkflow();
   updateCloseSessionState();
   renderInputDeliveryState();
   renderModelLine();
@@ -1263,8 +1460,11 @@ function updatePromptState(message) {
     promptFallbackTimer = null;
   }
   const q = selected ? (promptQueues.get(selected) || []) : [];
+  const native = workflowSupports(workspaceProtocolInfo, state, 'session-send');
+  const legacy = legacyPromptSupported(workspaceProtocolInfo, state);
   promptSubmit.disabled = !(selected && writable
-    && prompt.value.trim() && q.length < QUEUE_CAP);
+    && prompt.value.trim() && q.length < QUEUE_CAP
+    && (legacy || (native && state.workflow.sendReady)));
   if (message) {
     promptStatus.textContent = message;
   } else if (!selected) {
@@ -1273,6 +1473,8 @@ function updatePromptState(message) {
     promptStatus.textContent = 'View only';
   } else if (q[0]?.blockedReason) {
     promptStatus.textContent = q[0].blockedReason;
+  } else if (!native && !legacy && !q[0]?.prepared && !q[0]?.nativeAttempted) {
+    promptStatus.textContent = NATIVE_PROMPT_UNAVAILABLE_MESSAGE;
   } else if (q.length) {
     promptStatus.textContent = `${q.length} queued`;
   } else if (awaitingPromptStart) {
@@ -1306,6 +1508,13 @@ function clearElicitationSubmission(requestId, operationId) {
 }
 function applyOperationTransition(transition) {
   const { record, state } = transition;
+  if (['session-abort', 'set-session-budget', 'answer-session-budget'].includes(record.kind)) {
+    if (state !== 'accepted') clearTimeout(record.workflowTimer);
+    document.querySelector('#workflow-operation-status').textContent =
+      state === 'applied' ? 'Accepted by Copilot.' : remoteOperationMessage(record);
+    renderWorkflow();
+    return;
+  }
   if (record.kind === 'answer-user-input') {
     if (state === 'applied' || state === 'rejected' || state === 'indeterminate') {
       clearUserInputSubmission(record.targetId, record.operationId);
@@ -1551,6 +1760,7 @@ function renderWorkspace(data) {
       sessionState.set(session.id, session);
       sessions.append(renderSessionButton(session, active));
     });
+    reconcileWorkflowPrompts();
   });
   renderAttentionSummary();
   renderSelectedAttention();

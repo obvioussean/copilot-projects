@@ -60,6 +60,7 @@ public struct RemoteSessionSnapshot: Codable, Equatable, Sendable {
     public let conversationEpoch: String?
     public let operationSupport: RemoteOperationSupport?
     public let operationReceipts: [RemoteOperationReceipt]?
+    public let workflow: RemoteSessionWorkflow?
 
     public init(
         id: String,
@@ -77,7 +78,8 @@ public struct RemoteSessionSnapshot: Codable, Equatable, Sendable {
         availableModels: [RemoteAvailableModel]? = nil,
         conversationEpoch: String? = nil,
         operationSupport: RemoteOperationSupport? = nil,
-        operationReceipts: [RemoteOperationReceipt]? = nil
+        operationReceipts: [RemoteOperationReceipt]? = nil,
+        workflow: RemoteSessionWorkflow? = nil
     ) {
         self.id = id
         self.title = title
@@ -95,6 +97,7 @@ public struct RemoteSessionSnapshot: Codable, Equatable, Sendable {
         self.conversationEpoch = conversationEpoch
         self.operationSupport = operationSupport
         self.operationReceipts = operationReceipts
+        self.workflow = workflow
     }
 }
 

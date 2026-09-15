@@ -62,7 +62,9 @@ enum TranscriptImageAssociation {
             schemaVersion: snapshot.schemaVersion,
             updatedAt: snapshot.updatedAt,
             copilotSessionId: snapshot.copilotSessionId,
-            turns: newTurns
+            turns: newTurns,
+            totalTurns: snapshot.totalTurns,
+            latestResult: snapshot.latestResult
         )
     }
 

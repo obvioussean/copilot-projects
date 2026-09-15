@@ -213,6 +213,16 @@ final class RemoteModelBridge: @unchecked Sendable {
         ) ?? .invalid
     }
 
+    func performSessionAction(
+        sessionId: String,
+        action: RemoteSessionAction,
+        operation: CLIOperationRequest
+    ) -> RemoteUserInputResult {
+        model?.performSessionAction(
+            sessionId: sessionId, action: action, operation: operation
+        ) ?? .invalid
+    }
+
     /// The exact retained PNG bytes for `(imageId, version)` in `sessionId`'s
     /// terminal, or `nil` if the session, id, or exact version isn't (or is no
     /// longer) available.
@@ -676,6 +686,14 @@ private let remoteMaxEncodedUserInputAnswerBytes = 64 * 1_024
 private let remoteWorkspaceRefreshInterval: TimeInterval = 2
 
 enum RemoteSDKControlValidation {
+    static func sessionAction(_ message: RemoteClientMessage) -> RemoteSessionAction? {
+        guard let payload = message.data, payload.utf8.count <= 65_536,
+              let action = try? JSONDecoder().decode(
+                RemoteSessionAction.self, from: Data(payload.utf8)
+              ), action.kind.rawValue == message.type, action.isValid else { return nil }
+        return action
+    }
+
     static func operation(_ message: RemoteClientMessage) -> CLIOperationRequestParse {
         CLIOperationRequest.parse(
             operationId: message.requestId,
@@ -1503,6 +1521,40 @@ private final class RemoteHTTPHandler:
                         status: response.0,
                         contentType: "text/plain",
                         body: Data(response.1.utf8)
+                    )
+                }
+            }
+        case "session-send", "session-abort", "set-session-budget", "answer-session-budget":
+            guard let action = RemoteSDKControlValidation.sessionAction(message),
+                  case .correlated(let operation) = RemoteSDKControlValidation.operation(message) else {
+                respond(context: context, method: .POST, status: .badRequest,
+                        contentType: "text/plain", body: "Bad session action or operation identity")
+                return
+            }
+            guard leases.holds(sessionId: sessionId, clientId: clientId) else {
+                respond(context: context, method: .POST, status: .forbidden,
+                        contentType: "text/plain", body: "view only")
+                return
+            }
+            let channel = context.channel
+            let leases = self.leases
+            Task { @MainActor in
+                let result = leases.withHeldLease(sessionId: sessionId, clientId: clientId) {
+                    self.bridge.performSessionAction(
+                        sessionId: sessionId, action: action, operation: operation
+                    )
+                }
+                channel.eventLoop.execute {
+                    let response: (HTTPResponseStatus, String)
+                    switch result {
+                    case .some(.accepted): response = (.noContent, "")
+                    case .some(.conflict): response = (.conflict, "Operation conflicts with current conversation")
+                    case .some(.invalid): response = (.unprocessableEntity, "Session action is not available")
+                    case .none: response = (.forbidden, "view only")
+                    }
+                    self.respond(
+                        channel: channel, method: .POST, status: response.0,
+                        contentType: "text/plain", body: Data(response.1.utf8)
                     )
                 }
             }

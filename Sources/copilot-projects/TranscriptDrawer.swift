@@ -1,29 +1,37 @@
 import SwiftUI
 import AppKit
 import CopilotProjectsProtocol
+import CopilotProjectsUI
 
 struct TranscriptOverlay: View {
     @ObservedObject var controller: TranscriptController
     let isOpen: Bool
     let onClose: () -> Void
     let onOpen: () -> Void
+    let workflow: RemoteSessionWorkflow?
+    let operation: AgentOperationProjection
+    let onAction: @MainActor (RemoteSessionAction) async -> RemoteWorkflowActionResult
 
     var body: some View {
-        if let snapshot = controller.snapshot, !snapshot.turns.isEmpty {
+        if controller.snapshot != nil || workflow != nil {
             if isOpen {
                 TranscriptDrawer(
-                    turns: snapshot.turns,
-                    onClose: onClose
+                    turns: controller.snapshot?.turns ?? [],
+                    latestResult: controller.snapshot?.latestResult,
+                    workflow: workflow,
+                    operation: operation,
+                    onClose: onClose,
+                    onAction: onAction
                 )
                 .transition(.move(edge: .trailing).combined(with: .opacity))
             } else {
                 Button(action: onOpen) {
-                    Label("Show completed turns", systemImage: "sidebar.trailing")
+                    Label("Show session details", systemImage: "sidebar.trailing")
                         .labelStyle(.iconOnly)
                         .frame(width: 28, height: 28)
                 }
                 .buttonStyle(.bordered)
-                .help("Show completed turns")
+                .help("Show session details")
                 .padding(12)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
             }
@@ -33,13 +41,17 @@ struct TranscriptOverlay: View {
 
 private struct TranscriptDrawer: View {
     let turns: [TranscriptTurn]
+    let latestResult: RemoteTaskResult?
+    let workflow: RemoteSessionWorkflow?
+    let operation: AgentOperationProjection
     let onClose: () -> Void
+    let onAction: @MainActor (RemoteSessionAction) async -> RemoteWorkflowActionResult
     @State private var isAtBottom = true
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Label("Completed turns", systemImage: "text.bubble")
+                Label("Session details", systemImage: "text.bubble")
                     .font(.headline)
                 Spacer()
                 Button(action: onClose) {
@@ -52,12 +64,24 @@ private struct TranscriptDrawer: View {
             .frame(height: 44)
 
             Divider()
+            if let workflow {
+                SessionWorkflowView(
+                    workflow: workflow, canWrite: true,
+                    receipts: operation.receipts ?? [], onAction: onAction
+                )
+                    .id(operation.conversationEpoch)
+                    .padding(12)
+                Divider()
+            }
 
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
                         ForEach(turns) { turn in
                             TranscriptTurnCard(turn: turn)
+                        }
+                        if let latestResult {
+                            TaskResultView(result: latestResult)
                         }
                         Color.clear
                             .frame(height: 1)
@@ -71,6 +95,10 @@ private struct TranscriptDrawer: View {
                     proxy.scrollTo("transcript-bottom", anchor: .bottom)
                 }
                 .onChange(of: turns) { _, _ in
+                    guard isAtBottom else { return }
+                    proxy.scrollTo("transcript-bottom", anchor: .bottom)
+                }
+                .onChange(of: latestResult) { _, _ in
                     guard isAtBottom else { return }
                     proxy.scrollTo("transcript-bottom", anchor: .bottom)
                 }
