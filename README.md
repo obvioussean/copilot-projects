@@ -39,6 +39,8 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
   Text, choices, and other supported forms use the original response ID. This works with
   the existing CLI event API; no new CLI version is required for missed-event recovery.
   An optional pending-question snapshot API also recovers older prompts on supporting CLIs.
+  If completions free slots after bounded staging overflows, the tracker replays that
+  window before selecting the remaining forms; staging and per-heartbeat read limits stay unchanged.
   If a question has already left the CLI's in-memory event history and no snapshot is
   available, it remains answerable through **Open terminal** rather than a guessed response ID.
 - **Notifications:** native macOS banners identify the originating project/session and

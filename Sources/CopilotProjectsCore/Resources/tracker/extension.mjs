@@ -2075,6 +2075,7 @@ if (validSessionId && socketPath) {
                 response: { answer, wasFreeform },
             });
             if (!operationAuthorityCurrent(executionContext)) return;
+            // False means the request is no longer pending, not that our answer succeeded.
             const resolved = typeof result?.success === "boolean";
             if (resolved) {
                 noteQuestionCompleted(requestId);
@@ -2230,6 +2231,8 @@ if (validSessionId && socketPath) {
 
     function noteQuestionCompleted(requestId) {
         pendingQuestionRecovery?.completed.add(requestId);
+        questionEventStream?.inputs.delete(requestId);
+        questionEventStream?.elicitations.delete(requestId);
         // Runtime request IDs are unique; a delayed notification must not reopen an answered form.
         completedQuestionRequests.delete(requestId);
         completedQuestionRequests.add(requestId);
@@ -2284,6 +2287,9 @@ if (validSessionId && socketPath) {
         const stream = questionEventStream ??= {
             sessionId: copilotSessionId,
             cursor: undefined,
+            startCursor: undefined,
+            inputsOverflowed: false,
+            elicitationsOverflowed: false,
             inputs: new Map(),
             elicitations: new Map(),
             completed: new Map(),
@@ -2335,6 +2341,9 @@ if (validSessionId && socketPath) {
                 }
                 if (result.cursorStatus === "expired") {
                     stream.cursor = undefined;
+                    stream.startCursor = undefined;
+                    stream.inputsOverflowed = false;
+                    stream.elicitationsOverflowed = false;
                     stream.inputs.clear();
                     stream.elicitations.clear();
                     stream.completed.clear();
@@ -2352,8 +2361,6 @@ if (validSessionId && socketPath) {
                             || !Number.isFinite(Date.parse(event.timestamp))) continue;
                     if (event.type.endsWith(".completed")) {
                         noteQuestionCompleted(requestId);
-                        stream.inputs.delete(requestId);
-                        stream.elicitations.delete(requestId);
                         stream.completed.set(requestId, event);
                         while (stream.completed.size > MAX_QUESTION_COMPLETIONS) {
                             stream.completed.delete(stream.completed.keys().next().value);
@@ -2366,12 +2373,24 @@ if (validSessionId && socketPath) {
                         const maximum = event.type === "elicitation.requested" ? MAX_ELICITATIONS : MAX_USER_INPUTS;
                         if (!pending.has(requestId)) pending.set(requestId, event);
                         while (pending.size > maximum) {
+                            if (pending === stream.inputs) stream.inputsOverflowed = true;
+                            else stream.elicitationsOverflowed = true;
                             pending.delete(pending.keys().next().value);
                         }
                     }
                 }
                 stream.cursor = result.cursor;
-                if (!result.hasMore) {
+                if (!result.hasMore && (
+                    (stream.inputsOverflowed && stream.inputs.size < MAX_USER_INPUTS)
+                    || (stream.elicitationsOverflowed && stream.elicitations.size < MAX_ELICITATIONS)
+                )) {
+                    // Completions freed capped slots; reselect with their tombstones before publishing.
+                    stream.cursor = stream.startCursor;
+                    stream.inputsOverflowed = false;
+                    stream.elicitationsOverflowed = false;
+                    stream.inputs.clear();
+                    stream.elicitations.clear();
+                } else if (!result.hasMore) {
                     let changed = false;
                     for (const event of stream.completed.values()) {
                         changed = applyQuestionEvent(event, true) || changed;
@@ -2382,6 +2401,9 @@ if (validSessionId && socketPath) {
                     stream.inputs.clear();
                     stream.elicitations.clear();
                     stream.completed.clear();
+                    stream.startCursor = stream.cursor;
+                    stream.inputsOverflowed = false;
+                    stream.elicitationsOverflowed = false;
                     stream.error = null;
                     if (changed) publish();
                     return;
@@ -2743,6 +2765,7 @@ if (validSessionId && socketPath) {
                 result,
             });
             if (!operationAuthorityCurrent(executionContext)) return;
+            // False means the request is no longer pending, not that our answer succeeded.
             const resolved = typeof rpcResult?.success === "boolean";
             if (resolved) {
                 noteQuestionCompleted(requestId);

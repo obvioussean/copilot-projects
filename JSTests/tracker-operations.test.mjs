@@ -1031,6 +1031,10 @@ function pendingURLQuestion(requestId = "url-request", toolCallId = "call-url") 
   };
 }
 
+function questionEvent(type, data) {
+  return { id: uuid(), type, timestamp: new Date().toISOString(), data };
+}
+
 function writeDurableQuestion(runtime, question = pendingURLQuestion()) {
   const directory = join(
     runtime.root, "copilot-home", "session-state", runtime.copilotSessionId
@@ -1484,6 +1488,240 @@ test("cursor staging retains the newest pending question after old requests exce
   });
   await waitFor(() => readSnapshot(runtime).trackedElicitations.length === 1, "newest question not recovered");
   assert.equal(readSnapshot(runtime).trackedElicitations[0].requestId, "request-69");
+});
+
+for (const kind of ["elicitation", "user_input"]) {
+  test(`cursor staging overflow recovers older unresolved ${kind} questions`, {
+    concurrency: false,
+  }, async (t) => {
+    const runtime = await createRuntime(t, (session) => {
+      for (let index = 0; index < 70; index++) {
+        const requestId = `request-${index}`;
+        session.questionEvents.push(questionEvent(`${kind}.requested`, kind === "elicitation"
+          ? pendingURLQuestion(requestId) : { requestId, question: "Choose", choices: ["Go"] }));
+      }
+      for (let index = 20; index < 70; index++) {
+        session.questionEvents.push(questionEvent(`${kind}.completed`, { requestId: `request-${index}` }));
+      }
+    });
+    const field = kind === "elicitation" ? "trackedElicitations" : "trackedUserInputs";
+    await waitFor(() => readSnapshot(runtime)[field].length === 20, "older active questions were lost");
+    assert.deepEqual(readSnapshot(runtime)[field].map((entry) => entry.requestId),
+      Array.from({ length: 20 }, (_, index) => `request-${index}`));
+    assert.ok(runtime.activityWrites.every((snapshot) =>
+      snapshot[field].every((entry) => Number(entry.requestId.slice(8)) < 20)));
+    const reads = runtime.session.questionEventCalls.length;
+    runtime.intervalCallback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(runtime.session.questionEventCalls.length, reads + 1);
+    assert.equal(runtime.session.questionEventCalls.at(-1).cursor, "120");
+  });
+
+  test(`a losing ${kind} answer rejects its receipt without reopening the stale question`, {
+    concurrency: false,
+  }, async (t) => {
+    const runtime = await createRuntime(t);
+    const requestId = `already-answered-${kind}`;
+    const elicitation = kind === "elicitation";
+    const data = elicitation ? pendingURLQuestion(requestId)
+      : { requestId, question: "Choose", choices: ["Go"] };
+    const field = elicitation ? "trackedElicitations" : "trackedUserInputs";
+    await runtime.session.emit(`${kind}.requested`, data, {}, false);
+    runtime.intervalCallback();
+    await waitFor(() => readSnapshot(runtime)[field].length === 1, "missed question was not recovered");
+    runtime.session.elicitationHandler = runtime.session.userInputHandler = async () => ({ success: false });
+    const fields = operationFields(runtime, elicitation ? "answer-elicitation" : "answer-user-input");
+    const path = elicitation ? runtime.elicitationPath : runtime.userInputPath;
+    writeHandoff(runtime, path, {
+      schemaVersion: 1, copilotSessionId: runtime.copilotSessionId, requestId,
+      ...(elicitation ? { action: "accept", content: { url: "https://example.com" } }
+        : { answer: "Go", wasFreeform: false }),
+      ...fields,
+    });
+    trigger(runtime, `${runtime.appSessionId}.${elicitation ? "elicitation" : "user-input"}-response.json`);
+    await waitFor(() => receipt(runtime, fields.operationId)?.state === "rejected", "losing answer was not rejected");
+    assert.equal(receipt(runtime, fields.operationId).errorCode, "rpc-rejected");
+    assert.deepEqual(readSnapshot(runtime)[field], []);
+    await runtime.session.emit(`${kind}.requested`, data);
+    runtime.intervalCallback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(readSnapshot(runtime)[field], []);
+  });
+
+  test(`a live ${kind} completion frees an overflowed staging slot before the replay tail`, {
+    concurrency: false,
+  }, async (t) => {
+    let finishTail;
+    let delayed = false;
+    const runtime = await createRuntime(t, (session) => {
+      const events = Array.from({ length: 51 }, (_, index) => {
+        const requestId = `request-${index}`;
+        return questionEvent(`${kind}.requested`, kind === "elicitation"
+          ? pendingURLQuestion(requestId) : { requestId, question: "Choose", choices: ["Go"] });
+      });
+      session.questionEventHandler = async ({ cursor }) => {
+        if (cursor === undefined) {
+          return { events, cursor: "after-requests", hasMore: true, cursorStatus: "ok" };
+        }
+        if (!delayed) {
+          delayed = true;
+          return new Promise((resolve) => { finishTail = resolve; });
+        }
+        return { events: [], cursor: "tail", hasMore: false, cursorStatus: "ok" };
+      };
+    });
+    await waitFor(() => finishTail, "tail read did not pause");
+    await runtime.session.emit(`${kind}.completed`, { requestId: "request-50" });
+    finishTail({ events: [], cursor: "tail", hasMore: false, cursorStatus: "ok" });
+    const field = kind === "elicitation" ? "trackedElicitations" : "trackedUserInputs";
+    await waitFor(() => readSnapshot(runtime)[field].length === 50, "live completion hid an overflow vacancy");
+    assert.deepEqual(readSnapshot(runtime)[field].map((entry) => entry.requestId),
+      Array.from({ length: 50 }, (_, index) => `request-${index}`));
+    assert.equal(runtime.session.questionEventCalls.length, 4);
+  });
+}
+
+test("overflow replay preserves the page budget across a full retained question window", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    for (let index = 0; index < 70; index++) {
+      session.questionEvents.push(questionEvent("elicitation.requested", pendingURLQuestion(`request-${index}`)));
+    }
+    for (let index = 0; index < 3_976; index++) {
+      session.questionEvents.push(questionEvent("elicitation.completed", { requestId: `unrelated-${index}` }));
+    }
+    for (let index = 20; index < 70; index++) {
+      session.questionEvents.push(questionEvent("elicitation.completed", { requestId: `request-${index}` }));
+    }
+  });
+  let previousReads = 0;
+  for (let heartbeat = 0; heartbeat < 10; heartbeat++) {
+    await new Promise((resolve) => setImmediate(resolve));
+    const reads = runtime.session.questionEventCalls.length;
+    assert.ok(reads - previousReads <= 10, "replay exceeded the per-heartbeat page budget");
+    previousReads = reads;
+    if (readSnapshot(runtime).trackedElicitations.length === 20) break;
+    assert.deepEqual(readSnapshot(runtime).trackedElicitations, [], "published before the replay reached its tail");
+    runtime.intervalCallback();
+  }
+  assert.equal(readSnapshot(runtime).trackedElicitations.length, 20);
+  assert.equal(runtime.session.questionEventCalls.length, 82);
+  assert.ok(runtime.activityWrites.every((snapshot) =>
+    snapshot.trackedElicitations.every((entry) => Number(entry.requestId.slice(8)) < 20)));
+  runtime.intervalCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(runtime.session.questionEventCalls.at(-1).cursor, "4096");
+});
+
+test("overflow replay reselects again when later pages introduce new completions", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    for (let index = 0; index < 70; index++) {
+      session.questionEvents.push(questionEvent("elicitation.requested", pendingURLQuestion(`request-${index}`)));
+    }
+    for (let index = 0; index < 31; index++) {
+      session.questionEvents.push(questionEvent("elicitation.completed", {
+        requestId: index === 30 ? "request-69" : `unrelated-${index}`,
+      }));
+    }
+    const read = session.questionEventHandler;
+    session.questionEventHandler = async (params) => {
+      const result = await read(params);
+      if (session.questionEventCalls.length === 3) {
+        for (let index = 20; index < 70; index++) {
+          session.questionEvents.push(questionEvent("elicitation.completed", { requestId: `request-${index}` }));
+        }
+      }
+      return result;
+    };
+  });
+  await waitFor(() => readSnapshot(runtime).trackedElicitations.length === 20, "moving replay tail lost active questions");
+  assert.equal(runtime.session.questionEventCalls.length, 6);
+  assert.ok(runtime.activityWrites.every((snapshot) =>
+    snapshot.trackedElicitations.every((entry) => Number(entry.requestId.slice(8)) < 20)));
+});
+
+test("overflow replay starts at the captured cursor and stops with fifty genuinely pending questions", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await runtime.session.emit("elicitation.completed", { requestId: "old" }, {}, false);
+  runtime.intervalCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  const before = runtime.session.questionEventCalls.length;
+  for (let index = 0; index < 70; index++) {
+    await runtime.session.emit("elicitation.requested", pendingURLQuestion(`request-${index}`), {
+      timestamp: "2026-09-15T00:00:00.000Z",
+    }, false);
+  }
+  runtime.intervalCallback();
+  await waitFor(() => readSnapshot(runtime).trackedElicitations.length === 50, "bounded pending set not recovered");
+  assert.deepEqual(readSnapshot(runtime).trackedElicitations.map((entry) => entry.requestId),
+    Array.from({ length: 50 }, (_, index) => `request-${index + 20}`));
+  assert.deepEqual(runtime.session.questionEventCalls.slice(before).map((call) => call.cursor), ["1"]);
+  runtime.intervalCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(runtime.session.questionEventCalls.length, before + 2);
+  assert.equal(runtime.session.questionEventCalls.at(-1).cursor, "71");
+});
+
+for (const kind of ["elicitation", "user_input"]) {
+  test(`unrelated ${kind} completions cannot keep a full pending set replaying`, {
+    concurrency: false,
+  }, async (t) => {
+    const runtime = await createRuntime(t, (session) => {
+      for (let index = 0; index < 70; index++) {
+        session.questionEvents.push(questionEvent("elicitation.requested", pendingURLQuestion(`request-${index}`)));
+      }
+      const read = session.questionEventHandler;
+      session.questionEventHandler = async (params) => {
+        session.questionEvents.push(questionEvent(`${kind}.completed`, { requestId: uuid() }));
+        return read(params);
+      };
+    });
+    await waitFor(() => readSnapshot(runtime).trackedElicitations.length === 50, "unrelated completions prevented publication");
+    assert.equal(runtime.session.questionEventCalls.length, 1);
+    runtime.intervalCallback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(runtime.session.questionEventCalls.length, 2);
+    assert.equal(runtime.session.questionEventCalls.at(-1).cursor, "71");
+    assert.equal(readSnapshot(runtime).trackedElicitations.length, 50);
+  });
+}
+
+test("an expired overflow replay discards its old pass state and restarts retained history", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    session.questionEvents.push(questionEvent("elicitation.completed", { requestId: "old" }));
+  });
+  const history = (prefix) => [
+    ...Array.from({ length: 51 }, (_, index) =>
+      questionEvent("elicitation.requested", pendingURLQuestion(`${prefix}-${index}`))),
+    ...Array.from({ length: 31 }, (_, index) =>
+      questionEvent("elicitation.completed", { requestId: `${prefix}-${index + 20}` })),
+  ];
+  runtime.session.questionEvents.push(...history("request"));
+  const read = runtime.session.questionEventHandler;
+  let reads = 0;
+  runtime.session.questionEventHandler = async (params) => {
+    if (++reads === 2) {
+      runtime.session.questionEvents = history("retained");
+      return { events: [], cursor: "expired", hasMore: false, cursorStatus: "expired" };
+    }
+    return read(params);
+  };
+  runtime.intervalCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(readSnapshot(runtime).trackedElicitations, []);
+  assert.deepEqual(runtime.session.questionEventCalls.slice(1).map((call) => call.cursor), ["1", "1"]);
+  runtime.intervalCallback();
+  await waitFor(() => readSnapshot(runtime).trackedElicitations.length === 20, "retained questions not recovered");
+  assert.deepEqual(readSnapshot(runtime).trackedElicitations.map((entry) => entry.requestId),
+    Array.from({ length: 20 }, (_, index) => `retained-${index}`));
+  assert.deepEqual(runtime.session.questionEventCalls.slice(3).map((call) => call.cursor), [undefined, undefined]);
 });
 
 test("a duplicate live request cannot replace a polled card or reopen a completed request", {
