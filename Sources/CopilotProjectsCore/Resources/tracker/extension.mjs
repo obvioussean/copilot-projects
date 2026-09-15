@@ -1761,14 +1761,49 @@ if (validSessionId && socketPath) {
     }
 
     async function captureTaskResult(context, revision, result) {
-        if (!workflowRuntime) return;
+        const current = () => revision === workflowResultRevision && operationAuthorityCurrent(context);
+        if (!workflowRuntime || !result.turnId || !current()) return;
+        const temporary = `${taskResultPath}.${process.pid}.tmp`;
+        const saveFailure = (error) => {
+            if (!current()) return;
+            console.error("[copilot-projects] could not capture task result:", error);
+            const failure = {
+                schemaVersion: 1,
+                copilotSessionId: context.copilotSessionId,
+                conversationEpoch: context.conversationEpoch,
+                result: {
+                    turnId: result.turnId, capturedAt: new Date().toISOString(), status: result.status,
+                    summary: null, branch: null, repository: null, diff: null,
+                    checks: [], pullRequests: [],
+                    error: "Task result capture failed. Inspect the terminal for current evidence.",
+                },
+            };
+            try {
+                const encoded = JSON.stringify(failure);
+                if (Buffer.byteLength(encoded) > 256 * 1_024) throw new Error("task-result-too-large");
+                if (!current()) return;
+                writeFileSync(temporary, encoded, { mode: 0o600 });
+                if (!current()) return;
+                renameSync(temporary, taskResultPath);
+            } catch (writeError) {
+                if (!current()) return;
+                console.error(
+                    "[copilot-projects] could not persist task result failure; previous result may remain:",
+                    writeError
+                );
+            }
+        };
         const [metadata, diff] = await Promise.allSettled([
             workflowRead("session.metadata.snapshot", {}, context),
             workflowRead("session.workspaces.diff", { mode: "session" }, context),
         ]);
-        if (!operationAuthorityCurrent(context) || revision !== workflowResultRevision) return;
+        if (!current()) return;
         const snapshot = metadata.status === "fulfilled" ? metadata.value : null;
-        if (snapshot?.sessionId !== context.copilotSessionId || snapshot.isRemote !== false) return;
+        if (snapshot?.sessionId !== context.copilotSessionId || snapshot.isRemote !== false) {
+            saveFailure(metadata.status === "rejected"
+                ? metadata.reason : new Error("invalid task result session metadata"));
+            return;
+        }
         const normalizedDiff = diff.status === "fulfilled" ? boundedWorkflowDiff(diff.value) : null;
         const envelope = {
             schemaVersion: 1,
@@ -1782,15 +1817,13 @@ if (validSessionId && socketPath) {
                 error: normalizedDiff ? null : "Diff unavailable; inspect the working tree in the terminal",
             },
         };
-        const temporary = `${taskResultPath}.${process.pid}.tmp`;
         try {
             const encoded = JSON.stringify(envelope);
             if (Buffer.byteLength(encoded) > 256 * 1_024) throw new Error("task-result-too-large");
             writeFileSync(temporary, encoded, { mode: 0o600 });
             renameSync(temporary, taskResultPath);
         } catch (error) {
-            console.error("[copilot-projects] could not save task result:", error);
-            removeFile(temporary);
+            saveFailure(error);
         }
     }
 

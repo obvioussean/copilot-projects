@@ -303,9 +303,22 @@ function renderWorkflow() {
   const session = selected && sessionState.get(selected);
   const workflow = session?.workflow;
   panel.hidden = !workflow;
-  const native = workflowSupports(workspaceProtocolInfo, session, 'session-send');
-  document.querySelector('#native-prompt-controls').hidden = !native;
-  document.querySelector('#prompt-warning').textContent = native
+  const sendSupported = workflowSupports(workspaceProtocolInfo, session, 'session-send');
+  const abortSupported = workflowSupports(workspaceProtocolInfo, session, 'session-abort');
+  const enabled = (kind, target = kind) => {
+    const record = sdkOperations.recordForTarget(operationTargetContext(kind, target));
+    return writable && workflowSupports(workspaceProtocolInfo, session, kind)
+      && !['submitting', 'accepted'].includes(record?.state)
+      && (kind === 'session-abort' || record?.state !== 'indeterminate');
+  };
+  document.querySelector('#native-prompt-controls').hidden = !(sendSupported || abortSupported);
+  const mode = document.querySelector('#native-prompt-mode');
+  mode.hidden = !sendSupported;
+  mode.disabled = !writable || !sendSupported;
+  const stop = document.querySelector('#native-stop');
+  stop.hidden = !abortSupported;
+  stop.disabled = !enabled('session-abort');
+  document.querySelector('#prompt-warning').textContent = sendSupported
     ? 'Native messages keep your desktop draft unchanged.'
     : (legacyPromptSupported(workspaceProtocolInfo, session)
       ? 'Sending clears any unsent desktop draft.'
@@ -324,19 +337,12 @@ function renderWorkflow() {
     ...(workflow.agents || []).map((agent) => `${agent.name}: ${agent.description || ''}`),
     ...(workflow.schedules || [])
   ].join('\n');
-  const enabled = (kind, target = kind) => {
-    const record = sdkOperations.recordForTarget(operationTargetContext(kind, target));
-    return writable && workflowSupports(workspaceProtocolInfo, session, kind)
-      && !['submitting', 'accepted'].includes(record?.state)
-      && (kind === 'session-abort' || record?.state !== 'indeterminate');
-  };
   const request = workflow.budgetRequest;
   document.querySelector('#workflow-budget-edit').hidden = !!request;
   document.querySelector('#workflow-budget-answer').hidden = !request;
   document.querySelector('#workflow-set-limit').disabled = !enabled('set-session-budget');
   document.querySelector('#workflow-unset-limit').disabled = !enabled('set-session-budget')
     || workflow.maxAiCredits == null;
-  document.querySelector('#native-stop').disabled = !enabled('session-abort');
   if (request) {
     if (panel.dataset.budgetRequest !== request.requestId) {
       panel.open = true;

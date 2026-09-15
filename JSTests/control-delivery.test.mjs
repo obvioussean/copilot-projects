@@ -28,21 +28,37 @@ function sourceSection(start, end) {
 function client(info = protocol()) {
   const {document, FakeNode} = documentShim();
   FakeNode.prototype.replaceChildren = function(...nodes) { this.children = nodes; this._text = undefined; };
-  const node = () => {
-    const element = new FakeNode('div');
+  const node = (tag = 'div') => {
+    const element = new FakeNode(tag);
+    const listeners = new Map();
     element.classList = {toggle() {}};
     element.focus = () => {};
     element.value = '';
+    element.dataset = {};
+    element.addEventListener = (event, handler) => listeners.set(event, handler);
+    element.click = () => { if (!element.disabled) return listeners.get('click')?.(); };
     return element;
   };
-  document.querySelector = () => node();
+  const elements = new Map([
+    ['#native-prompt-controls', node()],
+    ['#native-prompt-mode', node('select')],
+    ['#native-stop', node('button')],
+  ]);
+  elements.get('#native-prompt-controls').append(
+    elements.get('#native-prompt-mode'), elements.get('#native-stop')
+  );
+  document.querySelector = selector => {
+    if (!elements.has(selector)) elements.set(selector, node());
+    return elements.get(selector);
+  };
   document.querySelectorAll = () => [];
   let uuid = 0;
   let timerID = 0;
   const timers = new Map();
   const calls = [];
   const context = loadFragments(['operations', 'control-delivery'], {
-    document, selected: 'A', writable: true, closingSession: false,
+    document, selected: 'A', selectedConversationEpoch: 'conversation-A',
+    writable: true, closingSession: false,
     selectionGeneration: 0, conversationRequestGeneration: 0,
     workspaceProtocolInfo: info,
     sessionState: new Map([
@@ -56,7 +72,7 @@ function client(info = protocol()) {
     promptQueue: node(), promptStatus: node(), promptForm: node(), prompt: node(), promptSubmit: node(),
     lease: node(), input: node(), terminal: node(), inputDeliveryNotice: node(),
     inputDeliveryText: node(), discardPendingInput: node(), QUEUE_CAP: 25,
-    updateCloseSessionState() {}, renderModelLine() {}, renderWorkflow() {},
+    updateCloseSessionState() {}, renderModelLine() {},
     RECEIPT_TIMEOUT_MS: 20000,
     newUUID: () => `00000000-0000-4000-8000-${String(++uuid).padStart(12, '0')}`,
     setTimeout: (callback, delay) => { const id = ++timerID; timers.set(id, {callback, delay}); return id; },
@@ -64,11 +80,16 @@ function client(info = protocol()) {
     control: async message => { calls.push(plain(message)); return {status: 204, ok: true}; },
   });
   context.controlDeliveries = context.createControlDeliveryAllocator();
+  context.sdkOperations = context.createOperationController({newOperationId: context.newUUID});
   vm.runInContext(sourceSection('function selectTerminalInputSession(', '// ---- Model picker'), context);
-  vm.runInContext(sourceSection('function reconcileWorkflowPrompts()', 'function clearModelOperationState('), context);
+  vm.runInContext(sourceSection('function operationContext(', 'function clearModelOperationState('), context);
   vm.runInContext(sourceSection('function updatePromptState(message)', 'function clearUserInputSubmission('), context);
+  vm.runInContext(sourceSection(
+    "document.querySelector('#native-stop')?.addEventListener(",
+    "document.querySelector('#workflow-set-limit')?.addEventListener("
+  ), context);
   return {
-    context, calls, timers,
+    context, calls, timers, elements,
     addPrompt(text, sessionId = context.selected) {
       const item = context.controlAction(context.newUUID(), 'prompt', sessionId, text);
       context.sessionQueue(sessionId, true).push(item);
@@ -89,6 +110,7 @@ async function settle() {
 
 function switchSession(context, id) {
   context.selected = id;
+  context.selectedConversationEpoch = context.sessionState.get(id)?.conversationEpoch || null;
   context.selectionGeneration += 1;
   context.conversationRequestGeneration += 1;
   context.selectTerminalInputSession(id);
@@ -194,18 +216,160 @@ test('current hosts preserve drafts and block new prompts without explicit avail
 });
 
 test('missing native tracker metadata displays the reload or Terminal remedy in the warning', () => {
-  const {context: c} = client(nativeProtocol());
+  const {context: c, elements} = client(nativeProtocol());
   c.sessionState.get('A').operationSupport = 'legacy';
-  const elements = new Map([
-    '#session-workflow', '#native-prompt-controls', '#prompt-warning',
-  ].map(selector => [selector, c.document.createElement('div')]));
-  c.document.querySelector = selector => elements.get(selector);
-  vm.runInContext(sourceSection('function renderWorkflow()', 'async function submitWorkflowAction('), c);
   c.renderWorkflow();
   assert.equal(elements.get('#session-workflow').hidden, true);
   assert.equal(elements.get('#native-prompt-controls').hidden, true);
   assert.equal(elements.get('#prompt-warning').textContent,
     'Native tracker metadata is unavailable. Reload the tracker or use Terminal.');
+});
+
+test('rendered workflow controls gate send and abort independently across capability and lease states', () => {
+  for (const {send, abort, legacyPromptFallback} of [
+    {send: false, abort: false},
+    {send: false, abort: true},
+    {send: false, abort: true, legacyPromptFallback: true},
+    {send: true, abort: false},
+    {send: true, abort: true},
+  ]) {
+    for (const writable of [false, true]) {
+      const {context: c, elements} = client(nativeProtocol());
+      Object.assign(c.sessionState.get('A'), {
+        operationSupport: 'receipts',
+        workflow: {
+          version: 1, observedAtMilliseconds: Date.now(), sendReady: true, legacyPromptFallback,
+          capabilities: [...(send ? ['session-send'] : []), ...(abort ? ['session-abort'] : [])],
+        },
+      });
+      c.writable = writable;
+      c.prompt.value = 'current draft';
+      c.updatePromptState();
+      const container = elements.get('#native-prompt-controls');
+      const mode = elements.get('#native-prompt-mode');
+      const stop = elements.get('#native-stop');
+      assert.equal(mode.tagName, 'select');
+      assert.equal(stop.tagName, 'button');
+      assert.ok(container.children.includes(mode) && container.children.includes(stop));
+      assert.equal(container.hidden, !(send || abort));
+      assert.equal(mode.hidden, !send);
+      assert.equal(mode.disabled, !writable || !send);
+      assert.equal(stop.hidden, !abort);
+      assert.equal(stop.disabled, !writable || !abort);
+      assert.equal(c.promptSubmit.disabled, !writable || !(send || legacyPromptFallback === true));
+      assert.equal(elements.get('#prompt-warning').textContent, send
+        ? 'Native messages keep your desktop draft unchanged.'
+        : (legacyPromptFallback === true
+          ? 'Sending clears any unsent desktop draft.'
+          : 'Native tracker metadata is unavailable. Reload the tracker or use Terminal.'));
+    }
+  }
+});
+
+test('session switches reset rendered child controls before the missing-workflow early return', () => {
+  const {context: c, elements} = client(nativeProtocol());
+  Object.assign(c.sessionState.get('A'), {
+    operationSupport: 'receipts',
+    workflow: {version: 1, observedAtMilliseconds: Date.now(), sendReady: true,
+      capabilities: ['session-send', 'session-abort']},
+  });
+  c.updatePromptState();
+  const mode = elements.get('#native-prompt-mode');
+  const stop = elements.get('#native-stop');
+  assert.equal(stop.disabled, false);
+  assert.equal(mode.disabled, false);
+  switchSession(c, 'B');
+  c.updatePromptState();
+  assert.equal(elements.get('#native-prompt-controls').hidden, true);
+  assert.equal(mode.hidden, true);
+  assert.equal(mode.disabled, true);
+  assert.equal(stop.hidden, true);
+  assert.equal(stop.disabled, true);
+  switchSession(c, 'A');
+  c.writable = false;
+  c.updatePromptState();
+  assert.equal(elements.get('#native-prompt-controls').hidden, false);
+  assert.equal(mode.hidden, false);
+  assert.equal(mode.disabled, true);
+  assert.equal(stop.hidden, false);
+  assert.equal(stop.disabled, true);
+});
+
+test('the rendered Stop button dispatches independently of in-flight and uncertain native sends', async () => {
+  for (const uncertain of [false, true]) {
+    const {context: c, calls, elements} = client(nativeProtocol());
+    Object.assign(c.sessionState.get('A'), {
+      operationSupport: 'receipts',
+      workflow: {version: 1, observedAtMilliseconds: Date.now(), sendReady: true,
+        capabilities: ['session-send', 'session-abort']},
+    });
+    let finishSend;
+    c.control = message => {
+      calls.push(plain(message));
+      return message.type === 'session-send'
+        ? new Promise(resolve => { finishSend = resolve; }) : Promise.resolve({status: 204});
+    };
+    c.enqueuePrompt('unresolved native send');
+    if (uncertain) {
+      finishSend(null);
+      await settle();
+    }
+    c.renderWorkflow();
+    const stop = elements.get('#native-stop');
+    assert.equal(elements.get('#native-prompt-controls').hidden, false);
+    assert.equal(stop.hidden, false);
+    assert.equal(stop.disabled, false);
+    await stop.click();
+    assert.deepEqual(calls.map(message => message.type), ['session-send', 'session-abort']);
+    assert.equal(calls[1].sessionId, 'A');
+    assert.equal(calls[1].conversationEpoch, 'conversation-A');
+    assert.notEqual(calls[1].requestId, calls[0].requestId);
+    assert.deepEqual(JSON.parse(calls[1].data), {kind: 'session-abort'});
+    assert.equal(stop.disabled, true, 'the Stop action still waits for its own receipt');
+    await stop.click();
+    assert.equal(calls.length, 2);
+    assert.equal(c.sessionQueue('A')[0].id, calls[0].requestId);
+    if (!uncertain) {
+      finishSend(null);
+      await settle();
+    }
+  }
+});
+
+test('abort-only rendering keeps the existing explicit retry guard for an unknown Stop outcome', async () => {
+  const {context: c, calls, elements} = client(nativeProtocol());
+  Object.assign(c.sessionState.get('A'), {
+    operationSupport: 'receipts',
+    workflow: {version: 1, observedAtMilliseconds: Date.now(), sendReady: false,
+      capabilities: ['session-abort'], legacyPromptFallback: true},
+  });
+  c.prompt.value = 'legacy composer draft';
+  c.updatePromptState();
+  assert.equal(c.promptSubmit.disabled, false);
+  assert.equal(elements.get('#prompt-warning').textContent, 'Sending clears any unsent desktop draft.');
+  const previous = c.sdkOperations.prepare({
+    sessionId: 'A', conversationEpoch: 'conversation-A', support: 'receipts',
+    kind: 'session-abort', targetId: 'session-abort', payloadContext: null,
+  });
+  c.renderWorkflow();
+  const stop = elements.get('#native-stop');
+  assert.equal(stop.hidden, false);
+  assert.equal(stop.disabled, true);
+  c.sdkOperations.markHostAccepted(previous.record.operationId);
+  c.renderWorkflow();
+  assert.equal(stop.disabled, true);
+  c.sdkOperations.markIndeterminate(previous.record.operationId);
+  c.renderWorkflow();
+  assert.equal(elements.get('#native-prompt-controls').hidden, false);
+  assert.equal(elements.get('#native-prompt-mode').hidden, true);
+  assert.equal(stop.disabled, false);
+  await stop.click();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].type, 'session-abort');
+  assert.notEqual(calls[0].requestId, previous.record.operationId);
+  assert.equal(stop.disabled, true);
+  assert.equal(c.prompt.value, 'legacy composer draft');
+  assert.equal(c.sessionQueue('A').length, 0);
 });
 
 test('explicit available fallback remains usable before or after the inner observation TTL', async () => {
