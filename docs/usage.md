@@ -171,11 +171,34 @@ copilot-projects ping            # -> pong
 
 ### Cutting a release
 
+The [Release workflow](../.github/workflows/release.yml) is the primary publisher.
+It automatically publishes the next patch version for eligible PR merges to `main`.
+To publish a specific new version, dispatch the workflow from `main`:
+
+```bash
+gh workflow run release.yml \
+  --repo sirfergy/copilot-projects \
+  --ref main \
+  -f version=X.Y.Z
+```
+
+Replace `X.Y.Z` with an unused semantic version. The workflow runs validation and
+tests before entering the protected `release` environment for signing and publishing.
+
+#### Local builds and fallback publishing
+
 `scripts/release.sh` builds an Apple Silicon optimized app and drag-to-Applications DMG.
-Publishing requires a Developer ID identity and a `notarytool` Keychain profile:
 
 ```bash
 ./scripts/release.sh 0.1.0             # -> dist/Copilot-Projects-0.1.0.dmg (local only)
+```
+
+Use direct script publishing only as a fallback when the Actions runner or signing
+configuration is unavailable. Run the release validation and tests first; this path
+does not run the workflow's validation job or protected environment approvals.
+It requires a Developer ID identity and a `notarytool` Keychain profile:
+
+```bash
 CODESIGN_IDENTITY="Developer ID Application: …" \
 NOTARY_PROFILE="copilot-projects-notary" \
 ./scripts/release.sh 0.1.0 --publish
@@ -464,4 +487,5 @@ hooks.
 
 ## License
 
-MIT.
+[MIT](../LICENSE). The bundled `dtach` helper is licensed under GPLv2; its source is
+included in [`vendor/dtach`](../vendor/dtach).
