@@ -4,7 +4,14 @@ A native macOS terminal workspace for keeping coding-agent sessions organized.
 Projects live in the sidebar, sessions live in tabs, and status indicators tell
 you what is running, what needs input, and what finished while you were away.
 
-![Copilot Projects showing a project sidebar and terminal tabs](docs/screenshot.png)
+<table>
+  <tr>
+    <td><img src="docs/project-status.png" alt="Current project rows showing running, waiting, and ready status indicators" width="360"></td>
+    <td><img src="docs/task-result.png" alt="Current session details showing a completed task summary, branch, and executed-checks disclosure" width="560"></td>
+  </tr>
+</table>
+
+Current native UI previews with illustrative sample data—not a full-window screenshot.
 
 ## Install
 
@@ -38,17 +45,6 @@ distribution rather than replacing it with the standalone download.
 Copilot CLI hooks and a local tracker supply automatic status and session
 details. Other command-line tools work as ordinary terminal sessions and can
 report status through the CLI.
-
-### A closer look
-
-<table>
-  <tr>
-    <td><img src="docs/project-status.png" alt="Sample projects showing running, waiting, and ready status indicators" width="360"></td>
-    <td><img src="docs/task-result.png" alt="Session details showing a completed task summary, branch, and executed-checks disclosure" width="560"></td>
-  </tr>
-</table>
-
-These native-view snapshots use illustrative sample data, not a live workspace.
 
 ## Everyday controls
 
