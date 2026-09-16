@@ -2,6 +2,7 @@
 """Exercise the release entrypoint without building, signing, or network access."""
 
 import json
+import importlib.util
 import os
 from pathlib import Path
 import shutil
@@ -13,6 +14,9 @@ import unittest
 
 RELEASE = Path(__file__).with_name("release.sh")
 REAL_GIT = shutil.which("git")
+KEYCHAIN_SPEC = importlib.util.spec_from_file_location("keychain_search", RELEASE.with_name("keychain-search.py"))
+keychain_search = importlib.util.module_from_spec(KEYCHAIN_SPEC)
+KEYCHAIN_SPEC.loader.exec_module(keychain_search)
 MOCK = r"""#!/usr/bin/env python3
 import json
 import os
@@ -449,6 +453,62 @@ class ReleaseTests(unittest.TestCase):
         result = self.run_release()
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("tag v1.2.3 already exists", result.stdout)
+
+
+class KeychainSearchTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="keychain-search-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.existing = self.root / "existing public.keychain-db"
+        self.job = self.root / "job signing.keychain-db"
+        self.existing.touch()
+        self.job.touch()
+        self.state = [str(self.existing)]
+        self.writes = []
+
+    def execute(self, *args):
+        if "-s" in args:
+            self.writes.append(list(args))
+            self.state = list(args[args.index("-s") + 1:])
+            return ""
+        self.assertEqual(args, ("security", "list-keychains", "-d", "user"))
+        return "".join("    " + json.dumps(path) + "\n" for path in self.state)
+
+    def test_register_preserves_quoted_paths_and_is_idempotent(self):
+        keychain_search.register_keychain(str(self.job), self.execute)
+        self.assertEqual(self.writes, [[
+            "security", "list-keychains", "-d", "user", "-s", str(self.existing), str(self.job),
+        ]])
+        keychain_search.register_keychain(str(self.job), self.execute)
+        self.assertEqual(len(self.writes), 1)
+
+    def test_empty_malformed_or_relative_lists_never_reach_the_setter(self):
+        for raw in (
+            "", '    "/broken\n', '"relative.keychain-db"\n', '"/tmp/a" "/tmp/b"\n',
+            '    "/Users/sean/Library/Keychains/    "/Users/sean/Library/Keychains/login.keychain-db"\n',
+        ):
+            with self.subTest(raw=raw):
+                def execute(*args):
+                    self.assertNotIn("-s", args)
+                    return raw
+                with self.assertRaises(ValueError):
+                    keychain_search.register_keychain(str(self.job), execute)
+
+    def test_missing_job_keychain_never_changes_the_search_list(self):
+        self.job.unlink()
+        with self.assertRaisesRegex(ValueError, "already exist"):
+            keychain_search.register_keychain(str(self.job), self.execute)
+        self.assertEqual(self.writes, [])
+
+    def test_concurrent_removal_is_bounded_and_fails_visibly(self):
+        def execute(*args):
+            if "-s" in args:
+                self.writes.append(args)
+            return "    " + json.dumps(str(self.existing)) + "\n"
+        with self.assertRaisesRegex(RuntimeError, "Concurrent"):
+            keychain_search.register_keychain(str(self.job), execute)
+        self.assertEqual(len(self.writes), 3)
 
 
 if __name__ == "__main__":

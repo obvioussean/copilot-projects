@@ -208,9 +208,13 @@ NOTARY_PROFILE="copilot-projects-notary" \
 
 On shared build machines, set `CODESIGN_KEYCHAIN` to the job's signing keychain
 and `NOTARY_KEYCHAIN` to the keychain containing its notarization profile.
-Signing then uses the explicit keychain for identity discovery, app/helpers, and
-the DMG without replacing the user's keychain search list. Leaving
-`CODESIGN_KEYCHAIN` unset preserves the existing local signing behavior.
+Signing then uses that keychain for identity discovery, app/helpers, and the DMG.
+The signing keychain must also be registered in the invoking user's search list:
+`codesign --keychain` narrows identity selection but does not enable unlisted
+keychains. The Release workflow safely appends its job keychain, verifies a real
+signature before building, and deletes only that keychain afterward. Independent
+signing pipelines should use separate macOS accounts to avoid sharing keychain
+preferences. Leaving `CODESIGN_KEYCHAIN` unset preserves local signing behavior.
 
 Publishing requires a clean checkout whose HEAD is reachable from `origin/main`.
 The configured `GITHUB_REPOSITORY` (default `sirfergy/copilot-projects`) must match
