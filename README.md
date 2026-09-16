@@ -39,6 +39,17 @@ Copilot CLI hooks and a local tracker supply automatic status and session
 details. Other command-line tools work as ordinary terminal sessions and can
 report status through the CLI.
 
+### A closer look
+
+<table>
+  <tr>
+    <td><img src="docs/project-status.png" alt="Sample projects showing running, waiting, and ready status indicators" width="360"></td>
+    <td><img src="docs/task-result.png" alt="Session details showing a completed task summary, branch, and executed-checks disclosure" width="560"></td>
+  </tr>
+</table>
+
+These native-view snapshots use illustrative sample data, not a live workspace.
+
 ## Everyday controls
 
 | Action | Shortcut |
