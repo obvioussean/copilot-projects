@@ -3,6 +3,29 @@ import AppKit
 import CopilotProjectsProtocol
 import CopilotProjectsUI
 
+enum TranscriptDrawerRow: Identifiable {
+    case turn(TranscriptTurn)
+    case result(RemoteTaskResult)
+
+    var id: String {
+        switch self {
+        case .turn(let turn): "turn-\(turn.id)"
+        case .result(let result): "result-\(result.turnId)"
+        }
+    }
+
+    static func make(turns: [TranscriptTurn], latestResult: RemoteTaskResult?) -> [Self] {
+        var rows: [Self] = []
+        for turn in turns {
+            rows.append(.turn(turn))
+            if let latestResult, latestResult.turnId == turn.id {
+                rows.append(.result(latestResult))
+            }
+        }
+        return rows
+    }
+}
+
 struct TranscriptOverlay: View {
     @ObservedObject var controller: TranscriptController
     let isOpen: Bool
@@ -77,11 +100,13 @@ private struct TranscriptDrawer: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
-                        ForEach(turns) { turn in
-                            TranscriptTurnCard(turn: turn)
-                        }
-                        if let latestResult {
-                            TaskResultView(result: latestResult)
+                        ForEach(TranscriptDrawerRow.make(turns: turns, latestResult: latestResult)) { row in
+                            switch row {
+                            case .turn(let turn):
+                                TranscriptTurnCard(turn: turn)
+                            case .result(let result):
+                                TaskResultView(result: result)
+                            }
                         }
                         Color.clear
                             .frame(height: 1)

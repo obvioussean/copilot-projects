@@ -91,6 +91,8 @@ Simple check commands need structured shell-exit metadata; a successful tool cal
 an asynchronous shell, or an assistant's assertion does not prove tests passed.
 The latest result is kept in one bounded private sidecar, not copied into every
 historical turn. Streaming text replaces its matching final message.
+In the desktop drawer, the result stays immediately after the turn that produced it,
+before newer prompts, rather than remaining at the bottom of the conversation.
 
 **Usage and background work** shows accumulated session AI credits, the latest
 context observation, active agents, and schedules. Session totals and the current
