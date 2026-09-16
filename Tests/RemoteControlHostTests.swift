@@ -1,7 +1,7 @@
 import XCTest
 import AppKit
 import CopilotProjectsProtocol
-@testable import copilot_projects
+@testable import CopilotProjectsHost
 
 final class RemoteControlHostTests: XCTestCase {
     private final class PromptState {
@@ -123,66 +123,6 @@ final class RemoteControlHostTests: XCTestCase {
             first.model.remoteControlDeliveryEpoch
         )
         XCTAssertEqual(RemoteProtocolInfo.current.controlDeliverySupport, .legacy)
-    }
-
-    @MainActor
-    func testLeaseTakeoverAcknowledgesExactReplayButBlocksNewInjection() throws {
-        let harness = try makeHarness()
-        defer { try? FileManager.default.removeItem(at: harness.root) }
-        let bridge = RemoteModelBridge(model: harness.model)
-        let leases = RemoteWriterLeases()
-        leases.acquire(sessionId: harness.session.id, clientId: "client")
-        var injections = 0
-        func submit(_ request: RemoteClientMessage) -> RemoteControlResult {
-            bridge.performControl(request) {
-                leases.withHeldLease(sessionId: harness.session.id, clientId: "client") {
-                    injections += 1
-                    return RemoteControlResult.sent
-                } ?? .forbidden
-            }
-        }
-        let accepted = message(harness)
-        XCTAssertEqual(submit(accepted), .sent)
-        leases.acquire(sessionId: harness.session.id, clientId: "takeover")
-        XCTAssertEqual(submit(accepted), .sent)
-        let next = message(harness, sequence: 2)
-        XCTAssertEqual(submit(next), .forbidden)
-        XCTAssertEqual(injections, 1)
-        leases.acquire(sessionId: harness.session.id, clientId: "client")
-        XCTAssertEqual(submit(next), .sent)
-        XCTAssertEqual(injections, 2)
-    }
-
-    @MainActor
-    func testPromptReplayPrecedesSubmissionThrottleAndTakeover() throws {
-        let harness = try makeHarness()
-        defer { try? FileManager.default.removeItem(at: harness.root) }
-        let bridge = RemoteModelBridge(model: harness.model)
-        let leases = RemoteWriterLeases()
-        let now = Date()
-        leases.acquire(sessionId: harness.session.id, clientId: "client")
-        func submit(_ request: RemoteClientMessage) -> RemoteControlResult {
-            bridge.performControl(request) {
-                RemoteControlResult(leases.submitPrompt(
-                    sessionId: harness.session.id, clientId: "client", now: now
-                ) {
-                    bridge.sendPrompt(sessionId: harness.session.id, value: request.data!)
-                })
-            }
-        }
-        let accepted = message(harness, kind: "prompt")
-        XCTAssertEqual(submit(accepted), .sent)
-        XCTAssertEqual(submit(accepted), .sent)
-        let next = message(harness, kind: "prompt", sequence: 2, data: "next")
-        XCTAssertEqual(submit(next), .busy)
-        leases.acquire(sessionId: harness.session.id, clientId: "takeover")
-        XCTAssertEqual(submit(accepted), .sent)
-        XCTAssertEqual(submit(next), .forbidden)
-        XCTAssertEqual(harness.prompt.values, ["hello"])
-        leases.acquire(sessionId: harness.session.id, clientId: "client")
-        leases.observePromptUnavailable(sessionId: harness.session.id, observedAt: now)
-        XCTAssertEqual(submit(next), .sent)
-        XCTAssertEqual(harness.prompt.values, ["hello", "next"])
     }
 
     @MainActor

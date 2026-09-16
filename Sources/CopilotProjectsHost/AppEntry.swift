@@ -44,10 +44,8 @@ struct CopilotProjectsApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let model: AppModel
     private let nativeNotifications: NotificationManager
-    private let webPushService: WebPushService?
-    private let apnsService: APNsService?
-    private let notificationSync: NotificationSyncService
-    private let notifications: RoutedNotificationPoster
+    private let integration: (any HostIntegration)?
+    private let notifications: HostNotificationPoster
     private let instanceLock = AppInstanceLock()
     private var isPrimaryInstance = false
     private var eventMonitor: Any?
@@ -56,41 +54,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     override init() {
         let native = NotificationManager()
-        let email = UserDefaults.standard.string(
-            forKey: RemoteAccessConfiguration.allowedEmailKey
-        )
-        let webPush: WebPushService?
-        if let email {
-            do {
-                webPush = try WebPushService.production(contactEmail: email)
-            } catch {
-                webPush = nil
-                NSLog("copilot-projects: web push unavailable: %@", "\(error)")
-            }
-        } else {
-            webPush = nil
-        }
-        let apns: APNsService?
-        do {
-            apns = try APNsService.production()
-        } catch {
-            apns = nil
-            NSLog("copilot-projects: APNs unavailable: %@", "\(error)")
-        }
+        let model = AppModel()
+        let integration = HostIntegrationRegistry.factory(RemoteModelBridge(model: model))
         nativeNotifications = native
-        webPushService = webPush
-        apnsService = apns
-        let sync = NotificationSyncService(
-            webPushService: webPush,
-            apnsService: apns
-        )
-        notificationSync = sync
-        notifications = RoutedNotificationPoster(native: native, sync: sync)
-        model = AppModel(
-            webPushService: webPush,
-            apnsService: apns,
-            notificationSync: sync
-        )
+        self.integration = integration
+        notifications = HostNotificationPoster(native: native, integration: integration)
+        self.model = model
+        model.attach(integration: integration)
         super.init()
     }
 
@@ -99,7 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWindow.allowsAutomaticWindowTabbing = false
 
         guard instanceLock.acquire() else {
-            webPushService?.shutdown()
+            integration?.shutdown()
             focusExistingInstance()
             NSApp.terminate(nil)
             return
@@ -110,11 +80,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         nativeNotifications.onActivate = { [weak self] projectId, sessionId in
             self?.model.focus(projectId: projectId, sessionId: sessionId)
         }
-        let sync = notificationSync
-        nativeNotifications.onResolve = { [weak sync] id in
-            sync?.dismiss(NotificationDismissRequest(id: id))
+        let integration = self.integration
+        nativeNotifications.onResolve = { [weak integration] id in
+            integration?.dismissNotification(id)
         }
-        notificationSync.clearLocalNotification = { [weak self] id in
+        integration?.clearLocalNotification = { [weak self] id in
             self?.nativeNotifications.remove(id: id)
         }
         nativeNotifications.requestAuth()
@@ -135,7 +105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.bootstrapIfNeeded()
         model.startLivenessReconciler()
         model.startAgentActivityTracking()
-        model.startRemoteAccessIfEnabled()
+        model.startIntegration()
         requestMicrophoneAccessIfNeeded()
         let env = ProcessInfo.processInfo.environment
         if Env.shouldInstallGlobalIntegration(env) {
@@ -357,7 +327,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard isPrimaryInstance else { return }
         model.beginTermination()
         model.forcePendingSessionDestroys()
-        webPushService?.shutdown()
+        integration?.shutdown()
         model.detachAllClients()   // keep dtach masters alive for resume
         model.stopServer()
         model.save()
@@ -376,7 +346,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             await self.model.detachAllClientsAndDrain()
             await self.model.flushKittyImagePersistence()
-            await self.webPushService?.shutdownAndWait()
+            await self.integration?.shutdownAndWait()
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater

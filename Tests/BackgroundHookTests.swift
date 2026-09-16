@@ -1,6 +1,6 @@
 import XCTest
 import CopilotProjectsCore
-@testable import copilot_projects
+@testable import CopilotProjectsHost
 
 final class BackgroundHookTests: XCTestCase {
     final class Fixture {

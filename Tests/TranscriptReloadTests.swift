@@ -1,7 +1,7 @@
 import XCTest
 import CopilotProjectsCore
 import CopilotProjectsProtocol
-@testable import copilot_projects
+@testable import CopilotProjectsHost
 
 final class TranscriptReloadTests: XCTestCase {
     private func writeSnapshot(sessionId: String, updatedAt: Date) throws {

@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import copilot_projects
+@testable import CopilotProjectsHost
 
 final class ImagePersistenceOptimizationTests: XCTestCase {
     @MainActor

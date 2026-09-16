@@ -2,7 +2,7 @@ import Foundation
 import CryptoKit
 import CopilotProjectsProtocol
 
-enum RemoteControlKind: String, CaseIterable {
+public enum RemoteControlKind: String, CaseIterable, Sendable {
     case prompt
     case input
     case key
@@ -16,7 +16,7 @@ enum RemoteControlKind: String, CaseIterable {
     var lane: Lane { self == .prompt ? .prompt : .terminal }
 }
 
-enum RemoteControlResult: Equatable {
+public enum RemoteControlResult: Equatable, Sendable {
     case sent
     case missing
     case invalid
@@ -28,7 +28,7 @@ enum RemoteControlResult: Equatable {
     case fingerprintConflict
     case capacityExceeded
 
-    init(_ result: RemoteTerminalInputResult) {
+    public init(_ result: RemoteTerminalInputResult) {
         switch result {
         case .sent: self = .sent
         case .missing: self = .missing
@@ -36,7 +36,7 @@ enum RemoteControlResult: Equatable {
         }
     }
 
-    init(_ result: RemoteCommandResult) {
+    public init(_ result: RemoteCommandResult) {
         switch result {
         case .sent: self = .sent
         case .missing: self = .missing
@@ -45,7 +45,7 @@ enum RemoteControlResult: Equatable {
         }
     }
 
-    init(_ result: RemotePromptResult) {
+    public init(_ result: RemotePromptResult) {
         switch result {
         case .sent: self = .sent
         case .forbidden: self = .forbidden

@@ -2,7 +2,7 @@ import AppKit
 import XCTest
 import CopilotProjectsCore
 import CopilotProjectsProtocol
-@testable import copilot_projects
+@testable import CopilotProjectsHost
 
 final class SessionWorkflowTests: XCTestCase {
     func testActionValidationIsClosedAndBudgetLimitsAreExplicit() throws {

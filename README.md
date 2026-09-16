@@ -6,6 +6,10 @@ out horizontally. It keeps the parts of [cmux](https://github.com/manaflow-ai/cm
 matter most for working with coding agents — **status indicators** and **notifications** —
 and drops everything else.
 
+This repository builds the standalone desktop app. Web access, tunnel authentication,
+and remote push delivery are optional integrations maintained and built separately;
+they are not dependencies or resources of the public desktop distribution.
+
 ![Copilot Projects — vertical project sidebar, terminal sessions as horizontal tabs](docs/screenshot.png)
 
 It replaces cmux's Ghostty integration with
@@ -31,11 +35,8 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
 - **Schedules + background work:** queued scheduled prompts show a clock with cadence/next-run
   details; active scheduled turns and subagents use a separate background indicator instead of
   making the foreground session look busy.
-- **Private remote control:** expose a mobile web terminal behind Cloudflare Access + GitHub SSO,
-  with scrollback, safe clickable links, project/session status, live screen snapshots, and a
-  single remote writer lease.
-  The tracker also reads question events on its five-second heartbeat, so a missed live
-  notification does not leave iOS and web transcript forms stuck on **Open terminal**.
+- **Question recovery:** the tracker also reads question events on its five-second heartbeat,
+  so a missed live notification does not leave clients stuck on **Open terminal**.
   Text, choices, and other supported forms use the original response ID. This works with
   the existing CLI event API; no new CLI version is required for missed-event recovery.
   An optional pending-question snapshot API also recovers older prompts on supporting CLIs.
@@ -46,13 +47,12 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
 - **Notifications:** native macOS banners identify the originating project/session and
   automatically alert when Copilot has a question, needs permission, or finishes a task.
   Task completions include a short, plain-text preview of the completed turn's response
-  on Mac, native iOS, and web push. Previews are derived locally (no extra model call),
+  on Mac. Optional integrations receive the same event. Previews are derived locally (no extra model call),
   omit code blocks, and fall back to the generic alert when the matching transcript
   is unavailable. Response previews can appear on your devices' lock screens.
-  Clicking one focuses that session. Remote web push provides the same timestamped events to
-  subscribed browsers and installed iPhone/iPad Home Screen apps. Unread sessions get a bell
+  Clicking one focuses that session. Unread sessions get a bell
   badge + a Dock badge count. Completed tabs show one blue attention dot, not two.
-  Returning to the Mac app marks the selected session read across devices without
+  Returning to the Mac app marks the selected session read without
   needing to switch tabs.
 - **Control socket + CLI:** the same `copilot-projects` binary is also a CLI that talks to the
   running app over a Unix socket — ideal for agent hooks.
@@ -62,14 +62,14 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
   from another host.
 - **Persistence:** projects/sessions are restored on relaunch.
 - **Window lifetime:** closing the last window quits by default. Enable **Keep Running When
-  Window Closes** to keep remote access and sessions available from the menu bar; Dock reopen,
+  Window Closes** to keep sessions available from the menu bar; Dock reopen,
   menu-bar Open, notifications, and CLI focus all restore the main window. **Quit Copilot
   Projects** still performs the normal graceful detach and persistence drain.
 
 ## Native session workflows
 
 With Copilot CLI 1.0.84 or newer on SDK protocol 3, the tracker offers native
-session controls through the existing private gateway. iOS and web composers
+session controls to the desktop and optional integrations. Separately built iOS and web composers
 can **Run after current task** or **Steer current task** without clearing the
 desktop CLI draft. **Stop task** requests cancellation without closing the tab,
 shell, or dtach session. Terminal controls remain available for other TUIs and
@@ -98,7 +98,7 @@ budget accounting window are deliberately separate. Users can opt into an AI-cre
 soft limit (minimum 30), remove it, or answer a live exhausted-budget request by
 adding credits or cancelling the blocked model request. There is no default limit.
 Limits are checked by Copilot after model calls and can be exceeded by the last
-call. A new budget request sends the existing Mac/APNs/web notification flow.
+call. A new budget request sends a Mac notification and an event to any installed integration.
 
 Capabilities require fresh runtime evidence; unsupported or unavailable operations
 stay disabled. A host advertising native workflows treats missing session workflow
@@ -141,16 +141,16 @@ Requires Xcode 26+, macOS 26+.
 
 `build-app.sh` runs `swift build`, assembles `dist/Copilot Projects.app`, precompiles
 SwiftTerm's Metal shaders, and signs the nested executables inner-first. Local builds
-default to ad-hoc signing; set `CODESIGN_IDENTITY` for Developer ID signing.
+use an available Developer ID identity, falling back to ad-hoc signing. Set
+`CODESIGN_IDENTITY=-` to force ad-hoc signing for a validation build.
 
 The runtime assets are regular SwiftPM resources rather than embedded Swift literals. The
-tracker remains one atomic `extension.mjs` install, while the PWA is assembled from reviewed
-HTML/CSS/JavaScript files. The session-status rules live in the headless `SessionDomain`
+tracker remains one atomic `extension.mjs` install. The session-status rules live in the headless `SessionDomain`
 package, and the Mac/iOS/PWA protocol examples share `ContractFixtures`.
 
 ```bash
 swift test --package-path Packages/SessionDomain
-./scripts/check-web-assets.sh
+./scripts/check-tracker.sh
 swift test
 CODESIGN_IDENTITY=- ./scripts/build-app.sh --release
 ./scripts/verify-app-resources.sh
@@ -213,9 +213,6 @@ copilot-projects list-status
 copilot-projects new-project myapp                # name only; --cwd optional
 copilot-projects new-session --project <id> --cwd /tmp
 copilot-projects focus --session <id>             # bring app forward + select
-copilot-projects remote enable                    # enable the Cloudflare Access origin
-copilot-projects remote status                    # print its private URL and state
-copilot-projects remote disable
 copilot-projects doctor                           # diagnose state/session/runtime health
 copilot-projects version                          # print installed version
 copilot-projects install-hooks                    # wire up Copilot CLI status hooks
@@ -231,130 +228,25 @@ replaced atomically. Conflicting regular files and directories are refused: move
 aside yourself or choose a different `--dir`. The app's automatic
 launcher setup and the first step of `install-hooks` use the same behavior.
 
-### Remote access
+### Optional integrations
 
-Remote access is opt-in. The local gateway listens on `127.0.0.1:49272`; a separately managed
-Cloudflare Tunnel maps the protected public hostname to that origin:
+The standard app is desktop-only: it includes no HTTP listener, web client,
+Cloudflare integration, APNs provider, or web-push service.
+The `remote` CLI command reports that the integration is unavailable and leaves
+previously saved remote settings unchanged.
 
-```bash
-# Configure the Cloudflare Access application, then relaunch the app.
-defaults write com.obvioussean.copilot-projects remoteAccess.hostname "projects.example.com"
-defaults write com.obvioussean.copilot-projects remoteAccess.cloudflareTeamDomain \
-  "your-team.cloudflareaccess.com"
-defaults write com.obvioussean.copilot-projects remoteAccess.cloudflareAudience "your-access-aud-tag"
-defaults write com.obvioussean.copilot-projects remoteAccess.allowedEmail "you@example.com"
+`CopilotProjectsHost` is also a Swift package product. An integrating application
+calls `CopilotProjectsApplication.run(makeIntegration:checkIntegrationAssets:)`
+to register its optional `HostIntegration` before SwiftUI creates the app delegate.
+The typed `SessionHost` boundary keeps live terminals, transcript/image capture,
+and replay-safe session mutations owned by the desktop host. CLI-only invocations
+do not construct an integration.
 
-copilot-projects remote enable
-copilot-projects remote status
-```
-
-All four settings are required. Remote access fails closed and remains disabled when any setting
-is missing.
-
-When enabled, the status command prints the protected URL. Cloudflare Access performs GitHub SSO at the edge,
-then injects a signed identity JWT into each forwarded request. The app independently verifies
-that JWT's RS256 signature, issuer, audience, expiration, and allowed email; it also requires the
-expected host and same-origin POSTs. Direct requests to the localhost origin without a valid
-Access token are rejected.
-
-The native iOS client signs in through the system authentication browser so GitHub passkeys are
-available. After Cloudflare verifies the user, `/auth/ios` encrypts the verified application JWT
-to an ephemeral key generated by that specific login attempt before returning it to the app.
-The bearer token is never placed in the callback URL in plaintext. Deploy the gateway update
-before distributing an iOS build that uses this route; older iOS clients continue to work.
-
-The mobile web client can list projects, select a terminal, and acquire the single remote writer
-lease. Amber session indicators identify questions and permission prompts; blue indicators mark
-unseen completed work or notifications. Project badges and the **Needs attention** count let you
-scan the workspace, and **Next** cycles through waiting sessions before unseen activity. A banner
-links to the question or terminal without changing your view when an update arrives. **Mark seen**
-clears unseen activity across devices, just as viewing the session on the Mac does; it never
-dismisses a pending question.
-Its Markdown-rendered completed-turn pane mirrors the desktop drawer and includes a message
-composer with per-session drafts that survive session switches and reloads. Sending is enabled only
-when a fresh server-side check confirms Copilot is alive and its foreground prompt is idle,
-with no pending question or permission prompt. Background work can continue while the foreground
-is ready; sending clears any unsent desktop draft before submitting the message through
-the native CLI input path. The full terminal remains available for permissions and other TUI
-interactions, with an on-screen Enter key alongside the other terminal controls. Remote clients do
-not resize the PTY because dtach shares one terminal size with the desktop.
-
-Updated clients negotiate `replay-safe-control` and a host-lifetime delivery epoch.
-Prompt, input, key, and command retries retain their request ID and ordered delivery
-sequence; an acknowledged prompt is removed from its original queue even after a tab
-switch. The host acknowledges an exact replay without injecting it again. This is
-replay-safe host acceptance, not proof that a shell command or Copilot turn finished.
-
-A host restart, expired receipt, or ambiguous reply from an older host pauses delivery
-instead of blindly repeating an action. Inspect the terminal before using **Discard
-queued input** to continue; discarding does not retract input already accepted by the
-host. Tab switches discard undispatched typing but retain an uncertain terminal
-write for its originating session until acknowledged or explicitly discarded. An
-uncertain queued prompt stays visible until removed; automatic replay requires a
-known, unchanged conversation epoch. Older clients remain compatible, but need
-updating (or a web-page reload) to gain replay-safe delivery.
-
-The header's **New Session** controls let the remote user choose any project without changing the
-Mac's selected project or tab. Creation is idempotent: the client generates one request id per
-chosen project, retained across a network/5xx retry and cleared on success or when the host reports
-the earlier session was already created and closed. The new session opens `$HOME/Repos` and
-launches Copilot once on its fresh dtach master (resolving the CLI from an explicit override, then
-`$HOME/.local/bin/copilot`, then the app's `PATH`). App-managed launches and resumes pass
-`--no-remote --no-remote-export`: Copilot Projects remains their remote control plane and the
-session does not depend on GitHub's remote event storage, including when a resumed session
-previously persisted remote steering. The host records each creation in a private, bounded ledger
-and only answers 201 created or 200 existing after both workspace state and that ledger are durable.
-Persistence failures return 503 and the client retains the same request id; while the deterministic
-session remains live, its next retry repairs the missing state without launching Copilot again.
-Launch intentionally precedes persistence so a saved session cannot miss its one-shot initial
-prompt. Consequently, the prompt may already have acted before a 503, and a host crash combined
-with the failed workspace write leaves recovery dependent on the surviving dtach state. An
-unacknowledged creation can also be saved by a later unrelated workspace change without gaining
-a ledger record; closing it before a successful creation retry can allow a subsequent retry to
-create it again. Other answers are 409 collision, 410 already-closed, 422 unknown project or missing
-Repos, and 503 Copilot or persistence unavailable. Hosts without this endpoint return 404, which
-the client surfaces as unsupported.
-
-A malformed or unreadable `session-creation-ledger.json` in the state directory keeps remote
-creation unavailable, rather than silently discarding its records. Repair its permissions or
-restore a valid backup, keeping the original for recovery. Discarding the ledger also discards
-its replay protection; a 503 caused by corrupt data will not resolve just by retrying.
-
-When Copilot asks a structured `ask_user` question, the extension heartbeat surfaces it (with its
-verbatim choices) as a native question card in the remote client, temporarily replacing the
-message composer. Choosing an option — or typing free-form text when the question allows it — is
-delivered back to the exact live Copilot session over a lease-gated control message; a question
-whose choices or payload are too large is never exposed remotely so the terminal fallback stays
-exact. Answers are re-validated host-side against the fresh heartbeat before an atomic, private
-response file hands them to the extension.
-
-Receipt-capable clients bind SDK answers, elicitations, and model switches to the current
-conversation epoch. HTTP acceptance only means the host queued the handoff: the UI reports
-success only after an `applied` receipt, permits an explicit retry after `rejected`, and blocks
-automatic retry after `indeterminate` because the SDK may already have applied the operation.
-Known older hosts keep the legacy optimistic path; a new host with missing or unknown tracker
-metadata fails closed instead of silently downgrading.
-
-The remote client also answers schema-form `elicitation.requested` questions the same way the
-native iOS client does. A bounded, flat subset of the request's `requestedSchema`
-(enum/`oneOf` choices, multi-select arrays, booleans, numbers, and length-bounded strings) is
-rendered as a native form with Decline/Send-answer actions; url-mode requests offer a safe
-new-tab **Open in browser** link with Decline/Done. Send stays disabled until every required
-field holds a type-valid value, the submitted content is re-validated against the same subset,
-and anything outside it (nested/`$ref`/unsupported schema, or a non-http(s) url) falls back to
-"answer this one in the Copilot terminal" so arbitrary schema is never rendered. Accept, decline,
-and cancel are delivered to the live session over the same lease-gated control message.
-
-Normal-buffer sessions expose a bounded, independently scrollable history without moving the
-desktop terminal viewport. Active Copilot/full-screen sessions forward web wheel gestures to the
-existing TUI only while the remote client holds the writer lease. Terminal `http://`/`https://`
-links are rendered as safe new-tab links.
-
-Web Push is optional. Tap the bell in the remote toolbar to subscribe. Safari on iPhone/iPad
-requires adding the site to the Home Screen first (iOS/iPadOS 16.4+); desktop Safari/Edge/Chrome
-can subscribe directly. The app generates and keeps its VAPID private key in the macOS Keychain
-and stores browser subscriptions under the private state directory. Web and native notifications
-include the time the event was sent; clicking a web notification opens and selects its session.
+Shared `CopilotProjectsProtocol`, `CopilotProjectsUI`, and protocol fixtures remain
+public and usable by existing clients. They do not require a private dependency.
+An integrating app can reuse `scripts/build-app.sh` with `--binary`, `--resources`,
+and `--output`; its executable must include its additional assets in `check-assets`.
+The normal build and release do not resolve or bundle optional integrations.
 
 ### Notification deep links
 
@@ -403,19 +295,16 @@ For a manual shell launch with inline images, run
 `/usr/bin/env -u TERM_PROGRAM_VERSION TERM_PROGRAM=ghostty copilot`. Existing Copilot processes
 must be restarted with that profile; relaunching the app only reattaches their dtach master.
 Independent of that local rendering, each terminal session bounds-checks and retains the same
-Kitty-transmitted PNGs (fail-closed on anything outside the exact subset Copilot CLI emits) so a
-remote client can fetch a captured image's exact bytes over the authenticated gateway once its
-placement appears in a `screen` event; the image bytes themselves are never inlined into the SSE
-JSON stream.
+Kitty-transmitted PNGs (fail-closed on anything outside the exact subset Copilot CLI emits).
+The host API exposes exact image versions to optional integrations without exposing mutable
+terminal views.
 
 The companion Copilot extension records completed root turns through the supported Copilot SDK
 event API. It atomically writes a bounded per-tab transcript snapshot after each turn, including
 stopped turns and compact tool summaries but excluding raw tool arguments and results. Copilot
 Projects renders that snapshot in the drawer without parsing private CLI session files or
-changing the terminal's PTY size. The remote web view fetches the latest 50 turns and loads
-older retained turns with **Show earlier**. The transcript endpoint accepts an optional
-`limit` from 1 to 200 and includes `totalTurns` for a windowed response; clients that omit
-`limit` continue to receive the full snapshot.
+changing the terminal's PTY size. The host API supports full or bounded transcript windows
+for optional integrations; image association always precedes windowing.
 
 The app also installs a read-only Copilot extension at
 `~/.copilot/extensions/copilot-projects-tracker/extension.mjs`. It uses Copilot's session event
@@ -527,8 +416,9 @@ watchdogs, automatic retries, or recovery policy.
 
 ## How it works
 
-- One executable, two roles (`Sources/copilot-projects/main.swift`): a recognized subcommand runs
-  the CLI client; anything else launches the SwiftUI app.
+- The small executable entrypoint calls `CopilotProjectsApplication` in `Sources/CopilotProjectsHost`:
+  a recognized subcommand runs the CLI client; no arguments launches the SwiftUI app.
+  Unknown commands are rejected.
 - `Sources/CopilotProjectsCore` is Foundation-only: paths, the JSON-line wire protocol, the socket
   client, and CLI parsing.
 - `AppModel` is the SwiftUI coordinator. Versioned state persistence, activity evidence,

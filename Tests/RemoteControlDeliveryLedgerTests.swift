@@ -1,6 +1,6 @@
 import XCTest
 import CopilotProjectsProtocol
-@testable import copilot_projects
+@testable import CopilotProjectsHost
 
 final class RemoteControlDeliveryLedgerTests: XCTestCase {
     @MainActor

@@ -1,5 +1,5 @@
 import XCTest
-@testable import copilot_projects
+@testable import CopilotProjectsHost
 import CopilotProjectsCore
 import AppKit
 

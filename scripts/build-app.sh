@@ -8,16 +8,24 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/bundle-resources.sh"
 
 CONFIG="debug"
 LAUNCH=0
-for arg in "$@"; do
-  case "$arg" in
+OVERRIDE_BINARY=""
+EXTRA_RESOURCES=""
+OUTPUT_APP=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
     --release) CONFIG="release" ;;
     --debug)   CONFIG="debug" ;;
     --launch)  LAUNCH=1 ;;
-    *) echo "unknown arg: $arg" >&2; exit 1 ;;
+    --binary) OVERRIDE_BINARY="${2:?--binary needs an executable}"; shift ;;
+    --resources) EXTRA_RESOURCES="${2:?--resources needs a directory}"; shift ;;
+    --output) OUTPUT_APP="${2:?--output needs an .app path}"; shift ;;
+    *) echo "unknown arg: $1" >&2; exit 1 ;;
   esac
+  shift
 done
 
 APP_NAME="Copilot Projects"
@@ -103,7 +111,11 @@ echo "==> swift build -c $CONFIG"
 swift build -c "$CONFIG"
 BUILD_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
 RESOURCE_BUILD_DIR="$BUILD_DIR"
-APP_DIR="$ROOT/dist/$APP_NAME.app"
+APP_DIR="${OUTPUT_APP:-$ROOT/dist/$APP_NAME.app}"
+if [[ "$APP_DIR" != /* || "$APP_DIR" != *.app || "$APP_DIR" == "$ROOT" ]]; then
+  echo "error: output must be an absolute .app path outside the repository root" >&2
+  exit 1
+fi
 CONTENTS="$APP_DIR/Contents"
 MACOS="$CONTENTS/MacOS"
 RES="$CONTENTS/Resources"
@@ -115,18 +127,13 @@ echo "==> assembling $APP_DIR"
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS" "$RES" "$HELPER_MACOS"
 
-cp "$BUILD_DIR/$EXE_NAME" "$MACOS/$EXE_NAME"
+cp "${OVERRIDE_BINARY:-$BUILD_DIR/$EXE_NAME}" "$MACOS/$EXE_NAME"
 cp "$BUILD_DIR/copilot-projects-link" "$HELPER_MACOS/copilot-projects-link"
 
 # App icon
 if [ -f "$ROOT/Resources/AppIcon.icns" ]; then
   cp "$ROOT/Resources/AppIcon.icns" "$RES/AppIcon.icns"
 fi
-for icon in PWAIcon-192.png PWAIcon-512.png; do
-  if [ -f "$ROOT/Resources/$icon" ]; then
-    cp "$ROOT/Resources/$icon" "$RES/$icon"
-  fi
-done
 
 # Build + bundle the dtach helper (resumability backend).
 DTACH_SRC="$ROOT/vendor/dtach"
@@ -150,7 +157,8 @@ fi
 # absolute Bundle.module fallback path.
 if [ -d "$RESOURCE_BUILD_DIR/SwiftTerm_SwiftTerm.bundle" ]; then
   cp -R "$RESOURCE_BUILD_DIR/SwiftTerm_SwiftTerm.bundle" "$RES/"
-  SHADER_SOURCE="$RESOURCE_BUILD_DIR/SwiftTerm_SwiftTerm.bundle/Shaders.metal"
+  SHADER_RESOURCES="$(bundle_resources "$RESOURCE_BUILD_DIR/SwiftTerm_SwiftTerm.bundle")"
+  SHADER_SOURCE="$SHADER_RESOURCES/Shaders.metal"
   if [ -f "$SHADER_SOURCE" ]; then
     echo "==> compiling SwiftTerm Metal shaders"
     SHADER_TMP="$(mktemp -d -t copilot-projects-shaders)"
@@ -159,17 +167,17 @@ if [ -d "$RESOURCE_BUILD_DIR/SwiftTerm_SwiftTerm.bundle" ]; then
       -c "$SHADER_SOURCE" -o "$AIR_FILE"
     xcrun -sdk macosx metallib "$AIR_FILE" -o "$RES/default.metallib"
     rm -rf "$SHADER_TMP"
+  elif [ -f "$SHADER_RESOURCES/default.metallib" ]; then
+    cp "$SHADER_RESOURCES/default.metallib" "$RES/default.metallib"
   fi
 fi
 
-# SwiftPM resource bundles this app loads at runtime: the Copilot CLI tracker
-# extension (CopilotProjectsCore) and the remote web client (copilot-projects).
+# SwiftPM resource bundles the standalone host loads at runtime.
 # They are resolved from Contents/Resources only — there is no developer-path
 # fallback — so a bundle that failed to make it into the .app must fail the
 # build here rather than at first use on a user's machine.
 REQUIRED_RESOURCE_BUNDLES=(
   "copilot-projects_CopilotProjectsCore.bundle"
-  "copilot-projects_copilot-projects.bundle"
 )
 for bundle in "${REQUIRED_RESOURCE_BUNDLES[@]}"; do
   if [ ! -d "$RESOURCE_BUILD_DIR/$bundle" ]; then
@@ -183,27 +191,22 @@ done
 # The specific assets the runtime asks for by name, so a renamed or dropped file
 # is caught while assembling instead of by a trap in the running app.
 REQUIRED_RESOURCE_FILES=(
-  "PWAIcon-192.png"
-  "PWAIcon-512.png"
-  "copilot-projects_CopilotProjectsCore.bundle/tracker/extension.mjs"
-  "copilot-projects_copilot-projects.bundle/web/index.html"
-  "copilot-projects_copilot-projects.bundle/web/app.css"
-  "copilot-projects_copilot-projects.bundle/web/app.webmanifest"
-  "copilot-projects_copilot-projects.bundle/web/service-worker.js"
-  "copilot-projects_copilot-projects.bundle/web/js/markdown.js"
-  "copilot-projects_copilot-projects.bundle/web/js/draft.js"
-  "copilot-projects_copilot-projects.bundle/web/js/operations.js"
-  "copilot-projects_copilot-projects.bundle/web/js/session-creation.js"
-  "copilot-projects_copilot-projects.bundle/web/js/terminal-image.js"
-  "copilot-projects_copilot-projects.bundle/web/js/transcript.js"
-  "copilot-projects_copilot-projects.bundle/web/js/main.js"
+  "$(bundle_resources "$RES/copilot-projects_CopilotProjectsCore.bundle")/tracker/extension.mjs"
 )
 for required in "${REQUIRED_RESOURCE_FILES[@]}"; do
-  if [ ! -s "$RES/$required" ]; then
-    echo "error: packaged resource $RES/$required is missing or empty" >&2
+  if [ ! -s "$required" ]; then
+    echo "error: packaged resource $required is missing or empty" >&2
     exit 1
   fi
 done
+
+if [ -n "$EXTRA_RESOURCES" ]; then
+  if [ ! -d "$EXTRA_RESOURCES" ]; then
+    echo "error: integration resource directory is missing: $EXTRA_RESOURCES" >&2
+    exit 1
+  fi
+  cp -R "$EXTRA_RESOURCES/." "$RES/"
+fi
 
 cat > "$CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -266,7 +269,8 @@ fi
 # attributed to this responsible app — can use the microphone. Written outside the
 # .app bundle: --entitlements embeds it into the signature, so it must NOT be a
 # sealed bundle resource (removing it post-sign would invalidate the signature).
-ENTITLEMENTS="$ROOT/dist/copilot-projects.entitlements"
+ENTITLEMENTS="$(mktemp -t copilot-projects-entitlements.XXXXXX)"
+trap 'rm -f "$ENTITLEMENTS"' EXIT
 cat > "$ENTITLEMENTS" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -284,6 +288,7 @@ codesign "${SIGN_ARGS[@]}" "$HELPER_APP"
 codesign "${SIGN_ARGS[@]}" --entitlements "$ENTITLEMENTS" "$APP_DIR"
 rm -f "$ENTITLEMENTS"
 codesign --verify --deep --strict --verbose=2 "$APP_DIR"
+"$MACOS/$EXE_NAME" check-assets
 
 echo "App path:"
 echo "  $APP_DIR"

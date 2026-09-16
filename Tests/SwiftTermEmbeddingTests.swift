@@ -3,7 +3,7 @@ import SwiftTerm
 import XCTest
 import CopilotProjectsCore
 import CopilotProjectsProtocol
-@testable import copilot_projects
+@testable import CopilotProjectsHost
 
 final class SwiftTermEmbeddingTests: XCTestCase {
     @MainActor
@@ -413,7 +413,7 @@ final class SwiftTermEmbeddingTests: XCTestCase {
     }
 
     @MainActor
-    func testStaleRevisionCannotReturnAnAlreadyCachedScreen() throws {
+    func testStaleRevisionCannotReturnAnAlreadyCachedScreen() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -440,5 +440,10 @@ final class SwiftTermEmbeddingTests: XCTestCase {
         XCTAssertTrue(screen.lines.contains("first second"))
         view.resize(cols: 50, rows: 8)
         XCTAssertNil(bridge.screen(sessionId: sessionId, revision: after, afterLine: nil))
+        XCTAssertEqual(bridge.cachedScreenCount, 1)
+        XCTAssertEqual(model.closeRemoteSession(sessionId: sessionId), .closed)
+        XCTAssertNil(bridge.screen(sessionId: sessionId, revision: after, afterLine: nil))
+        XCTAssertEqual(bridge.cachedScreenCount, 0)
+        await model.detachAllClientsAndDrain()
     }
 }
