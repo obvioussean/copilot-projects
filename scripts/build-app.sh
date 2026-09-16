@@ -101,9 +101,18 @@ fi
 # Application identity when one is in the keychain so local builds keep their
 # grants across rebuilds. Set CODESIGN_IDENTITY explicitly to override, or
 # CODESIGN_IDENTITY=- to force ad-hoc.
+CODESIGN_KEYCHAIN="${CODESIGN_KEYCHAIN:-}"
+IDENTITY_ARGS=(-v -p codesigning)
+if [ -n "$CODESIGN_KEYCHAIN" ]; then
+  IDENTITY_ARGS+=("$CODESIGN_KEYCHAIN")
+fi
 if [ -z "${CODESIGN_IDENTITY:-}" ]; then
-  CODESIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+  CODESIGN_IDENTITY="$(security find-identity "${IDENTITY_ARGS[@]}" 2>/dev/null \
     | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
+  if [ -n "$CODESIGN_KEYCHAIN" ] && [ -z "$CODESIGN_IDENTITY" ]; then
+    echo "error: explicit signing keychain contains no Developer ID identity" >&2
+    exit 1
+  fi
   CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
 fi
 
@@ -261,6 +270,9 @@ if [ "$CODESIGN_IDENTITY" = "-" ]; then
 else
   echo "==> signing with $CODESIGN_IDENTITY"
   SIGN_ARGS=(--force --options runtime --timestamp --sign "$CODESIGN_IDENTITY")
+  if [ -n "$CODESIGN_KEYCHAIN" ]; then
+    SIGN_ARGS+=(--keychain "$CODESIGN_KEYCHAIN")
+  fi
 fi
 
 # Entitlements for the main app: microphone device access. Required under the

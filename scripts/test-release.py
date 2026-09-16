@@ -36,7 +36,15 @@ if command == "git":
         sys.exit(0)
     sys.exit(subprocess.call([os.environ["REAL_GIT"]] + args))
 if command == "security":
-    print('1) TEST "Developer ID Application: Release Test"')
+    if not os.environ.get("MOCK_NO_IDENTITY"):
+        print('1) TEST "Developer ID Application: Release Test"')
+elif command == "swift":
+    if "--show-bin-path" in args:
+        print(os.environ["MOCK_BUILD_PATH"])
+elif command == "clang":
+    output = Path(args[args.index("-o") + 1])
+    output.write_text("#!/bin/sh\nexit 0\n")
+    output.chmod(0o755)
 elif command == "hdiutil":
     Path(args[-1]).write_text("test dmg")
 elif command == "ditto":
@@ -67,6 +75,7 @@ elif command == "gh":
 BUILD = """#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\\n' "$PWD|$VERSION|$CODESIGN_IDENTITY|$*" > dist-build.txt
+printf '%s' "${CODESIGN_KEYCHAIN:-}" > dist-keychain.txt
 mkdir -p 'dist/Copilot Projects.app'
 case "${BUILD_CHANGE:-}" in
   dirty) echo changed >> tracked ;;
@@ -87,7 +96,7 @@ class ReleaseTests(unittest.TestCase):
             for key, value in os.environ.items()
             if not key.startswith(("GIT_", "GH_"))
             and key not in (
-                "GITHUB_REPOSITORY", "CODESIGN_IDENTITY", "NOTARY_PROFILE",
+                "GITHUB_REPOSITORY", "CODESIGN_IDENTITY", "CODESIGN_KEYCHAIN", "NOTARY_PROFILE",
                 "NOTARY_KEYCHAIN", "EXPECTED_PREVIOUS_TAG", "EXPECTED_PREVIOUS_SHA",
             )
         }
@@ -107,7 +116,7 @@ class ReleaseTests(unittest.TestCase):
         })
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        for name in ("git", "security", "xcrun", "spctl", "codesign", "hdiutil", "ditto", "gh", "curl"):
+        for name in ("git", "security", "xcrun", "spctl", "codesign", "hdiutil", "ditto", "gh", "curl", "swift", "clang"):
             self.executable(self.bin / name, MOCK)
         self.env["PATH"] = str(self.bin) + os.pathsep + self.env["PATH"]
         self.public = self.project("public", "https://github.com/sirfergy/copilot-projects.git")
@@ -133,7 +142,7 @@ class ReleaseTests(unittest.TestCase):
         root = self.root / name
         (root / "scripts").mkdir(parents=True)
         self.executable(root / "scripts/build-app.sh", BUILD)
-        (root / ".gitignore").write_text("dist/\ndist-build.txt\n")
+        (root / ".gitignore").write_text("dist/\ndist-build.txt\ndist-keychain.txt\n")
         (root / "tracked").write_text("original\n")
         self.git(root, "init", "-q", "--initial-branch=main")
         self.git(root, "add", ".")
@@ -188,6 +197,87 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertTrue((self.public / "dist/Copilot-Projects-1.2.3.dmg").exists())
         self.assertTrue(any("repos/sirfergy/copilot-projects/releases" in args for _, _, args in self.calls))
+
+    def test_explicit_keychain_scopes_discovery_verification_build_and_dmg(self):
+        keychain = str(self.root / "job signing.keychain-db")
+        self.env["CODESIGN_KEYCHAIN"] = keychain
+        del self.env["CODESIGN_IDENTITY"]
+        result = self.run_release()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        identities = [args for _, command, args in self.calls if command == "security"]
+        self.assertEqual(identities, [
+            ["find-identity", "-v", "-p", "codesigning", keychain],
+            ["find-identity", "-v", "-p", "codesigning", keychain],
+        ])
+        self.assertEqual((self.project_root / "dist-keychain.txt").read_text(), keychain)
+        signing = [args for _, command, args in self.calls if command == "codesign"]
+        self.assertEqual(len(signing), 1)
+        self.assertEqual(signing[0][-3:-1], ["--keychain", keychain])
+
+    def test_unavailable_explicit_keychain_cannot_fall_back_to_global_identities(self):
+        self.env["CODESIGN_KEYCHAIN"] = "/missing/job.keychain-db"
+        self.env["FAIL_COMMAND"] = "security find-identity -v"
+        result = self.run_release()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("codesigning identity not found", result.stdout)
+        self.assertFalse((self.project_root / "dist-build.txt").exists())
+        self.assertFalse(any(command == "codesign" for _, command, _ in self.calls))
+
+    def run_assembler(self):
+        shutil.copyfile(RELEASE.with_name("build-app.sh"), self.public / "scripts/build-app.sh")
+        shutil.copyfile(RELEASE.with_name("bundle-resources.sh"), self.public / "scripts/bundle-resources.sh")
+        build = self.public / ".build/products"
+        build.mkdir(parents=True, exist_ok=True)
+        for name in ("copilot-projects", "copilot-projects-link"):
+            self.executable(build / name, "#!/bin/sh\nexit 0\n")
+        tracker = build / "copilot-projects_CopilotProjectsCore.bundle/tracker"
+        tracker.mkdir(parents=True, exist_ok=True)
+        (tracker / "extension.mjs").write_text("// fixture\n")
+        dtach = self.public / "vendor/dtach"
+        dtach.mkdir(parents=True, exist_ok=True)
+        (dtach / "config.h").touch()
+        self.env.update(VERSION="1.2.3", MOCK_BUILD_PATH=str(build))
+        self.log.unlink(missing_ok=True)
+        result = subprocess.run(
+            ["bash", str(self.public / "scripts/build-app.sh"), "--release"],
+            env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        self.calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        return result
+
+    def test_actual_assembler_scopes_every_signed_binary_and_preserves_defaults(self):
+        for keychain, identity in (
+            (str(self.root / "job signing.keychain-db"), None),
+            (None, None),
+            (str(self.root / "unused.keychain-db"), "-"),
+        ):
+            with self.subTest(keychain=keychain, identity=identity):
+                for key in ("CODESIGN_KEYCHAIN", "CODESIGN_IDENTITY"):
+                    self.env.pop(key, None)
+                if keychain:
+                    self.env["CODESIGN_KEYCHAIN"] = keychain
+                if identity:
+                    self.env["CODESIGN_IDENTITY"] = identity
+                result = self.run_assembler()
+                self.assertEqual(result.returncode, 0, result.stdout)
+                signing = [args for _, cmd, args in self.calls if cmd == "codesign" and "--sign" in args]
+                self.assertEqual(len(signing), 3)
+                for args in signing:
+                    if keychain and identity != "-":
+                        self.assertEqual(args[args.index("--keychain") + 1], keychain)
+                    else:
+                        self.assertNotIn("--keychain", args)
+                lookups = [args for _, cmd, args in self.calls if cmd == "security"]
+                expected = ["find-identity", "-v", "-p", "codesigning"]
+                self.assertEqual(lookups, [] if identity == "-" else [expected + ([keychain] if keychain else [])])
+
+    def test_empty_explicit_keychain_never_silently_ad_hoc_signs(self):
+        self.env.pop("CODESIGN_IDENTITY")
+        self.env.update(CODESIGN_KEYCHAIN="/empty/job.keychain-db", MOCK_NO_IDENTITY="1")
+        result = self.run_assembler()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("explicit signing keychain contains no Developer ID", result.stdout)
+        self.assertFalse(any(cmd in ("swift", "codesign") for _, cmd, _ in self.calls))
 
     def test_local_build_still_allows_dirty_tree_without_fetching(self):
         (self.project_root / "tracked").write_text("local changes")
