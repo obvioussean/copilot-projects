@@ -21,10 +21,16 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
 - **Projects (vertical sidebar):** a project is just a named group of sessions. Create one
   with `⌘N` (name it; no folder required). Jump to one with **`⌘1`–`⌘9`**.
 - **Sessions (browser-style tabs):** each project shows a horizontal tab strip; one terminal
-  is visible at a time. Add a tab with `⌘T`, switch with a click / **`⌃Tab`** (next) / `⌃⇧Tab`
+  is visible at a time. Start Copilot with `⌘T` or a plain shell with `⌥⌘T`, switch with a click / **`⌃Tab`** (next) / `⌃⇧Tab`
   (prev) / **`⌃1`–`⌃9`** / `⌘⇧[` / `⌘⇧]`, close with `⌘W` or the tab's ✕. Background tabs keep
   running. Hold **⌘** (projects) or **⌃** (tabs) to see the number on each.
-- **Local PR reviews:** the shield button beside **New Session** accepts a GitHub pull request
+- **Prompt-first sessions:** the **+ Copilot** dropdown, Session menu, and project context
+  menu offer **Start with Prompt…**. Compose multiple lines, then use `⌘Return` to launch
+  an interactive session (not a one-shot/headless command). Cancel creates no tab.
+  Startup checks retain the draft on failure; after a tab opens, **Copy Starting Prompt**
+  in its context menu recovers the prompt until that tab closes or the app quits.
+  Prompts are never retried automatically. Normal desktop launches do not add `--allow-all`.
+- **Local PR reviews:** the shield button beside **+ Copilot** accepts a GitHub pull request
   URL and opens a new Copilot CLI tab with a local adversarial-review prompt.
 - **Status:** each session reports `idle` / `running` / `waiting`. Running and waiting
   counts appear in the sidebar; a blue dot on the session tab marks work that finished

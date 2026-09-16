@@ -804,7 +804,7 @@ final class AppModel: ObservableObject {
     /// Message + button title shown by the container when nothing is selected.
     var emptyContextHint: (message: String, button: String) {
         if let project = selectedProject {
-            return ("No sessions in “\(project.name)”", "New Session")
+            return ("No sessions in “\(project.name)”", "New Copilot Session")
         }
         return ("No project selected", "New Project…")
     }
@@ -813,7 +813,7 @@ final class AppModel: ObservableObject {
     /// create a project if there is none.
     func newInActiveContext() {
         if let pid = selectedProjectId {
-            addSession(toProjectId: pid)
+            addCopilotSessionInteractive(toProjectId: pid)
         } else {
             addProjectInteractive()
         }
@@ -849,9 +849,11 @@ final class AppModel: ObservableObject {
             confirmTitle: "Create",
             initialText: defaultName
         ) else { return }
-        let project = makeProject(name: name, cwd: Paths.defaultStartupDir, withSession: true)
+        guard !isTerminating else { return }
+        let project = makeProject(name: name, cwd: Paths.defaultStartupDir, withSession: false)
         projects.append(project)
         selectProject(project.id)
+        addCopilotSessionInteractive(toProjectId: project.id)
     }
 
     /// Shared single-field prompt. Returns trimmed text, or nil if empty/cancelled.
@@ -882,6 +884,114 @@ final class AppModel: ObservableObject {
         refreshSelectedTranscriptController()
         save()
         return session.id
+    }
+
+    enum CopilotSessionStartError: LocalizedError {
+        case shuttingDown, projectUnavailable, backendUnavailable, copilotUnavailable
+        case invalidPrompt, terminalUnavailable
+        case workingDirectoryUnavailable(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .shuttingDown:
+                return "The app is quitting. Reopen it before starting a session."
+            case .projectUnavailable:
+                return "This project is no longer available. Select a project and try again."
+            case .backendUnavailable:
+                return "The bundled terminal backend is unavailable. Reinstall the app, or use New Terminal."
+            case .copilotUnavailable:
+                return "Install the Copilot CLI or set COPILOT_PROJECTS_COPILOT to its executable, or use New Terminal."
+            case .invalidPrompt:
+                return "Enter a prompt of at most 8,192 UTF-8 bytes, without terminal control characters."
+            case .workingDirectoryUnavailable(let path):
+                return "The working directory no longer exists: \(path). Choose a session with an existing directory."
+            case .terminalUnavailable:
+                return "The terminal could not be started. Your prompt has not been submitted."
+            }
+        }
+    }
+
+    private func copilotSessionExecutable(toProjectId pid: String) throws -> String {
+        guard !isTerminating else { throw CopilotSessionStartError.shuttingDown }
+        guard projectIndex(pid) != nil else { throw CopilotSessionStartError.projectUnavailable }
+        guard remoteSessionBackendAvailable() else { throw CopilotSessionStartError.backendUnavailable }
+        guard let executable = remoteCopilotExecutable() else {
+            throw CopilotSessionStartError.copilotUnavailable
+        }
+        return executable
+    }
+
+    func addCopilotSessionInteractive(toProjectId pid: String, withPrompt: Bool = false) {
+        do {
+            _ = try copilotSessionExecutable(toProjectId: pid)
+            if withPrompt {
+                CopilotPromptComposer().run { prompt in
+                    try self.addCopilotSession(toProjectId: pid, initialPrompt: prompt)
+                }
+            } else {
+                try addCopilotSession(toProjectId: pid)
+            }
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Could Not Start Copilot"
+            alert.informativeText = error.localizedDescription
+            alert.addButton(withTitle: "OK")
+            if let startError = error as? CopilotSessionStartError {
+                switch startError {
+                case .copilotUnavailable, .backendUnavailable:
+                    alert.addButton(withTitle: "New Terminal")
+                default:
+                    break
+                }
+            }
+            if alert.runModal() == .alertSecondButtonReturn, !isTerminating {
+                addSession(toProjectId: pid)
+            }
+        }
+    }
+
+    @discardableResult
+    func addCopilotSession(toProjectId pid: String, initialPrompt: String? = nil) throws -> String {
+        // Revalidate after the composer: its modal run loop permits project changes.
+        let executable = try copilotSessionExecutable(toProjectId: pid)
+        guard let pi = projectIndex(pid) else { throw CopilotSessionStartError.projectUnavailable }
+        if let initialPrompt, !SessionInputValidation.isValidPrompt(initialPrompt) {
+            throw CopilotSessionStartError.invalidPrompt
+        }
+        let cwd = Paths.normalizedDirectory(defaultCwd(forProjectIndex: pi))
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: cwd, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw CopilotSessionStartError.workingDirectoryUnavailable(cwd)
+        }
+        let prompt = initialPrompt?
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let session = Session(title: "Copilot", cwd: cwd)
+        let previousSelection = projects[pi].selectedSessionId
+        projects[pi].sessions.append(session)
+        projects[pi].selectedSessionId = session.id
+        // No modal or suspension between appending and creating the launch controller:
+        // a view update must not lazily create a plain shell for this tab.
+        launchCopilotSession(session.id, executable: executable, initialPrompt: prompt, allowAll: false)
+        if remoteSessionLauncher == nil, controllers[session.id]?.terminalView.process?.running != true {
+            controllers[session.id] = nil
+            projects[pi].sessions.removeAll { $0.id == session.id }
+            projects[pi].selectedSessionId = previousSelection
+            throw CopilotSessionStartError.terminalUnavailable
+        }
+        refreshSelectedTranscriptController()
+        save()
+        return session.id
+    }
+
+    func startingPrompt(for sessionId: String) -> String? {
+        controllers[sessionId]?.startingPrompt
+    }
+
+    func copyStartingPrompt(for sessionId: String) {
+        guard let prompt = startingPrompt(for: sessionId) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(prompt, forType: .string)
     }
 
     func addAdversarialReviewSessionInteractive(toProjectId pid: String) {
@@ -1174,6 +1284,16 @@ final class AppModel: ObservableObject {
     }
 
     func addSessionToSelected() {
+        guard let pid = selectedProjectId else { return }
+        addCopilotSessionInteractive(toProjectId: pid)
+    }
+
+    func addPromptedSessionToSelected() {
+        guard let pid = selectedProjectId else { return }
+        addCopilotSessionInteractive(toProjectId: pid, withPrompt: true)
+    }
+
+    func addTerminalToSelected() {
         guard let pid = selectedProjectId else { return }
         addSession(toProjectId: pid)
     }

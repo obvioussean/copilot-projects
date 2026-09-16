@@ -58,7 +58,8 @@ These component previews use illustrative sample data.
 | Action | Shortcut |
 |---|---|
 | New project | `⌘N` |
-| New session | `⌘T` |
+| New Copilot session | `⌘T` |
+| New plain terminal | `⌥⌘T` |
 | Close the current session | `⌘W` |
 | Next / previous session | `⌃Tab` / `⌃⇧Tab` |
 | Jump to a project | `⌘1`–`⌘9` |
@@ -66,6 +67,17 @@ These component previews use illustrative sample data.
 
 Hold `⌘` or `⌃` to reveal numbered navigation hints. Use the session-details
 button to open the completed-turn drawer.
+
+The **+ Copilot** button starts an interactive Copilot CLI session immediately,
+inheriting the current session's working directory. Its dropdown offers
+**Start with Prompt…** (a multiline composer) and **New Terminal** (just a shell).
+The Session menu and project context menus offer the same choices. New projects
+created with `⌘N` also start with Copilot; these launches do not add `--allow-all`.
+
+In the composer, Return adds a line, `⌘Return` starts Copilot, and Cancel creates
+no tab. Failed preflight checks keep your draft. If startup fails after a tab
+opens, right-click that tab and choose **Copy Starting Prompt** before closing
+it or quitting the app. This in-memory copy is never automatically resubmitted.
 
 **Closing a tab ends that session. Quitting the app does not**, when the bundled
 `dtach` backend is available. Closing the last window quits by default; enable
@@ -86,6 +98,8 @@ copilot-projects new-session --project <id> --cwd /path/to/repo
 copilot-projects focus --session <id>
 copilot-projects doctor
 ```
+
+The automation command `new-session` still creates a plain shell.
 
 Commands inside an app-managed terminal automatically target its current
 project and session. Hooks for other agents can use:

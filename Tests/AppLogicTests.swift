@@ -4838,7 +4838,7 @@ final class AppLogicTests: XCTestCase {
     func testStartupProgramPrecedenceAndLaunchCommand() {
         let shell = "/bin/zsh"
         let executable = "/opt/my copilot/copilot"
-        // Local sessions (addSession, CLI new-session, the Mac UI) pass no launch
+        // Raw sessions (addSession, CLI new-session, New Terminal) pass no launch
         // executable, so their dtach program stays a plain login shell.
         XCTAssertEqual(
             TerminalController.startupProgram(
@@ -6045,6 +6045,250 @@ final class AppLogicTests: XCTestCase {
         XCTAssertFalse(router.handle(ControlRequest(command: "set-status")).ok)
         XCTAssertFalse(didSetStatus)
         XCTAssertFalse(router.handle(ControlRequest(command: "unknown")).ok)
+    }
+
+    // MARK: - Desktop Copilot session creation
+
+    @MainActor
+    func testDesktopCopilotSessionLaunchesWithNormalPermissionsAndInheritedDirectory() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let existing = Session(id: "existing", title: "shell", cwd: root.path)
+        let project = Project(
+            id: "p1", name: "First", cwd: "/tmp",
+            sessions: [existing], selectedSessionId: existing.id)
+        var launches: [(String, String, String?, Bool)] = []
+        let model = try makeRemoteCreateModel(
+            root: root, projects: [project], selectedProjectId: project.id,
+            reposDirectory: { nil },
+            ledger: SessionCreationLedger(url: root.appendingPathComponent("ledger.json")),
+            onLaunch: { launches.append(($0, $1, $2, $3)) }
+        )
+        let prompt = "  Review Sean's changes; $(touch SHOULD_NOT_EXIST)\r\n100% literal\n  "
+        let id = try model.addCopilotSession(toProjectId: project.id, initialPrompt: prompt)
+        XCTAssertEqual(launches.count, 1)
+        XCTAssertEqual(launches[0].0, id)
+        XCTAssertEqual(launches[0].1, "/opt/copilot/bin/copilot")
+        XCTAssertEqual(launches[0].2, prompt.replacingOccurrences(of: "\r\n", with: "\n"))
+        XCTAssertFalse(launches[0].3)
+        XCTAssertEqual(model.project(project.id)?.sessions.last?.title, "Copilot")
+        XCTAssertEqual(model.project(project.id)?.sessions.last?.cwd, root.path)
+        XCTAssertEqual(model.project(project.id)?.selectedSessionId, id)
+        guard case .loaded(let persisted) = StateRepository(path: root.appendingPathComponent("state.json")).load()
+        else { return XCTFail("Created Copilot session was not persisted") }
+        XCTAssertEqual(persisted.projects.first?.selectedSessionId, id)
+        XCTAssertFalse(try String(contentsOf: root.appendingPathComponent("state.json"), encoding: .utf8)
+            .contains("SHOULD_NOT_EXIST"))
+
+        model.addSessionToSelected()
+        model.newInActiveContext()
+        XCTAssertEqual(launches.count, 3)
+        XCTAssertTrue(launches.dropFirst().allSatisfy { $0.2 == nil && !$0.3 })
+    }
+
+    @MainActor
+    func testDesktopCopilotSessionFailuresDoNotMutateOrLaunch() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = Project(id: "p1", name: "First", cwd: root.path)
+        var executable: String? = "/opt/copilot/bin/copilot"
+        var backend = true
+        var launches = 0
+        let model = try makeRemoteCreateModel(
+            root: root, projects: [project], selectedProjectId: project.id,
+            copilotExecutable: { executable }, reposDirectory: { nil },
+            backendAvailable: { backend },
+            ledger: SessionCreationLedger(url: root.appendingPathComponent("ledger.json")),
+            onLaunch: { _, _, _, _ in launches += 1 }
+        )
+        func assertFailure(_ expected: AppModel.CopilotSessionStartError, pid: String = "p1", prompt: String? = nil) {
+            XCTAssertThrowsError(try model.addCopilotSession(toProjectId: pid, initialPrompt: prompt)) {
+                XCTAssertEqual($0.localizedDescription, expected.localizedDescription)
+            }
+            XCTAssertEqual(model.projects, [project])
+            XCTAssertEqual(model.selectedProjectId, project.id)
+            XCTAssertEqual(launches, 0)
+        }
+        backend = false
+        assertFailure(.backendUnavailable)
+        backend = true
+        executable = nil
+        assertFailure(.copilotUnavailable)
+        executable = "/opt/copilot/bin/copilot"
+        assertFailure(.projectUnavailable, pid: "removed-during-composer")
+        for prompt in ["", " \n\t", "\u{1b}]0;title\u{7}", "\u{0}", String(repeating: "x", count: 8_193)] {
+            assertFailure(.invalidPrompt, prompt: prompt)
+        }
+        model.beginTermination()
+        assertFailure(.shuttingDown)
+    }
+
+    @MainActor
+    func testDesktopCopilotSessionRejectsMissingWorkingDirectory() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = Project(id: "p1", name: "First", cwd: root.appendingPathComponent("deleted").path)
+        var launches = 0
+        let model = try makeRemoteCreateModel(
+            root: root, projects: [project], selectedProjectId: project.id,
+            reposDirectory: { nil },
+            ledger: SessionCreationLedger(url: root.appendingPathComponent("ledger.json")),
+            onLaunch: { _, _, _, _ in launches += 1 }
+        )
+        XCTAssertThrowsError(try model.addCopilotSession(toProjectId: project.id)) {
+            XCTAssertEqual($0.localizedDescription,
+                           AppModel.CopilotSessionStartError.workingDirectoryUnavailable(project.cwd).localizedDescription)
+        }
+        XCTAssertEqual(model.projects, [project])
+        XCTAssertEqual(launches, 0)
+    }
+
+    @MainActor
+    func testCopilotPromptComposerValidatesMultilineAndByteLimit() {
+        let composer = CopilotPromptComposer()
+        XCTAssertTrue(composer.alert.window.initialFirstResponder === composer.textView)
+        XCTAssertFalse(composer.textView.isRichText)
+        XCTAssertEqual(composer.alert.buttons[0].keyEquivalent, "\r")
+        XCTAssertEqual(composer.alert.buttons[0].keyEquivalentModifierMask, .command)
+        XCTAssertEqual(composer.alert.buttons[1].keyEquivalent, "\u{1b}")
+        for (text, enabled) in [
+            ("", false), (" \n\t", false), ("line one\nline two", true),
+            (String(repeating: "x", count: 8_192), true),
+            (String(repeating: "x", count: 8_193), false),
+            (String(repeating: "é", count: 4_096), true),
+            (String(repeating: "é", count: 4_097), false),
+            ("unsafe\u{1b}]0;title\u{7}", false),
+        ] {
+            composer.textView.string = text
+            composer.textDidChange(Notification(name: NSText.didChangeNotification))
+            XCTAssertEqual(composer.alert.buttons[0].isEnabled, enabled)
+            XCTAssertEqual(composer.textView.string, text)
+        }
+    }
+
+    @MainActor
+    func testCopilotPromptComposerCancelAndFailurePreserveDraft() {
+        let composer = CopilotPromptComposer()
+        let draft = "  Don't lose this\nsecond line  "
+        composer.textView.string = draft
+        var attempts = 0
+        composer.run(present: { _ in .alertSecondButtonReturn }) { _ in attempts += 1 }
+        XCTAssertEqual(attempts, 0)
+        XCTAssertEqual(composer.textView.string, draft)
+
+        var presentations = 0
+        composer.run(present: { alert in
+            presentations += 1
+            XCTAssertTrue(alert.window.initialFirstResponder === composer.textView)
+            XCTAssertEqual(composer.textView.string, draft)
+            if presentations > 1 {
+                XCTAssertEqual(alert.informativeText,
+                               AppModel.CopilotSessionStartError.copilotUnavailable.localizedDescription)
+            }
+            return presentations <= 2 ? .alertFirstButtonReturn : .alertSecondButtonReturn
+        }) { prompt in
+            attempts += 1
+            XCTAssertEqual(prompt, draft)
+            if attempts == 1 { throw AppModel.CopilotSessionStartError.copilotUnavailable }
+        }
+        XCTAssertEqual(attempts, 2)
+        XCTAssertEqual(presentations, 2)
+        XCTAssertEqual(composer.textView.string, draft)
+    }
+
+    func testPromptedCopilotCommandExecutesLiteralInteractiveArgumentAndFallsBack() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appendingPathComponent("Sean's copilot")
+        let fallback = root.appendingPathComponent("fallback shell")
+        try "#!/bin/sh\nprintf 'FALLBACK:%s\\n' \"$1\"\n"
+            .write(to: fallback, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fallback.path)
+        let prompt = "Review 'quoted' text; $(touch SHOULD_NOT_EXIST)\n100% literal\\backslash"
+        for status in [0, 1, 127, 130] {
+            try "#!/bin/sh\nprintf '%s\\0' \"$@\"\nexit \(status)\n"
+                .write(to: executable, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.currentDirectoryURL = root
+            process.arguments = ["-c", TerminalController.launchCommand(
+                executable: executable.path, shell: fallback.path, initialPrompt: prompt)]
+            let output = Pipe()
+            process.standardOutput = output
+            process.standardError = output
+            try process.run()
+            let bytes = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            let fields = String(decoding: bytes, as: UTF8.self).components(separatedBy: "\0")
+            XCTAssertEqual(Array(fields.prefix(4)), [
+                "--no-remote", "--no-remote-export", "--interactive", prompt,
+            ])
+            XCTAssertTrue(fields.last?.contains("FALLBACK:-l") == true)
+            XCTAssertEqual(fields.last?.contains("could not launch Copilot"), status != 0)
+            XCTAssertEqual(process.terminationStatus, 0)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("SHOULD_NOT_EXIST").path))
+        }
+    }
+
+    @MainActor
+    func testDesktopCopilotPromptSurvivesFailedCLIInLiveFallbackTerminal() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = root.appendingPathComponent("foreground-backend")
+        let copilot = root.appendingPathComponent("failing-copilot")
+        // Run the real startup argv in a PTY, but without a persistent dtach daemon.
+        try "#!/bin/sh\nshift 6\nexec \"$@\"\n".write(to: backend, atomically: true, encoding: .utf8)
+        try "#!/bin/sh\nexit 1\n".write(to: copilot, atomically: true, encoding: .utf8)
+        for file in [backend, copilot] {
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
+        }
+        let overrides = [
+            "SHELL": "/bin/sh",
+            "COPILOT_PROJECTS_STATE_DIR": root.path,
+            "COPILOT_PROJECTS_SOCKET": root.appendingPathComponent("control.sock").path,
+            "COPILOT_PROJECTS_DTACH": backend.path,
+        ]
+        let previous = overrides.keys.map { ($0, ProcessInfo.processInfo.environment[$0]) }
+        defer {
+            for (key, value) in previous {
+                if let value { setenv(key, value, 1) } else { unsetenv(key) }
+            }
+        }
+        for (key, value) in overrides { setenv(key, value, 1) }
+        let project = Project(id: "p1", name: "First", cwd: root.path)
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [project], selectedProjectId: project.id))
+        let model = AppModel(
+            stateRepository: repository, isAppActive: { false },
+            agentActivityDirectory: root, resumeMarkerDirectory: root,
+            remoteCopilotExecutable: { copilot.path },
+            sessionCreationLedger: SessionCreationLedger(url: root.appendingPathComponent("ledger.json")),
+            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("images"))
+        )
+        defer { model.detachAllClients() }
+        let prompt = "Don't lose this prompt\n100% literal"
+        let id = try model.addCopilotSession(toProjectId: project.id, initialPrompt: prompt)
+        let terminal = try XCTUnwrap(model.terminalView(for: id))
+        var sawFailure = false
+        for _ in 0 ..< 200 {
+            sawFailure = terminal.terminalStateSnapshot().visibleRows.contains {
+                $0.text.contains("could not launch Copilot")
+            }
+            if sawFailure { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(sawFailure, "The actual PTY must render the launch failure")
+        XCTAssertEqual(terminal.process?.running, true, "Failure must leave a usable shell")
+        XCTAssertEqual(model.startingPrompt(for: id), prompt)
+        XCTAssertEqual(model.project(project.id)?.sessions.map(\.id), [id])
+        model.closeSession(projectId: project.id, sessionId: id)
+        XCTAssertNil(model.startingPrompt(for: id), "Closing the tab must discard the in-memory prompt")
     }
 
     // MARK: - Remote session creation (AppModel)
