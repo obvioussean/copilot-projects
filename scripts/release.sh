@@ -4,32 +4,122 @@
 #
 #   scripts/release.sh 0.1.0            # build dist/Copilot-Projects-0.1.0.dmg locally
 #   scripts/release.sh 0.1.0 --publish  # also create the GitHub release + tag
+#   GITHUB_REPOSITORY=owner/repo scripts/release.sh 0.1.0 --project-root=/absolute/repo --publish
 #
 # --publish uses the active `gh` account; run it as the account that owns $REPO.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT"
+SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
 REPO="${GITHUB_REPOSITORY:-sirfergy/copilot-projects}"
 APP_NAME="Copilot Projects"
 
 VERSION=""
 PUBLISH=0
+PROJECT_ROOT=""
 for arg in "$@"; do
   case "$arg" in
     --publish) PUBLISH=1 ;;
+    --project-root=*)
+      PROJECT_ROOT="${arg#*=}"
+      [[ "$PROJECT_ROOT" == /* ]] || {
+        echo "error: --project-root requires an absolute repository path" >&2
+        exit 1
+      }
+      [ -n "${GITHUB_REPOSITORY:-}" ] || {
+        echo "error: --project-root requires an explicit GITHUB_REPOSITORY" >&2
+        exit 1
+      }
+      ;;
     -*) echo "unknown arg: $arg" >&2; exit 1 ;;
     *)  VERSION="$arg" ;;
   esac
 done
-[ -n "$VERSION" ] || { echo "usage: scripts/release.sh <version> [--publish]" >&2; exit 1; }
+[ -n "$VERSION" ] || { echo "usage: scripts/release.sh <version> [--project-root=/absolute/repo] [--publish]" >&2; exit 1; }
 VERSION="${VERSION#v}"   # accept either 0.1.0 or v0.1.0
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
   echo "error: version must be X.Y.Z (optionally prefixed with v)" >&2
   exit 1
 }
 TAG="v$VERSION"
+
+ROOT="$(cd "${PROJECT_ROOT:-$SCRIPT_ROOT}" && pwd -P)"
+cd "$ROOT"
+# Repository selectors inherited from a caller must not redirect the selected root.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
+
+# SwiftPM + git need this when the user's global git sets safe.bareRepository=explicit.
+GIT_CONFIG_INDEX="${GIT_CONFIG_COUNT:-0}"
+export "GIT_CONFIG_KEY_$GIT_CONFIG_INDEX=safe.bareRepository"
+export "GIT_CONFIG_VALUE_$GIT_CONFIG_INDEX=all"
+export GIT_CONFIG_COUNT="$((GIT_CONFIG_INDEX + 1))"
+
+verify_project_root() {
+  local toplevel
+  toplevel="$(git rev-parse --show-toplevel)" || return 1
+  [ "$(cd "$toplevel" && pwd -P)" = "$ROOT" ] || {
+    echo "error: project root must be the Git worktree root" >&2
+    return 1
+  }
+  [ -x "$ROOT/scripts/build-app.sh" ] || {
+    echo "error: project root must provide executable scripts/build-app.sh" >&2
+    return 1
+  }
+}
+
+verify_publish_source() {
+  local direction urls url repository expected worktree_status
+  verify_project_root || return 1
+  [[ "$REPO" =~ ^[a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+$ ]] || {
+    echo "error: GITHUB_REPOSITORY must be owner/repository" >&2
+    return 1
+  }
+  expected="$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
+  for direction in fetch push; do
+    if [ "$direction" = fetch ]; then
+      urls="$(git remote get-url --all origin)" || return 1
+    else
+      urls="$(git remote get-url --push --all origin)" || return 1
+    fi
+    while IFS= read -r url; do
+      case "$url" in
+        https://github.com/*) repository="${url#https://github.com/}" ;;
+        git@github.com:*) repository="${url#git@github.com:}" ;;
+        ssh://git@github.com/*) repository="${url#ssh://git@github.com/}" ;;
+        *) echo "error: origin $direction URL must identify a GitHub repository" >&2; return 1 ;;
+      esac
+      repository="${repository%/}"
+      repository="${repository%.git}"
+      [ "$(printf '%s' "$repository" | tr '[:upper:]' '[:lower:]')" = "$expected" ] || {
+        echo "error: origin $direction repository does not match GITHUB_REPOSITORY" >&2
+        return 1
+      }
+    done <<< "$urls"
+  done
+  [ "$(git rev-parse HEAD)" = "$SHA" ] || {
+    echo "error: project HEAD changed during release" >&2
+    return 1
+  }
+  worktree_status="$(git status --porcelain --untracked-files=normal)" || return 1
+  [ -z "$worktree_status" ] || {
+    echo "error: --publish requires a clean project worktree" >&2
+    return 1
+  }
+}
+
+if [ -n "$PROJECT_ROOT" ]; then
+  verify_project_root
+fi
+if [ "$PUBLISH" = "1" ]; then
+  SHA="$(git rev-parse HEAD)"
+  verify_publish_source
+  git fetch origin main --quiet
+  git merge-base --is-ancestor "$SHA" origin/main || {
+    echo "error: refusing to publish $SHA because it is not on origin/main" >&2
+    exit 1
+  }
+fi
+
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
 NOTARY_KEYCHAIN="${NOTARY_KEYCHAIN:-}"
@@ -70,16 +160,13 @@ if [ "$PUBLISH" = "1" ]; then
   xcrun notarytool history "${NOTARY_ARGS[@]}" >/dev/null
 fi
 
-# SwiftPM + git need this when the user's global git sets safe.bareRepository=explicit.
-GIT_CONFIG_INDEX="${GIT_CONFIG_COUNT:-0}"
-export "GIT_CONFIG_KEY_$GIT_CONFIG_INDEX=safe.bareRepository"
-export "GIT_CONFIG_VALUE_$GIT_CONFIG_INDEX=all"
-export GIT_CONFIG_COUNT="$((GIT_CONFIG_INDEX + 1))"
-
 echo "==> building release app (v$VERSION)"
 VERSION="$VERSION" CODESIGN_IDENTITY="$CODESIGN_IDENTITY" \
   ./scripts/build-app.sh --release
 
+if [ "$PUBLISH" = "1" ]; then
+  verify_publish_source
+fi
 APP="$ROOT/dist/$APP_NAME.app"
 [ -d "$APP" ] || { echo "error: $APP missing after build" >&2; exit 1; }
 
@@ -132,14 +219,14 @@ echo "  $DMG"
 
 if [ "$PUBLISH" = "0" ]; then
   echo "==> built locally (no --publish). To publish the GitHub release:"
-  echo "    scripts/release.sh $VERSION --publish"
+  printf '    GITHUB_REPOSITORY=%q %q %q --project-root=%q --publish\n' \
+    "$REPO" "$SCRIPT_ROOT/scripts/release.sh" "$VERSION" "$ROOT"
   exit 0
 fi
 
 command -v gh >/dev/null || { echo "error: gh CLI not found" >&2; exit 1; }
 
 echo "==> publishing GitHub release $TAG to $REPO"
-SHA="$(git rev-parse HEAD)"
 NOTES_FILE="$(mktemp)"
 cat > "$NOTES_FILE" <<NOTES
 ## Install
@@ -284,6 +371,7 @@ verify_expected_predecessor() {
 }
 # Revalidate immediately before publishing so a queued/manual run cannot release
 # a commit that was force-pushed off main while tests, signing, or notarization ran.
+verify_publish_source
 git fetch origin main --quiet
 git merge-base --is-ancestor "$SHA" origin/main || {
   echo "error: refusing to publish $SHA because it is no longer on origin/main" >&2
@@ -333,9 +421,9 @@ release_response="$(
     -f body="$(cat "$NOTES_FILE")" \
     -F draft=true
 )"
-RELEASE_ID="$(jq -er '.id | tostring' <<< "$release_response")"
-UPLOAD_URL="$(jq -er '.upload_url | sub("\\{.*$"; "")' <<< "$release_response")"
+RELEASE_ID="$(jq -er '.id | numbers' <<< "$release_response")"
 RELEASE_CREATED=1
+UPLOAD_URL="$(jq -er '.upload_url | sub("\\{.*$"; "")' <<< "$release_response")"
 API_TOKEN="${GH_TOKEN:-$(gh auth token)}"
 curl --fail-with-body --location \
   -X POST \

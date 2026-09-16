@@ -181,6 +181,31 @@ NOTARY_PROFILE="copilot-projects-notary" \
 ./scripts/release.sh 0.1.0 --publish
 ```
 
+Publishing requires a clean checkout whose HEAD is reachable from `origin/main`.
+The configured `GITHUB_REPOSITORY` (default `sirfergy/copilot-projects`) must match
+every effective `origin` fetch and push URL before building or notarizing.
+
+An integration can reuse the same pipeline without copying release logic:
+
+```bash
+GITHUB_REPOSITORY=owner/integration \
+CODESIGN_IDENTITY="Developer ID Application: …" \
+NOTARY_PROFILE="copilot-projects-notary" \
+/absolute/public-checkout/scripts/release.sh 0.1.0 \
+  --project-root=/absolute/integration-checkout --publish
+```
+
+`--project-root` requires an absolute Git worktree root and an explicit
+`GITHUB_REPOSITORY`. That root owns HEAD, `origin`, release tags, predecessor
+checks, cleanup, and `dist`. Its executable `scripts/build-app.sh --release` must
+honor `VERSION` and `CODESIGN_IDENTITY` and emit `dist/Copilot Projects.app`,
+including the existing app identity and resources. Build outputs must be ignored;
+tracked source or HEAD changes during the build abort publication. HTTPS,
+`git@github.com:owner/repo`, and `ssh://git@github.com/owner/repo` origin URLs are
+supported (including Git URL rewrites); unknown hosts or mismatched targets fail
+closed. No override keeps the standalone public release behavior, including
+dirty/offline local builds without `--publish`.
+
 `--publish` refuses ad-hoc artifacts, notarizes and staples both the app and DMG, runs
 Gatekeeper checks, then uses the active `gh` account to publish. The Actions workflow
 uses a protected `release` environment and fails closed unless these environment secrets

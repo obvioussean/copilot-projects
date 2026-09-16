@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""Exercise the release entrypoint without building, signing, or network access."""
+
+import json
+import os
+from pathlib import Path
+import shutil
+import shlex
+import subprocess
+import tempfile
+import unittest
+
+
+RELEASE = Path(__file__).with_name("release.sh")
+REAL_GIT = shutil.which("git")
+MOCK = r"""#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+command = Path(sys.argv[0]).name
+args = sys.argv[1:]
+with open(os.environ["COMMAND_LOG"], "a") as log:
+    log.write(json.dumps([os.getcwd(), command, args]) + "\n")
+if os.environ.get("FAIL_COMMAND") == " ".join([command] + args[:2]):
+    sys.exit(1)
+if command == "git":
+    if args[:1] == ["fetch"] or "push" in args:
+        sys.exit(0)
+    if args[:1] == ["ls-remote"]:
+        tag = os.environ.get("MOCK_LATEST_TAG")
+        if tag:
+            print(os.environ["MOCK_LATEST_SHA"] + "\trefs/tags/" + tag)
+        sys.exit(0)
+    sys.exit(subprocess.call([os.environ["REAL_GIT"]] + args))
+if command == "security":
+    print('1) TEST "Developer ID Application: Release Test"')
+elif command == "hdiutil":
+    Path(args[-1]).write_text("test dmg")
+elif command == "ditto":
+    Path(args[-1]).write_text("test zip")
+elif command == "gh":
+    if args[:2] == ["release", "view"]:
+        if args[2] != os.environ.get("MOCK_LATEST_TAG"):
+            sys.exit(1)
+        assets = [{"name": "Copilot-Projects-" + args[2][1:] + ".dmg", "size": 1}]
+        if os.environ.get("MOCK_RELEASE_INCOMPLETE"):
+            assets = []
+        print(json.dumps({"isDraft": False, "publishedAt": "2026-01-01", "assets": assets}))
+    elif any("/git/ref/tags/" in a for a in args):
+        sys.exit(0 if os.environ.get("MOCK_TAG_EXISTS") else 1)
+    elif "--slurp" in args:
+        print("[[]]")
+    elif args[:3] == ["api", "-X", "POST"] and args[3].endswith("/releases"):
+        if os.environ.get("MOCK_NO_RELEASE_ID"):
+            print('{"upload_url":"https://uploads.example.invalid/assets{?name}"}')
+        elif os.environ.get("MOCK_BAD_UPLOAD_URL"):
+            print('{"id":42}')
+        else:
+            print('{"id":42,"upload_url":"https://uploads.example.invalid/assets{?name}"}')
+    elif args[-1].endswith("/releases/42"):
+        print('{"draft":true}')
+"""
+
+BUILD = """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$PWD|$VERSION|$CODESIGN_IDENTITY|$*" > dist-build.txt
+mkdir -p 'dist/Copilot Projects.app'
+case "${BUILD_CHANGE:-}" in
+  dirty) echo changed >> tracked ;;
+  head) git commit --allow-empty -qm 'changed during build' ;;
+  origin) git remote set-url origin https://github.com/example/wrong.git ;;
+esac
+"""
+
+
+class ReleaseTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="release-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.log = self.root / "commands.jsonl"
+        self.env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("GIT_", "GH_"))
+            and key not in (
+                "GITHUB_REPOSITORY", "CODESIGN_IDENTITY", "NOTARY_PROFILE",
+                "NOTARY_KEYCHAIN", "EXPECTED_PREVIOUS_TAG", "EXPECTED_PREVIOUS_SHA",
+            )
+        }
+        self.env.update({
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_AUTHOR_NAME": "Release Test",
+            "GIT_AUTHOR_EMAIL": "release@example.invalid",
+            "GIT_COMMITTER_NAME": "Release Test",
+            "GIT_COMMITTER_EMAIL": "release@example.invalid",
+            "GH_TOKEN": "offline-test-placeholder",
+            "REAL_GIT": REAL_GIT,
+            "COMMAND_LOG": str(self.log),
+            "GITHUB_REPOSITORY": "example/integration",
+            "CODESIGN_IDENTITY": "Developer ID Application: Release Test",
+            "NOTARY_PROFILE": "offline-test",
+        })
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        for name in ("git", "security", "xcrun", "spctl", "codesign", "hdiutil", "ditto", "gh", "curl"):
+            self.executable(self.bin / name, MOCK)
+        self.env["PATH"] = str(self.bin) + os.pathsep + self.env["PATH"]
+        self.public = self.project("public", "https://github.com/sirfergy/copilot-projects.git")
+        shutil.copyfile(RELEASE, self.public / "scripts/release.sh")
+        self.git(self.public, "add", "scripts/release.sh")
+        self.git(self.public, "commit", "-qm", "release entrypoint")
+        self.git(self.public, "update-ref", "refs/remotes/origin/main", "HEAD")
+        self.project_root = self.project("integration with spaces", "git@github.com:example/integration.git")
+
+    def executable(self, path, content):
+        path.write_text(content)
+        path.chmod(0o755)
+
+    def git(self, root, *args):
+        env = {key: value for key, value in self.env.items()
+               if key not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR")}
+        return subprocess.check_output(
+            [REAL_GIT, "-C", str(root), *args], env=env, text=True,
+            stderr=subprocess.STDOUT,
+        ).strip()
+
+    def project(self, name, origin):
+        root = self.root / name
+        (root / "scripts").mkdir(parents=True)
+        self.executable(root / "scripts/build-app.sh", BUILD)
+        (root / ".gitignore").write_text("dist/\ndist-build.txt\n")
+        (root / "tracked").write_text("original\n")
+        self.git(root, "init", "-q", "--initial-branch=main")
+        self.git(root, "add", ".")
+        self.git(root, "commit", "-qm", "fixture")
+        self.git(root, "remote", "add", "origin", origin)
+        self.git(root, "update-ref", "refs/remotes/origin/main", "HEAD")
+        return root
+
+    def run_release(self, *args, publish=True, override=True):
+        command = ["bash", str(self.public / "scripts/release.sh"), "1.2.3"]
+        if override:
+            command.append("--project-root=" + str(self.project_root))
+        if publish:
+            command.append("--publish")
+        result = subprocess.run(
+            command + list(args), cwd=self.root, env=self.env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        self.calls = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        return result
+
+    def assert_rejected_before_side_effects(self, message, **kwargs):
+        result = self.run_release(**kwargs)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(message, result.stdout)
+        self.assertFalse(any(command != "git" or "fetch" in args for _, command, args in self.calls))
+        self.assertFalse((self.project_root / "dist-build.txt").exists())
+
+    def test_override_runs_entire_pipeline_in_selected_root(self):
+        # Even inherited Git selectors must not validate a different checkout.
+        self.env.update(GIT_DIR=str(self.public / ".git"), GIT_WORK_TREE=str(self.public))
+        result = self.run_release()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertTrue((self.project_root / "dist/Copilot-Projects-1.2.3.dmg").exists())
+        self.assertFalse((self.public / "dist").exists())
+        self.assertEqual(
+            (self.project_root / "dist-build.txt").read_text().strip(),
+            f"{self.project_root}|1.2.3|Developer ID Application: Release Test|--release",
+        )
+        self.assertTrue(all(cwd == str(self.project_root) for cwd, _, _ in self.calls))
+        api_args = [arg for _, cmd, args in self.calls if cmd == "gh" for arg in args]
+        self.assertIn("repos/example/integration/releases", api_args)
+        self.assertIn("repos/example/integration/git/refs", api_args)
+        self.assertIn("sha=" + self.git(self.project_root, "rev-parse", "HEAD"), api_args)
+        self.assertFalse(any("sirfergy/copilot-projects" in arg for arg in api_args))
+        for command in ("codesign", "spctl", "xcrun", "curl"):
+            self.assertTrue(any(cmd == command for _, cmd, _ in self.calls))
+
+    def test_default_root_and_repository_remain_public(self):
+        del self.env["GITHUB_REPOSITORY"]
+        result = self.run_release(override=False)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertTrue((self.public / "dist/Copilot-Projects-1.2.3.dmg").exists())
+        self.assertTrue(any("repos/sirfergy/copilot-projects/releases" in args for _, _, args in self.calls))
+
+    def test_local_build_still_allows_dirty_tree_without_fetching(self):
+        (self.project_root / "tracked").write_text("local changes")
+        result = self.run_release(publish=False)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertFalse(any(cmd == "gh" or (cmd == "git" and "fetch" in args) for _, cmd, args in self.calls))
+        handoff = next(line.strip() for line in result.stdout.splitlines() if line.startswith("    GITHUB_REPOSITORY="))
+        self.assertEqual(shlex.split(handoff), [
+            "GITHUB_REPOSITORY=example/integration",
+            str(self.public / "scripts/release.sh"), "1.2.3",
+            "--project-root=" + str(self.project_root), "--publish",
+        ])
+
+    def test_requires_explicit_target_for_override(self):
+        del self.env["GITHUB_REPOSITORY"]
+        self.assert_rejected_before_side_effects("explicit GITHUB_REPOSITORY")
+
+    def test_rejects_relative_empty_missing_and_nested_roots(self):
+        for root, message in (
+            ("relative", "requires an absolute repository path"),
+            ("", "requires an absolute repository path"),
+            (str(self.root / "missing"), "No such file or directory"),
+            (str(self.project_root / "scripts"), "must be the Git worktree root"),
+        ):
+            with self.subTest(root=root):
+                result = self.run_release("--project-root=" + root, override=False)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(message, result.stdout)
+                self.assertFalse((self.project_root / "dist-build.txt").exists())
+
+    def test_rejects_mismatched_fetch_and_push_urls_including_secondary_urls(self):
+        for option in ("url", "pushurl"):
+            with self.subTest(option=option):
+                self.git(self.project_root, "config", "--add", "remote.origin." + option,
+                         "https://github.com/example/wrong.git")
+                self.assert_rejected_before_side_effects("does not match")
+                self.git(self.project_root, "config", "--unset-all", "remote.origin." + option,
+                         "https://github.com/example/wrong.git")
+
+    def test_accepts_supported_url_forms_and_expands_rewrites(self):
+        for url in (
+            "https://github.com/EXAMPLE/Integration.git/",
+            "git@github.com:example/integration",
+            "ssh://git@github.com/example/integration.git",
+            "test-alias:integration.git",
+        ):
+            with self.subTest(url=url):
+                self.git(self.project_root, "config", "url.https://github.com/example/.insteadOf", "test-alias:")
+                self.git(self.project_root, "remote", "set-url", "origin", url)
+                result = self.run_release()
+                self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_rejects_unsupported_or_credentialed_urls_without_echoing_them(self):
+        for url in (
+            "https://github.com.example.invalid/example/integration",
+            "https://userinfo@github.com/example/integration",
+            "file:///example/integration",
+        ):
+            with self.subTest(url=url):
+                self.git(self.project_root, "remote", "set-url", "origin", url)
+                result = self.run_release()
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("must identify a GitHub repository", result.stdout)
+                self.assertNotIn(url, result.stdout)
+                self.assertFalse((self.project_root / "dist-build.txt").exists())
+
+    def test_rejects_dirty_or_untracked_source_before_build(self):
+        (self.project_root / "tracked").write_text("dirty")
+        self.assert_rejected_before_side_effects("clean project worktree")
+        (self.project_root / "tracked").write_text("original\n")
+        (self.project_root / "untracked").write_text("untracked")
+        self.assert_rejected_before_side_effects("clean project worktree")
+
+    def test_rejects_non_main_head_but_allows_detached_main(self):
+        self.git(self.project_root, "checkout", "-q", "--detach")
+        result = self.run_release()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.git(self.project_root, "commit", "--allow-empty", "-qm", "feature only")
+        result = self.run_release()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("not on origin/main", result.stdout)
+
+    def test_build_cannot_change_head_source_or_origin_before_notarization(self):
+        for change, message in (("dirty", "clean project worktree"), ("head", "HEAD changed"), ("origin", "does not match")):
+            with self.subTest(change=change):
+                self.project_root = self.project("changed-" + change, "git@github.com:example/integration.git")
+                self.env["BUILD_CHANGE"] = change
+                self.log.unlink(missing_ok=True)
+                result = self.run_release()
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(message, result.stdout)
+                self.assertFalse(any(cmd == "xcrun" and args[:2] == ["notarytool", "submit"] for _, cmd, args in self.calls))
+
+    def test_signing_notary_stapling_and_gatekeeper_fail_closed(self):
+        self.env["CODESIGN_IDENTITY"] = "-"
+        result = self.run_release()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("requires CODESIGN_IDENTITY", result.stdout)
+        self.env["CODESIGN_IDENTITY"] = "Developer ID Application: Release Test"
+        for failure in ("xcrun notarytool submit", "xcrun stapler staple", "xcrun stapler validate", "spctl --assess --type"):
+            with self.subTest(failure=failure):
+                self.env["FAIL_COMMAND"] = failure
+                self.log.unlink(missing_ok=True)
+                result = self.run_release()
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertFalse(any(cmd == "gh" for _, cmd, _ in self.calls))
+
+    def test_failed_upload_cleans_up_only_selected_repository(self):
+        self.env["FAIL_COMMAND"] = "curl --fail-with-body --location"
+        result = self.run_release()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertTrue(any(args == ["api", "-X", "DELETE", "repos/example/integration/releases/42"] for _, cmd, args in self.calls if cmd == "gh"))
+        pushes = [(cwd, args) for cwd, cmd, args in self.calls if cmd == "git" and "push" in args]
+        self.assertEqual(len(pushes), 1)
+        self.assertEqual(pushes[0][0], str(self.project_root))
+        self.assertIn("--force-with-lease=refs/tags/v1.2.3:" + self.git(self.project_root, "rev-parse", "HEAD"), pushes[0][1])
+        self.assertEqual(pushes[0][1][-2:], ["origin", ":refs/tags/v1.2.3"])
+
+    def test_bad_upload_response_still_cleans_up_owned_draft(self):
+        self.env["MOCK_BAD_UPLOAD_URL"] = "1"
+        result = self.run_release()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertTrue(any(args == ["api", "-X", "DELETE", "repos/example/integration/releases/42"] for _, cmd, args in self.calls if cmd == "gh"))
+
+    def test_missing_release_id_never_uses_a_null_cleanup_endpoint(self):
+        self.env["MOCK_NO_RELEASE_ID"] = "1"
+        result = self.run_release()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertFalse(any("repos/example/integration/releases/null" in args for _, _, args in self.calls))
+        self.assertTrue(any(cmd == "git" and args[-2:] == ["origin", ":refs/tags/v1.2.3"] for _, cmd, args in self.calls))
+
+    def test_predecessor_must_be_unchanged_complete_and_in_selected_repository(self):
+        sha = self.git(self.project_root, "rev-parse", "HEAD")
+        self.env.update(
+            EXPECTED_PREVIOUS_TAG="v1.2.2", EXPECTED_PREVIOUS_SHA=sha,
+            MOCK_LATEST_TAG="v1.2.2", MOCK_LATEST_SHA=sha,
+        )
+        result = self.run_release()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertTrue(any(args[:5] == ["release", "view", "v1.2.2", "--repo", "example/integration"] for _, cmd, args in self.calls if cmd == "gh"))
+        self.env["EXPECTED_PREVIOUS_SHA"] = "0" * 40
+        result = self.run_release()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("predecessor v1.2.2 moved", result.stdout)
+        self.env["EXPECTED_PREVIOUS_SHA"] = sha
+        self.env["MOCK_RELEASE_INCOMPLETE"] = "1"
+        result = self.run_release()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("no longer complete", result.stdout)
+
+    def test_complete_superseding_release_exits_without_publishing(self):
+        sha = self.git(self.project_root, "rev-parse", "HEAD")
+        self.env.update(
+            EXPECTED_PREVIOUS_TAG="v1.2.2", EXPECTED_PREVIOUS_SHA=sha,
+            MOCK_LATEST_TAG="v1.2.4", MOCK_LATEST_SHA=sha,
+        )
+        result = self.run_release()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("superseded by complete descendant release v1.2.4", result.stdout)
+        self.assertFalse(any(cmd == "gh" and "POST" in args for _, cmd, args in self.calls))
+
+    def test_existing_version_or_tag_cannot_be_reused(self):
+        self.env["MOCK_LATEST_TAG"] = "v1.2.3"
+        result = self.run_release()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("release v1.2.3 already exists", result.stdout)
+        del self.env["MOCK_LATEST_TAG"]
+        self.env["MOCK_TAG_EXISTS"] = "1"
+        result = self.run_release()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("tag v1.2.3 already exists", result.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()
