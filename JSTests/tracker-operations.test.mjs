@@ -9,7 +9,7 @@ import test from "node:test";
 import {
   repositoryRoot,
   trackerResourceDir,
-} from "./support/fragments.mjs";
+} from "./support/tracker.mjs";
 
 const extensionPath = join(trackerResourceDir, "extension.mjs");
 const runtimeParent = join(repositoryRoot, "JSTests", ".tracker-operation-runtime");

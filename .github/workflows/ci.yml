@@ -10,14 +10,16 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v5
+      - name: Release entrypoint contracts
+        run: python3 scripts/test-release.py
       - name: Pure session rules
         run: swift test --package-path Packages/SessionDomain
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22.15.0
-      - name: JavaScript assets and contracts
-        run: PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" ./scripts/check-web-assets.sh
+      - name: Tracker assets and contracts
+        run: PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" ./scripts/check-tracker.sh
       - name: Test
         run: swift test
       - name: Release build

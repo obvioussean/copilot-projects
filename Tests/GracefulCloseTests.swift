@@ -1,7 +1,7 @@
 import XCTest
 import AppKit
 import CopilotProjectsCore
-@testable import copilot_projects
+@testable import CopilotProjectsHost
 
 private typealias CloseIdentity = TranscriptController.CloseProcessIdentity
 

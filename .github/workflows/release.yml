@@ -140,7 +140,9 @@ jobs:
 
       - name: Test
         if: steps.release.outputs.should_release == 'true'
-        run: swift test
+        run: |
+          python3 scripts/test-release.py
+          swift test
 
   release:
     needs: validate

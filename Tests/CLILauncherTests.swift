@@ -273,10 +273,10 @@ final class CLILauncherTests: XCTestCase {
         try fm.moveItem(at: decoyCore, to: packagedCore)
         let decoyResources = root.appendingPathComponent("Resources")
         try fm.createDirectory(at: decoyResources, withIntermediateDirectories: true)
-        try fm.moveItem(
-            at: resources.appendingPathComponent("PWAIcon-192.png"),
-            to: decoyResources.appendingPathComponent("PWAIcon-192.png")
-        )
+        let tracker = try XCTUnwrap(Bundle(url: packagedCore)?.url(
+            forResource: "extension", withExtension: "mjs", subdirectory: "tracker"
+        ))
+        try fm.moveItem(at: tracker, to: decoyResources.appendingPathComponent("extension.mjs"))
         for invocation in [executable.path, link.path, "copilot-projects"] {
             let result = try run(invocation, ["check-assets"], environment: ["PATH": root.path + ":/usr/bin:/bin"])
             XCTAssertEqual(result.status, 1, result.output)
@@ -321,12 +321,8 @@ final class CLILauncherTests: XCTestCase {
         try fm.createDirectory(at: resources, withIntermediateDirectories: true)
         let executable = macOS.appendingPathComponent("copilot-projects")
         try fm.copyItem(at: build.appendingPathComponent("copilot-projects"), to: executable)
-        for name in ["copilot-projects_CopilotProjectsCore.bundle", "copilot-projects_copilot-projects.bundle"] {
+        for name in ["copilot-projects_CopilotProjectsCore.bundle"] {
             try fm.copyItem(at: build.appendingPathComponent(name), to: resources.appendingPathComponent(name))
-        }
-        for size in [192, 512] {
-            let name = "PWAIcon-\(size).png"
-            try fm.copyItem(at: project.appendingPathComponent("Resources/\(name)"), to: resources.appendingPathComponent(name))
         }
         let info = [
             "CFBundleExecutable": "copilot-projects",

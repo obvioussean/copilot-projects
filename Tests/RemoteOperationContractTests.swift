@@ -1,6 +1,6 @@
 import XCTest
 import AppKit
-@testable import copilot_projects
+@testable import CopilotProjectsHost
 import CopilotProjectsProtocol
 
 final class RemoteOperationContractTests: XCTestCase {
@@ -587,100 +587,6 @@ final class RemoteOperationContractTests: XCTestCase {
         )
     }
 
-    func testControlBodyValidationRequiresBothOperationFields() throws {
-        let answerData = try JSONEncoder().encode(RemoteUserInputAnswer(
-            requestId: "question-1",
-            answer: "Go",
-            wasFreeform: false
-        ))
-        let answerPayload = String(decoding: answerData, as: UTF8.self)
-        let legacy = RemoteClientMessage(
-            type: "answer-user-input",
-            clientId: "phone",
-            sessionId: "session",
-            data: answerPayload
-        )
-        XCTAssertEqual(RemoteSDKControlValidation.operation(legacy), .legacy)
-        XCTAssertEqual(
-            RemoteSDKControlValidation.userInputAnswer(legacy)?.requestId,
-            "question-1"
-        )
-
-        let partial = RemoteClientMessage(
-            type: "answer-user-input",
-            clientId: "phone",
-            sessionId: "session",
-            requestId: "operation-1",
-            data: answerPayload
-        )
-        XCTAssertEqual(RemoteSDKControlValidation.operation(partial), .invalid)
-
-        let invalidToken = RemoteClientMessage(
-            type: "answer-user-input",
-            clientId: "phone",
-            sessionId: "session",
-            requestId: "operation 1",
-            data: answerPayload,
-            conversationEpoch: "epoch-1"
-        )
-        XCTAssertEqual(RemoteSDKControlValidation.operation(invalidToken), .invalid)
-
-        let correlated = RemoteClientMessage(
-            type: "answer-user-input",
-            clientId: "phone",
-            sessionId: "session",
-            requestId: "operation-1",
-            data: answerPayload,
-            conversationEpoch: "epoch-1"
-        )
-        XCTAssertEqual(
-            RemoteSDKControlValidation.operation(correlated),
-            .correlated(CLIOperationRequest(
-                operationId: "operation-1",
-                conversationEpoch: "epoch-1"
-            ))
-        )
-        XCTAssertEqual(
-            RemoteSDKControlValidation.userInputAnswer(correlated)?.requestId,
-            "question-1"
-        )
-        XCTAssertNil(RemoteSDKControlValidation.userInputAnswer(RemoteClientMessage(
-            type: "answer-user-input",
-            clientId: "phone",
-            sessionId: "session",
-            data: "{"
-        )))
-        XCTAssertNil(RemoteSDKControlValidation.elicitationAnswer(RemoteClientMessage(
-            type: "answer-elicitation",
-            clientId: "phone",
-            sessionId: "session",
-            data: "{}"
-        )))
-        XCTAssertNil(RemoteSDKControlValidation.modelSelection(RemoteClientMessage(
-            type: "set-model",
-            clientId: "phone",
-            sessionId: "session",
-            data: "{\"modelId\":\"\"}"
-        )))
-        XCTAssertEqual(
-            CLIOperationAdapter.payloadFingerprint(
-                kind: .answerElicitation,
-                payload: RemoteElicitationAnswer(
-                    requestId: "elicitation",
-                    action: .accept,
-                    content: ["b": .number(2), "a": .number(1)]
-                )
-            ),
-            CLIOperationAdapter.payloadFingerprint(
-                kind: .answerElicitation,
-                payload: RemoteElicitationAnswer(
-                    requestId: "elicitation",
-                    action: .accept,
-                    content: ["a": .number(1), "b": .number(2)]
-                )
-            )
-        )
-    }
 
     @MainActor
     func testSyntheticTerminalDefaultRejectsReceiptModeWithoutInvokingTerminal() throws {
@@ -1000,29 +906,4 @@ final class RemoteOperationContractTests: XCTestCase {
         XCTAssertEqual(projection.receipts, [])
     }
 
-    func testReceiptControlsPreserveWriterLeaseGating() {
-        let leases = RemoteWriterLeases()
-        leases.acquire(sessionId: "session", clientId: "phone")
-        XCTAssertNil(leases.withHeldLease(
-            sessionId: "session",
-            clientId: "laptop"
-        ) {
-            CLIOperationRequest(
-                operationId: "operation-1",
-                conversationEpoch: "epoch-1"
-            )
-        })
-        XCTAssertEqual(leases.withHeldLease(
-            sessionId: "session",
-            clientId: "phone"
-        ) {
-            CLIOperationRequest(
-                operationId: "operation-1",
-                conversationEpoch: "epoch-1"
-            )
-        }, CLIOperationRequest(
-            operationId: "operation-1",
-            conversationEpoch: "epoch-1"
-        ))
-    }
 }

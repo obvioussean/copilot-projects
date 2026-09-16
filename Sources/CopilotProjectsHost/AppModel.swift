@@ -35,7 +35,7 @@ private enum ScreenshotPreparation {
     case failure(String)
 }
 
-enum RemotePromptResult: Equatable {
+public enum RemotePromptResult: Equatable, Sendable {
     case sent
     case forbidden
     case invalid
@@ -43,14 +43,14 @@ enum RemotePromptResult: Equatable {
     case noLiveCopilot
 }
 
-enum RemoteCommandResult: Equatable {
+public enum RemoteCommandResult: Equatable, Sendable {
     case sent
     case busy
     case invalid
     case missing
 }
 
-enum RemoteTerminalInputResult: Equatable {
+public enum RemoteTerminalInputResult: Equatable, Sendable {
     case sent
     case missing
     case invalid
@@ -74,7 +74,7 @@ struct RemoteCommandRequestLedger {
 }
 
 /// Outcome of accepting a remote answer to a structured `ask_user` question.
-enum RemoteUserInputResult: Equatable {
+public enum RemoteUserInputResult: Equatable, Sendable {
     /// The request was published, or an identical correlated operation was replayed.
     case accepted
     /// A response for this tab is already awaiting the extension, or the question
@@ -140,7 +140,7 @@ struct RemoteElicitationTerminalTarget {
 /// Outcome of a remote `POST /sessions/create`. Each case maps to a distinct HTTP
 /// status at the gateway so the client can react precisely (select, retry, or show
 /// an unsupported/unavailable message).
-enum RemoteSessionCreationOutcome: Equatable {
+public enum RemoteSessionCreationOutcome: Equatable, Sendable {
     /// A brand-new session was created and its controller launched. (201)
     case created(RemoteCreateSessionResponse)
     /// The deterministic session already exists in the requested project — the
@@ -233,7 +233,7 @@ private enum WindowScreenshot {
     }
 }
 
-enum RemoteSessionMoveResult: Equatable {
+public enum RemoteSessionMoveResult: Equatable, Sendable {
     case moved
     case unchanged
     case missing
@@ -253,7 +253,7 @@ typealias GracefulSessionDestroyer = (
 ) -> Task<Void, Never>
 typealias ForcedSessionDestroyer = (_ sessionIds: [String]) -> Void
 
-enum RemoteSessionCloseResult: Equatable {
+public enum RemoteSessionCloseResult: Equatable, Sendable {
     case closed, missing, failed
 }
 
@@ -342,7 +342,8 @@ final class AppModel: ObservableObject {
         },
         diagnostics: { [unowned self] in self.renderDiagnostics() },
         remote: { [unowned self] action in
-            self.remoteAccess.command(action, model: self)
+            self.integration?.command(action)
+                ?? .failure("This build does not include a remote integration.")
         }
     ))
     private var stateLoadFailure: String?
@@ -350,7 +351,7 @@ final class AppModel: ObservableObject {
     private var stateRecoveryMessage: String?
     private var didPresentStateMessage = false
     private var server: ControlServer?
-    private let remoteAccess: RemoteAccessController
+    private var integration: (any HostIntegration)?
     private weak var notifications: (any NotificationPosting)?
     private var saveWork: DispatchWorkItem?
     private(set) var isTerminating = false
@@ -522,9 +523,6 @@ final class AppModel: ObservableObject {
             }
         },
         agentActivityScanObserver: (() -> Void)? = nil,
-        webPushService: WebPushService? = nil,
-        apnsService: APNsService? = nil,
-        notificationSync: NotificationSyncService? = nil,
         kittyImageDiskStore: RemoteKittyImageDiskStore = .shared,
         gracefulSessionDestroyer: @escaping GracefulSessionDestroyer = {
             sessionIds, store in
@@ -559,11 +557,6 @@ final class AppModel: ObservableObject {
         self.kittyImageDiskStore = kittyImageDiskStore
         self.gracefulSessionDestroyer = gracefulSessionDestroyer
         self.forcedSessionDestroyer = forcedSessionDestroyer
-        remoteAccess = RemoteAccessController(
-            webPushService: webPushService,
-            apnsService: apnsService,
-            notificationSync: notificationSync
-        )
         load()
     }
 
@@ -571,6 +564,10 @@ final class AppModel: ObservableObject {
 
     func attach(notifications: any NotificationPosting) {
         self.notifications = notifications
+    }
+
+    func attach(integration: (any HostIntegration)?) {
+        self.integration = integration
     }
 
     func activateKittyImagePersistence() {
@@ -1383,7 +1380,7 @@ final class AppModel: ObservableObject {
         agentActivitySource?.cancel()
         agentActivitySource = nil
         agentActivityRefreshGeneration += 1
-        remoteAccess.stopGateway()
+        integration?.stop()
     }
 
     func forcePendingSessionDestroys() {
@@ -1438,8 +1435,8 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func startRemoteAccessIfEnabled() {
-        remoteAccess.startIfEnabled(model: self)
+    func startIntegration() {
+        integration?.start()
     }
 
     /// Count of sessions with an in-flight agent (running or waiting).

@@ -13,18 +13,18 @@ extension StatusNotificationKind {
     }
 }
 
-struct NotificationEvent: Codable, Equatable, Sendable {
-    let id: UUID
-    let kind: StatusNotificationKind?
-    let title: String
-    let subtitle: String?
-    let body: String?
-    let projectId: String?
-    let sessionId: String?
-    let isTargetVisible: Bool
-    let sentAt: Date
+public struct NotificationEvent: Codable, Equatable, Sendable {
+    public let id: UUID
+    public let kind: StatusNotificationKind?
+    public let title: String
+    public let subtitle: String?
+    public let body: String?
+    public let projectId: String?
+    public let sessionId: String?
+    public let isTargetVisible: Bool
+    public let sentAt: Date
 
-    init(
+    public init(
         id: UUID = UUID(),
         kind: StatusNotificationKind?,
         title: String,
@@ -53,7 +53,7 @@ struct NotificationEvent: Codable, Equatable, Sendable {
         return components.joined(separator: "\n")
     }
 
-    var webBody: String {
+    public var webBody: String {
         var components: [String] = []
         if let subtitle, !subtitle.isEmpty { components.append(subtitle) }
         if let body, !body.isEmpty { components.append(body) }
@@ -62,8 +62,26 @@ struct NotificationEvent: Codable, Equatable, Sendable {
 }
 
 @MainActor
-protocol NotificationPosting: AnyObject {
+public protocol NotificationPosting: AnyObject {
     func post(_ event: NotificationEvent)
+}
+
+@MainActor
+final class HostNotificationPoster: NotificationPosting {
+    private let native: any NotificationPosting
+    private let integration: (any HostIntegration)?
+
+    init(native: any NotificationPosting, integration: (any HostIntegration)?) {
+        self.native = native
+        self.integration = integration
+    }
+
+    func post(_ event: NotificationEvent) {
+        if !event.isTargetVisible {
+            native.post(event)
+        }
+        integration?.postNotification(event)
+    }
 }
 
 @MainActor

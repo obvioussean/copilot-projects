@@ -11,6 +11,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT/scripts/bundle-resources.sh"
 APP="${1:-$ROOT/dist/Copilot Projects.app}"
 
 if [ ! -d "$APP" ]; then
@@ -24,15 +25,15 @@ RES="$APP/Contents/Resources"
 cd /
 
 CORE_BUNDLE="$RES/copilot-projects_CopilotProjectsCore.bundle"
-WEB_BUNDLE="$RES/copilot-projects_copilot-projects.bundle"
 
-for bundle in "$CORE_BUNDLE" "$WEB_BUNDLE"; do
+for bundle in "$CORE_BUNDLE"; do
   if [ ! -d "$bundle" ]; then
     echo "error: missing packaged resource bundle $bundle" >&2
     echo "       (scripts/build-app.sh copies these next to SwiftTerm_SwiftTerm.bundle)" >&2
     exit 1
   fi
 done
+CORE_RESOURCES="$(bundle_resources "$CORE_BUNDLE")"
 
 # A resource bundle at the .app root would mean the app is relying on SwiftPM's
 # Bundle.module main-bundle path instead of its own sealed Resources directory.
@@ -44,20 +45,7 @@ done
 
 # path-inside-the-app : matching source file
 PACKAGED=(
-  "$RES/PWAIcon-192.png:$ROOT/Resources/PWAIcon-192.png"
-  "$RES/PWAIcon-512.png:$ROOT/Resources/PWAIcon-512.png"
-  "$CORE_BUNDLE/tracker/extension.mjs:$ROOT/Sources/CopilotProjectsCore/Resources/tracker/extension.mjs"
-  "$WEB_BUNDLE/web/index.html:$ROOT/Sources/copilot-projects/Resources/web/index.html"
-  "$WEB_BUNDLE/web/app.css:$ROOT/Sources/copilot-projects/Resources/web/app.css"
-  "$WEB_BUNDLE/web/app.webmanifest:$ROOT/Sources/copilot-projects/Resources/web/app.webmanifest"
-  "$WEB_BUNDLE/web/service-worker.js:$ROOT/Sources/copilot-projects/Resources/web/service-worker.js"
-  "$WEB_BUNDLE/web/js/markdown.js:$ROOT/Sources/copilot-projects/Resources/web/js/markdown.js"
-  "$WEB_BUNDLE/web/js/draft.js:$ROOT/Sources/copilot-projects/Resources/web/js/draft.js"
-  "$WEB_BUNDLE/web/js/operations.js:$ROOT/Sources/copilot-projects/Resources/web/js/operations.js"
-  "$WEB_BUNDLE/web/js/session-creation.js:$ROOT/Sources/copilot-projects/Resources/web/js/session-creation.js"
-  "$WEB_BUNDLE/web/js/terminal-image.js:$ROOT/Sources/copilot-projects/Resources/web/js/terminal-image.js"
-  "$WEB_BUNDLE/web/js/transcript.js:$ROOT/Sources/copilot-projects/Resources/web/js/transcript.js"
-  "$WEB_BUNDLE/web/js/main.js:$ROOT/Sources/copilot-projects/Resources/web/js/main.js"
+  "$CORE_RESOURCES/tracker/extension.mjs:$ROOT/Sources/CopilotProjectsCore/Resources/tracker/extension.mjs"
 )
 
 for entry in "${PACKAGED[@]}"; do
@@ -75,10 +63,7 @@ for entry in "${PACKAGED[@]}"; do
 done
 
 if command -v node >/dev/null 2>&1; then
-  node --check "$CORE_BUNDLE/tracker/extension.mjs"
-  for script in "$WEB_BUNDLE"/web/js/*.js "$WEB_BUNDLE/web/service-worker.js"; do
-    node --check "$script"
-  done
+  node --check "$CORE_RESOURCES/tracker/extension.mjs"
   echo "ok: packaged JavaScript parses"
 else
   echo "note: node not found; skipped the packaged JavaScript syntax check" >&2

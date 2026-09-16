@@ -8,6 +8,10 @@ let package = Package(
         .iOS("17.0"),
     ],
     products: [
+        .library(name: "CopilotProjectsHost", targets: ["CopilotProjectsHost"]),
+        .library(name: "CopilotProjectsCore", targets: ["CopilotProjectsCore"]),
+        .executable(name: "copilot-projects", targets: ["copilot-projects"]),
+        .executable(name: "copilot-projects-link", targets: ["copilot-projects-link"]),
         .library(name: "CopilotProjectsUI", targets: ["CopilotProjectsUI"]),
         .library(
             name: "CopilotProjectsProtocol",
@@ -24,14 +28,6 @@ let package = Package(
         .package(
             url: "https://github.com/sirfergy/SwiftTerm",
             revision: "18de4c63fb5637d1a3d2ada17951f872682b329d"
-        ),
-        .package(
-            url: "https://github.com/apple/swift-nio",
-            revision: "cd3e1152083706d77b223fb29110e590efcc70c0"
-        ),
-        .package(
-            url: "https://github.com/mochidev/swift-webpush.git",
-            exact: "0.4.1"
         ),
     ],
     targets: [
@@ -62,21 +58,21 @@ let package = Package(
             path: "Sources/CopilotProjectsCore",
             resources: [.copy("Resources/tracker")]
         ),
-        .executableTarget(
-            name: "copilot-projects",
+        .target(
+            name: "CopilotProjectsHost",
             dependencies: [
                 "CopilotProjectsUI",
                 "CopilotProjectsCore",
                 "CopilotProjectsProtocol",
                 "SessionDomain",
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
-                .product(name: "NIOCore", package: "swift-nio"),
-                .product(name: "NIOPosix", package: "swift-nio"),
-                .product(name: "NIOHTTP1", package: "swift-nio"),
-                .product(name: "WebPush", package: "swift-webpush")
             ],
-            path: "Sources/copilot-projects",
-            resources: [.copy("Resources/web")]
+            path: "Sources/CopilotProjectsHost"
+        ),
+        .executableTarget(
+            name: "copilot-projects",
+            dependencies: ["CopilotProjectsHost"],
+            path: "Sources/copilot-projects"
         ),
         .executableTarget(
             name: "copilot-projects-link",
@@ -89,8 +85,7 @@ let package = Package(
                 "CopilotProjectsCore",
                 "CopilotProjectsProtocol",
                 "CopilotProjectsProtocolFixtures",
-                "copilot-projects",
-                .product(name: "WebPush", package: "swift-webpush"),
+                "CopilotProjectsHost",
             ],
             path: "Tests"
         )

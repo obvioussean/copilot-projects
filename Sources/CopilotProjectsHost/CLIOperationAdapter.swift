@@ -12,11 +12,11 @@ enum CLISDKOperationKind: String, Codable {
     case answerSessionBudget = "answer-session-budget"
 }
 
-struct CLIOperationRequest: Equatable {
-    let operationId: String
-    let conversationEpoch: String
+public struct CLIOperationRequest: Equatable, Sendable {
+    public let operationId: String
+    public let conversationEpoch: String
 
-    static func parse(
+    public static func parse(
         operationId: String?,
         conversationEpoch: String?
     ) -> CLIOperationRequestParse {
@@ -46,7 +46,7 @@ struct CLIOperationRequest: Equatable {
     }
 }
 
-enum CLIOperationRequestParse: Equatable {
+public enum CLIOperationRequestParse: Equatable, Sendable {
     case legacy
     case correlated(CLIOperationRequest)
     case invalid

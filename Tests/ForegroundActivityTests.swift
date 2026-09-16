@@ -2,7 +2,7 @@ import XCTest
 import AppKit
 import CopilotProjectsCore
 import Combine
-@testable import copilot_projects
+@testable import CopilotProjectsHost
 
 final class ForegroundActivityTests: XCTestCase {
     @MainActor
