@@ -206,6 +206,12 @@ NOTARY_PROFILE="copilot-projects-notary" \
 ./scripts/release.sh 0.1.0 --publish
 ```
 
+On shared build machines, set `CODESIGN_KEYCHAIN` to the job's signing keychain
+and `NOTARY_KEYCHAIN` to the keychain containing its notarization profile.
+Signing then uses the explicit keychain for identity discovery, app/helpers, and
+the DMG without replacing the user's keychain search list. Leaving
+`CODESIGN_KEYCHAIN` unset preserves the existing local signing behavior.
+
 Publishing requires a clean checkout whose HEAD is reachable from `origin/main`.
 The configured `GITHUB_REPOSITORY` (default `sirfergy/copilot-projects`) must match
 every effective `origin` fetch and push URL before building or notarizing.

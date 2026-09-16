@@ -121,6 +121,11 @@ if [ "$PUBLISH" = "1" ]; then
 fi
 
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
+CODESIGN_KEYCHAIN="${CODESIGN_KEYCHAIN:-}"
+IDENTITY_ARGS=(-v -p codesigning)
+if [ -n "$CODESIGN_KEYCHAIN" ]; then
+  IDENTITY_ARGS+=("$CODESIGN_KEYCHAIN")
+fi
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
 NOTARY_KEYCHAIN="${NOTARY_KEYCHAIN:-}"
 NOTARY_ARGS=()
@@ -139,8 +144,12 @@ fi
 # across builds and is required to notarize). Override by setting CODESIGN_IDENTITY,
 # or CODESIGN_IDENTITY=- to force ad-hoc for a throwaway local build.
 if [ -z "$CODESIGN_IDENTITY" ]; then
-  CODESIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+  CODESIGN_IDENTITY="$(security find-identity "${IDENTITY_ARGS[@]}" 2>/dev/null \
     | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
+  if [ -n "$CODESIGN_KEYCHAIN" ] && [ -z "$CODESIGN_IDENTITY" ]; then
+    echo "error: explicit signing keychain contains no Developer ID identity" >&2
+    exit 1
+  fi
   CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
 fi
 
@@ -149,7 +158,7 @@ if [ "$PUBLISH" = "1" ]; then
     echo "error: --publish requires CODESIGN_IDENTITY='Developer ID Application: …'" >&2
     exit 1
   }
-  security find-identity -v -p codesigning | grep -Fq "\"$CODESIGN_IDENTITY\"" || {
+  security find-identity "${IDENTITY_ARGS[@]}" | grep -Fq "\"$CODESIGN_IDENTITY\"" || {
     echo "error: codesigning identity not found: $CODESIGN_IDENTITY" >&2
     exit 1
   }
@@ -161,7 +170,7 @@ if [ "$PUBLISH" = "1" ]; then
 fi
 
 echo "==> building release app (v$VERSION)"
-VERSION="$VERSION" CODESIGN_IDENTITY="$CODESIGN_IDENTITY" \
+VERSION="$VERSION" CODESIGN_IDENTITY="$CODESIGN_IDENTITY" CODESIGN_KEYCHAIN="$CODESIGN_KEYCHAIN" \
   ./scripts/build-app.sh --release
 
 if [ "$PUBLISH" = "1" ]; then
@@ -208,7 +217,11 @@ rm -f "$DMG"
 hdiutil create -volname "$APP_NAME" -srcfolder "$STAGING" -ov -format UDZO "$DMG" >/dev/null
 if [ "$CODESIGN_IDENTITY" != "-" ] && [ "${#NOTARY_ARGS[@]}" -gt 0 ]; then
   echo "==> signing and notarizing DMG"
-  codesign --force --timestamp --sign "$CODESIGN_IDENTITY" "$DMG"
+  SIGN_ARGS=(--force --timestamp --sign "$CODESIGN_IDENTITY")
+  if [ -n "$CODESIGN_KEYCHAIN" ]; then
+    SIGN_ARGS+=(--keychain "$CODESIGN_KEYCHAIN")
+  fi
+  codesign "${SIGN_ARGS[@]}" "$DMG"
   xcrun notarytool submit "$DMG" \
     "${NOTARY_ARGS[@]}" --wait --timeout 20m
   xcrun stapler staple "$DMG"
