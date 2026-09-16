@@ -5,6 +5,43 @@ import CopilotProjectsProtocol
 @testable import CopilotProjectsHost
 
 final class SessionWorkflowTests: XCTestCase {
+    private func resultTurn(_ id: String, kind: String = "foreground", pending: Bool = false) -> TranscriptTurn {
+        TranscriptTurn(
+            id: id, startedAt: Date(timeIntervalSince1970: pending ? 200 : 100),
+            endedAt: pending ? nil : Date(timeIntervalSince1970: 150), kind: kind,
+            userContent: id, assistantMessages: [], tools: [], isAborted: false
+        )
+    }
+
+    func testDrawerResultStaysBeforeNewPromptEvenWhenCapturedLate() {
+        for kind in ["foreground", "scheduled", "automated"] {
+            let rows = TranscriptDrawerRow.make(
+                turns: [resultTurn("old", kind: kind), resultTurn("pending", pending: true)],
+                latestResult: RemoteTaskResult(
+                    turnId: "old", capturedAt: Date(timeIntervalSince1970: 300), status: "finished"
+                )
+            )
+            XCTAssertEqual(rows.map(\.id), ["turn-old", "result-old", "turn-pending"], kind)
+        }
+    }
+
+    func testDrawerKeepsOnlyTheLatestResultAtItsMatchingTurn() {
+        let turns = [resultTurn("old"), resultTurn("new")]
+        XCTAssertEqual(
+            TranscriptDrawerRow.make(turns: turns, latestResult: nil).map(\.id),
+            ["turn-old", "turn-new"]
+        )
+        for status in ["finished", "stopped", "blocked"] {
+            let result = RemoteTaskResult(turnId: "new", capturedAt: Date(), status: status)
+            let rows = TranscriptDrawerRow.make(turns: turns, latestResult: result)
+            XCTAssertEqual(rows.map(\.id), ["turn-old", "turn-new", "result-new"])
+            guard case .result(let rendered) = rows.last else {
+                return XCTFail("Expected the matching result after the last turn")
+            }
+            XCTAssertEqual(rendered, result)
+        }
+    }
+
     func testActionValidationIsClosedAndBudgetLimitsAreExplicit() throws {
         XCTAssertTrue(RemoteSessionAction(kind: .send, prompt: "hello", mode: .enqueue).isValid)
         XCTAssertFalse(RemoteSessionAction(kind: .send, prompt: "hello").isValid)
