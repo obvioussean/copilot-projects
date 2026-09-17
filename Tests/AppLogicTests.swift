@@ -7211,19 +7211,25 @@ final class AppLogicTests: XCTestCase {
         }
         for (key, value) in overrides { setenv(key, value, 1) }
         var launches = 0
+        var backendAvailable = true
+        var executable: String? = "/opt/copilot/bin/copilot"
+        var cwd: String? = root.path
         let model = try makeRemoteCreateModel(
             root: root, projects: [Project(id: "p1", name: "First", cwd: root.path)],
-            selectedProjectId: "p1", reposDirectory: { root.path },
+            selectedProjectId: "p1", copilotExecutable: { executable },
+            reposDirectory: { cwd }, backendAvailable: { backendAvailable },
             ledger: SessionCreationLedger(url: root.appendingPathComponent("ledger.json")),
             onLaunch: { _, _, _, _ in launches += 1 }
         )
         for reviewURL in [nil, "https://github.com/owner/repo/pull/12"] {
             let request = RemoteCreateSessionRequest(
                 requestId: UUID(), projectId: "p1", pullRequestURL: reviewURL)
-            func create() -> RemoteSessionCreationOutcome {
-                reviewURL == nil
-                    ? model.createRemoteConfiguredSession(request)
-                    : model.createRemoteAdversarialReviewSession(request)
+            func create(projectId: String = "p1") -> RemoteSessionCreationOutcome {
+                let input = RemoteCreateSessionRequest(
+                    requestId: request.requestId, projectId: projectId, pullRequestURL: reviewURL)
+                return reviewURL == nil
+                    ? model.createRemoteConfiguredSession(input)
+                    : model.createRemoteAdversarialReviewSession(input)
             }
             let socket = URL(fileURLWithPath: Paths.dtachSocketPath(sessionId: request.requestId.uuidString))
             try FileManager.default.createDirectory(
@@ -7231,12 +7237,33 @@ final class AppLogicTests: XCTestCase {
             try Data().write(to: socket)
             let before = launches
             XCTAssertEqual(create(), .conflict)
+            XCTAssertEqual(create(projectId: "missing"), .conflict)
+            backendAvailable = false
+            XCTAssertEqual(create(), .conflict)
+            backendAvailable = true
+            executable = nil
+            XCTAssertEqual(create(), .conflict)
+            executable = "/opt/copilot/bin/copilot"
+            cwd = nil
+            XCTAssertEqual(create(), .conflict)
+            cwd = root.path
             XCTAssertEqual(launches, before)
             try FileManager.default.removeItem(at: socket)
             for suffix in ["copilot-session", "copilot-allow-all"] {
                 try UUID().uuidString.write(
                     to: root.appendingPathComponent("\(request.requestId.uuidString).\(suffix)"),
                     atomically: true, encoding: .utf8)
+            }
+            backendAvailable = false
+            XCTAssertEqual(create(), .unavailable)
+            backendAvailable = true
+            cwd = nil
+            XCTAssertEqual(create(), .invalid)
+            cwd = root.path
+            XCTAssertEqual(launches, before)
+            for suffix in ["copilot-session", "copilot-allow-all"] {
+                XCTAssertTrue(FileManager.default.fileExists(atPath:
+                    root.appendingPathComponent("\(request.requestId.uuidString).\(suffix)").path))
             }
             XCTAssertEqual(create(), .created(RemoteCreateSessionResponse(
                 requestId: request.requestId, projectId: "p1", sessionId: request.requestId.uuidString)))

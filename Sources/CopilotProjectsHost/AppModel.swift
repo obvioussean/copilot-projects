@@ -1246,6 +1246,12 @@ final class AppModel: ObservableObject {
             return .gone
         }
 
+        // An orphaned terminal has no trustworthy intent binding to replay.
+        if !isLegacyRequest,
+           FileManager.default.fileExists(atPath: Paths.dtachSocketPath(sessionId: sessionId)) {
+            return .conflict
+        }
+
         guard let pi = projectIndex(request.projectId) else { return .unknownProject }
         guard remoteSessionBackendAvailable() else { return .unavailable }
         let copilotExecutable: String?
@@ -1258,10 +1264,6 @@ final class AppModel: ObservableObject {
         guard let cwd = remoteReposDirectory() else { return .invalid }
 
         if !isLegacyRequest {
-            // An orphaned terminal has no trustworthy intent binding to replay.
-            guard !FileManager.default.fileExists(atPath: Paths.dtachSocketPath(sessionId: sessionId)) else {
-                return .conflict
-            }
             for suffix in ["copilot-session", "copilot-allow-all"] {
                 let marker = resumeMarkerDirectory.appendingPathComponent("\(sessionId).\(suffix)")
                 if unlink(marker.path) == 0 { continue }
