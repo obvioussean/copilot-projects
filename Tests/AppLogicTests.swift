@@ -6463,7 +6463,7 @@ final class AppLogicTests: XCTestCase {
 
         // Idempotent replay: existing, no new session, no relaunch.
         XCTAssertEqual(model.createRemoteSession(request), .existing(expected))
-        XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+        XCTAssertEqual(model.createRemoteConfiguredSession(RemoteCreateSessionRequest(
             requestId: requestId, projectId: "p1", kind: .copilot)), .existing(expected))
         XCTAssertEqual(
             model.project("p1")?.sessions.filter { $0.id == requestId.uuidString }.count, 1)
@@ -6501,7 +6501,7 @@ final class AppLogicTests: XCTestCase {
         )
         XCTAssertNil(try ledger.record(for: request.requestId, now: now))
         XCTAssertEqual(
-            model.createRemoteSession(RemoteCreateSessionRequest(
+            model.createRemoteConfiguredSession(RemoteCreateSessionRequest(
                 requestId: request.requestId, projectId: "p1", kind: .terminal), now: now),
             .conflict
         )
@@ -7001,7 +7001,7 @@ final class AppLogicTests: XCTestCase {
             .gone
         )
         XCTAssertEqual(
-            model.createRemoteSession(
+            model.createRemoteConfiguredSession(
                 RemoteCreateSessionRequest(requestId: requestId, projectId: "p1", kind: .terminal)),
             .conflict
         )
@@ -7113,7 +7113,7 @@ final class AppLogicTests: XCTestCase {
             .unavailable
         )
         XCTAssertEqual(
-            noBackendModel.createRemoteSession(
+            noBackendModel.createRemoteConfiguredSession(
                 RemoteCreateSessionRequest(requestId: noBackendId, projectId: "p1", kind: .terminal)),
             .unavailable
         )
@@ -7128,7 +7128,7 @@ final class AppLogicTests: XCTestCase {
             .invalid)
         copilot = nil
         XCTAssertEqual(
-            model.createRemoteSession(
+            model.createRemoteConfiguredSession(
                 RemoteCreateSessionRequest(requestId: invalidId, projectId: "p1", kind: .terminal)),
             .invalid)
         XCTAssertNil(try ledger.record(for: invalidId))
@@ -7155,7 +7155,9 @@ final class AppLogicTests: XCTestCase {
             copilotExecutable: { executable }, reposDirectory: { repos.path }, ledger: ledger,
             onLaunch: { launches.append(($0, $1, $2, $3)) }
         )
+        let bridge: any SessionHost = RemoteModelBridge(model: model)
         let cases: [(RemoteSessionKind?, String?)] = [
+            (nil, nil),
             (nil, "  UNIQUE_STARTING_PROMPT; $(touch SHOULD_NOT_EXIST)\r\n100% literal  "),
             (.copilot, nil),
             (.terminal, nil),
@@ -7169,7 +7171,7 @@ final class AppLogicTests: XCTestCase {
             let response = RemoteCreateSessionResponse(
                 requestId: request.requestId, projectId: project.id,
                 sessionId: request.requestId.uuidString)
-            XCTAssertEqual(model.createRemoteSession(request), .created(response))
+            XCTAssertEqual(bridge.createConfiguredSession(request), .created(response))
             XCTAssertEqual(launches.count, index + 1)
             XCTAssertEqual(launches.last?.id, response.sessionId)
             XCTAssertEqual(launches.last?.executable, executable)
@@ -7183,12 +7185,66 @@ final class AppLogicTests: XCTestCase {
             XCTAssertEqual(
                 try ledger.record(for: request.requestId)?.creationFingerprint,
                 session.creationFingerprint)
-            XCTAssertEqual(model.createRemoteSession(request), .existing(response))
+            XCTAssertEqual(model.createRemoteConfiguredSession(request), .existing(response))
             XCTAssertEqual(launches.count, index + 1)
         }
         for file in ["state.json", "ledger.json"] {
             XCTAssertFalse(try String(contentsOf: root.appendingPathComponent(file), encoding: .utf8)
                 .contains("UNIQUE_STARTING_PROMPT"))
+        }
+    }
+
+    @MainActor
+    func testCreateRemoteDefaultConfiguredAndReviewRequestsNeverUseLegacyExemptions() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let overrides = [
+            "COPILOT_PROJECTS_STATE_DIR": root.path,
+            "COPILOT_PROJECTS_SOCKET": root.appendingPathComponent("control.sock").path,
+        ]
+        let previous = overrides.keys.map { ($0, ProcessInfo.processInfo.environment[$0]) }
+        defer {
+            for (key, value) in previous {
+                if let value { setenv(key, value, 1) } else { unsetenv(key) }
+            }
+        }
+        for (key, value) in overrides { setenv(key, value, 1) }
+        var launches = 0
+        let model = try makeRemoteCreateModel(
+            root: root, projects: [Project(id: "p1", name: "First", cwd: root.path)],
+            selectedProjectId: "p1", reposDirectory: { root.path },
+            ledger: SessionCreationLedger(url: root.appendingPathComponent("ledger.json")),
+            onLaunch: { _, _, _, _ in launches += 1 }
+        )
+        for reviewURL in [nil, "https://github.com/owner/repo/pull/12"] {
+            let request = RemoteCreateSessionRequest(
+                requestId: UUID(), projectId: "p1", pullRequestURL: reviewURL)
+            func create() -> RemoteSessionCreationOutcome {
+                reviewURL == nil
+                    ? model.createRemoteConfiguredSession(request)
+                    : model.createRemoteAdversarialReviewSession(request)
+            }
+            let socket = URL(fileURLWithPath: Paths.dtachSocketPath(sessionId: request.requestId.uuidString))
+            try FileManager.default.createDirectory(
+                at: socket.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data().write(to: socket)
+            let before = launches
+            XCTAssertEqual(create(), .conflict)
+            XCTAssertEqual(launches, before)
+            try FileManager.default.removeItem(at: socket)
+            for suffix in ["copilot-session", "copilot-allow-all"] {
+                try UUID().uuidString.write(
+                    to: root.appendingPathComponent("\(request.requestId.uuidString).\(suffix)"),
+                    atomically: true, encoding: .utf8)
+            }
+            XCTAssertEqual(create(), .created(RemoteCreateSessionResponse(
+                requestId: request.requestId, projectId: "p1", sessionId: request.requestId.uuidString)))
+            XCTAssertEqual(launches, before + 1)
+            for suffix in ["copilot-session", "copilot-allow-all"] {
+                XCTAssertFalse(FileManager.default.fileExists(atPath:
+                    root.appendingPathComponent("\(request.requestId.uuidString).\(suffix)").path))
+            }
         }
     }
 
@@ -7210,18 +7266,22 @@ final class AppLogicTests: XCTestCase {
             "", " \n\t", "\u{0}", "\u{1b}", "\u{7f}", "\u{85}",
             String(repeating: "x", count: 8_193), String(repeating: "é", count: 4_097),
         ] {
-            XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+            XCTAssertEqual(model.createRemoteConfiguredSession(RemoteCreateSessionRequest(
                 requestId: UUID(), projectId: project.id, kind: .copilot, initialPrompt: prompt)),
                 .badRequest)
         }
         for prompt in ["", "valid prompt"] {
-            XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+            XCTAssertEqual(model.createRemoteConfiguredSession(RemoteCreateSessionRequest(
                 requestId: UUID(), projectId: project.id, kind: .terminal, initialPrompt: prompt)),
                 .badRequest)
         }
         let reviewURL = "https://github.com/owner/repo/pull/12"
-        XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+        XCTAssertEqual(model.createRemoteConfiguredSession(RemoteCreateSessionRequest(
             requestId: UUID(), projectId: project.id, pullRequestURL: reviewURL)), .badRequest)
+        XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+            requestId: UUID(), projectId: project.id, kind: .copilot)), .badRequest)
+        XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+            requestId: UUID(), projectId: project.id, initialPrompt: "configured")), .badRequest)
         for kind in [RemoteSessionKind.copilot, .terminal] {
             XCTAssertEqual(model.createRemoteAdversarialReviewSession(RemoteCreateSessionRequest(
                 requestId: UUID(), projectId: project.id, pullRequestURL: reviewURL, kind: kind)),
@@ -7284,10 +7344,10 @@ final class AppLogicTests: XCTestCase {
         try FileManager.default.createDirectory(
             at: orphanSocket.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data().write(to: orphanSocket)
-        XCTAssertEqual(model.createRemoteSession(request), .conflict)
+        XCTAssertEqual(model.createRemoteConfiguredSession(request), .conflict)
         XCTAssertFalse(FileManager.default.fileExists(atPath: capturedArguments.path))
         try FileManager.default.removeItem(at: orphanSocket)
-        XCTAssertEqual(model.createRemoteSession(request), .created(RemoteCreateSessionResponse(
+        XCTAssertEqual(model.createRemoteConfiguredSession(request), .created(RemoteCreateSessionResponse(
             requestId: request.requestId, projectId: "p1", sessionId: request.requestId.uuidString)))
         for suffix in ["copilot-session", "copilot-allow-all"] {
             XCTAssertFalse(FileManager.default.fileExists(atPath:
@@ -7377,7 +7437,7 @@ final class AppLogicTests: XCTestCase {
             selectedProjectId: "p1", copilotExecutable: { nil }, reposDirectory: { root.path },
             ledger: ledger, onLaunch: { _, _, _, _ in launches += 1 }
         )
-        XCTAssertEqual(model.createRemoteSession(request), .persistenceUnavailable)
+        XCTAssertEqual(model.createRemoteConfiguredSession(request), .persistenceUnavailable)
         XCTAssertEqual(launches, 0)
         XCTAssertTrue(model.project("p1")?.sessions.isEmpty == true)
         XCTAssertNil(try ledger.record(for: request.requestId))
@@ -7398,9 +7458,9 @@ final class AppLogicTests: XCTestCase {
         )
         let id = UUID()
         let response = RemoteCreateSessionResponse(requestId: id, projectId: "p1", sessionId: id.uuidString)
-        XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+        XCTAssertEqual(model.createRemoteConfiguredSession(RemoteCreateSessionRequest(
             requestId: id, projectId: "p1", initialPrompt: "first\r\nsecond")), .created(response))
-        XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+        XCTAssertEqual(model.createRemoteConfiguredSession(RemoteCreateSessionRequest(
             requestId: id, projectId: "p1", kind: .copilot, initialPrompt: "first\nsecond")), .existing(response))
         for request in [
             RemoteCreateSessionRequest(requestId: id, projectId: "p1", kind: .terminal),
@@ -7408,7 +7468,7 @@ final class AppLogicTests: XCTestCase {
             RemoteCreateSessionRequest(requestId: id, projectId: "p1", initialPrompt: "different"),
             RemoteCreateSessionRequest(requestId: id, projectId: "p2", initialPrompt: "first\nsecond"),
         ] {
-            XCTAssertEqual(model.createRemoteSession(request), .conflict)
+            XCTAssertEqual(model.createRemoteConfiguredSession(request), .conflict)
         }
         XCTAssertEqual(model.createRemoteAdversarialReviewSession(RemoteCreateSessionRequest(
             requestId: id, projectId: "p1", pullRequestURL: "https://github.com/owner/repo/pull/12")),
@@ -7454,7 +7514,7 @@ final class AppLogicTests: XCTestCase {
         )
         let request = RemoteCreateSessionRequest(
             requestId: UUID(), projectId: "p1", kind: .copilot, initialPrompt: "UNIQUE_RESTART_PROMPT")
-        XCTAssertEqual(model.createRemoteSession(request), .persistenceUnavailable)
+        XCTAssertEqual(model.createRemoteConfiguredSession(request), .persistenceUnavailable)
         XCTAssertEqual(launches, 1)
         XCTAssertEqual(model.moveRemoteSession(sessionId: request.requestId.uuidString, toProjectId: "p2"), .moved)
         try FileManager.default.removeItem(at: ledgerURL)
@@ -7476,9 +7536,9 @@ final class AppLogicTests: XCTestCase {
             RemoteCreateSessionRequest(
                 requestId: request.requestId, projectId: "p2", initialPrompt: request.initialPrompt),
         ] {
-            XCTAssertEqual(restarted.createRemoteSession(changed), .conflict)
+            XCTAssertEqual(restarted.createRemoteConfiguredSession(changed), .conflict)
         }
-        XCTAssertEqual(restarted.createRemoteSession(request), .existing(RemoteCreateSessionResponse(
+        XCTAssertEqual(restarted.createRemoteConfiguredSession(request), .existing(RemoteCreateSessionResponse(
             requestId: request.requestId, projectId: "p2", sessionId: request.requestId.uuidString)))
         XCTAssertEqual(launches, 1)
         XCTAssertNotNil(try ledger.record(for: request.requestId)?.creationFingerprint)
@@ -7505,9 +7565,9 @@ final class AppLogicTests: XCTestCase {
             selectedProjectId: "p1", reposDirectory: { root.path }, ledger: ledger,
             onLaunch: { _, _, _, _ in launches += 1 }
         )
-        XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+        XCTAssertEqual(model.createRemoteConfiguredSession(RemoteCreateSessionRequest(
             requestId: id, projectId: "p1", kind: .terminal)), .gone)
-        XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+        XCTAssertEqual(model.createRemoteConfiguredSession(RemoteCreateSessionRequest(
             requestId: id, projectId: "p1", kind: .copilot)), .conflict)
         XCTAssertEqual(launches, 0)
     }
@@ -7532,10 +7592,13 @@ final class AppLogicTests: XCTestCase {
         let legacy = RemoteCreateSessionRequest(requestId: id, projectId: "p1")
         XCTAssertEqual(model.createRemoteSession(legacy), .existing(
             RemoteCreateSessionResponse(requestId: id, projectId: "p2", sessionId: id.uuidString)))
-        for kind in [RemoteSessionKind.copilot, .terminal] {
-            XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+        for kind in [nil, RemoteSessionKind.copilot, .terminal] {
+            XCTAssertEqual(model.createRemoteConfiguredSession(RemoteCreateSessionRequest(
                 requestId: id, projectId: "p1", kind: kind)), .conflict)
         }
+        XCTAssertEqual(model.createRemoteAdversarialReviewSession(RemoteCreateSessionRequest(
+            requestId: id, projectId: "p1", pullRequestURL: "https://github.com/owner/repo/pull/12")),
+            .conflict)
         XCTAssertNil(model.project("p2")?.sessions.first?.creationFingerprint)
         XCTAssertNil(try ledger.record(for: id)?.creationFingerprint)
         XCTAssertEqual(launches, 0)

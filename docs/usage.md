@@ -315,8 +315,8 @@ The normal build and release do not resolve or bundle optional integrations.
 
 An integrating gateway can expose `RemoteSessionContract.configuredCreatePath`
 (`sessions/create-configured`) and pass its decoded `RemoteCreateSessionRequest`
-to `SessionHost.createSession`. In addition to `requestId` and `projectId`, the
-request accepts optional `kind` (`copilot` or `terminal`) and `initialPrompt`.
+to `SessionHost.createConfiguredSession`. In addition to `requestId` and
+`projectId`, the request accepts optional `kind` (`copilot` or `terminal`) and `initialPrompt`.
 Omitted kind means Copilot; omitted prompt means an unprompted session. Copilot
 uses `--allow-all`; a terminal opens a plain shell without requiring Copilot.
 Both retain the remote `~/Repos` working-directory and desktop-selection policy.
@@ -327,7 +327,8 @@ characters other than line breaks and tabs. Terminal requests cannot carry a
 prompt. Configured creation rejects `pullRequestURL`; the separate review route
 accepts its canonical PR URL and rejects `kind` and `initialPrompt`.
 
-Gateways must reject launch options on the legacy `sessions/create` route and
+Gateways and `SessionHost.createSession` reject launch options on the legacy
+`sessions/create` route. Gateways must
 expose the configured route only when the host advertises the
 `configured-session-creation` protocol capability. Clients must not
 fall back to the legacy endpoint when configured creation is unsupported: older
@@ -336,17 +337,24 @@ or launch Copilot instead of a terminal. Allow enough JSON body space for an
 escaped maximum-size prompt.
 Custom `SessionHost` implementations that do not honor these options must
 publish protocol metadata without `configured-session-creation`.
+The public `RemoteProtocolInfo` initializer accepts a filtered
+`RemoteProtocolInfo.current.capabilities` array; other capabilities need not be
+copied into a hard-coded list.
+The default `createConfiguredSession` implementation returns unavailable rather
+than falling back to a conformer's legacy `createSession` implementation.
 
 Keep an immutable request body and UUID for an explicit retry after a network
 or 5xx error. Do not automatically resubmit prompts, reuse a UUID after changing
 the project or launch options, or retain pending retries indefinitely. A matching
 retry returns the original session, even if it moved projects; a changed intent
-returns 409. Historical sessions without an intent fingerprint accept only
-legacy-shaped retries, not new launch options. The host persists intent hashes,
+returns 409. Historical sessions without an intent fingerprint accept retries
+only through the legacy `sessions/create` route. Configured and review routes
+return 409 for those unverifiable historical replays, including optionless
+configured requests and old review attempts. The host persists intent hashes,
 not starting-prompt text.
 An existing terminal socket without a stored intent cannot satisfy a configured
-create, even if its master may have exited; it returns 409 rather than assuming
-the requested intent is safe to repeat. Fresh configured
+or review create, even if its master may have exited; it returns 409 rather than assuming
+the requested intent is safe to repeat. Fresh configured and review
 launches clear stale Copilot resume markers before creating a terminal.
 
 Binding survives workspace or ledger repair while either retains the intent.

@@ -1106,6 +1106,23 @@ final class AppModel: ObservableObject {
         _ request: RemoteCreateSessionRequest,
         now: Date = Date()
     ) -> RemoteSessionCreationOutcome {
+        guard request.kind == nil, request.initialPrompt == nil, request.pullRequestURL == nil else {
+            return .badRequest
+        }
+        return createRemoteSession(
+            request,
+            isLegacyRequest: true,
+            kind: .copilot,
+            title: "Copilot",
+            initialPrompt: nil,
+            now: now
+        )
+    }
+
+    func createRemoteConfiguredSession(
+        _ request: RemoteCreateSessionRequest,
+        now: Date = Date()
+    ) -> RemoteSessionCreationOutcome {
         guard request.pullRequestURL == nil else { return .badRequest }
         let kind = request.kind ?? .copilot
         if let prompt = request.initialPrompt {
@@ -1118,6 +1135,7 @@ final class AppModel: ObservableObject {
             .replacingOccurrences(of: "\r", with: "\n")
         return createRemoteSession(
             request,
+            isLegacyRequest: false,
             kind: kind,
             title: kind == .terminal ? "shell" : "Copilot",
             initialPrompt: prompt,
@@ -1137,6 +1155,7 @@ final class AppModel: ObservableObject {
         }
         return createRemoteSession(
             request,
+            isLegacyRequest: false,
             kind: .copilot,
             title: target.title,
             initialPrompt: Self.adversarialReviewPrompt(for: target),
@@ -1146,6 +1165,7 @@ final class AppModel: ObservableObject {
 
     private func createRemoteSession(
         _ request: RemoteCreateSessionRequest,
+        isLegacyRequest: Bool,
         kind: RemoteSessionKind,
         title: String,
         initialPrompt: String?,
@@ -1163,7 +1183,6 @@ final class AppModel: ObservableObject {
             initialPrompt: request.pullRequestURL == nil ? initialPrompt : nil,
             pullRequestURL: request.pullRequestURL
         )
-        let isLegacyRequest = request.kind == nil && request.initialPrompt == nil
         let creationRecord: SessionCreationRecord?
         do {
             creationRecord = try sessionCreationLedger.record(
