@@ -257,5 +257,5 @@ jobs:
             "$RUNNER_TEMP/copilot-projects-signing-probe"
           keychain_path="$RUNNER_TEMP/copilot-projects-signing.keychain-db"
           if [ -f "$keychain_path" ]; then
-            security delete-keychain "$keychain_path"
+            python3 scripts/keychain-search.py --delete "$keychain_path"
           fi
