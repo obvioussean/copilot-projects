@@ -5089,6 +5089,34 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(bounded.contains { $0.requestId == "r\(overflow - 1)" })
     }
 
+    func testSessionCreationFingerprintRoundTripsWithoutInventingLegacyIntent() throws {
+        let legacySession = Data(#"{"id":"s1","title":"shell","cwd":"/tmp"}"#.utf8)
+        XCTAssertNil(try JSONDecoder().decode(Session.self, from: legacySession).creationFingerprint)
+        let fingerprint = SessionCreationRecord.fingerprint(
+            projectId: "p1", kind: .copilot, initialPrompt: "prompt", pullRequestURL: nil)
+        XCTAssertEqual(fingerprint.count, 64)
+        let session = Session(id: "s1", title: "Copilot", cwd: "/tmp", creationFingerprint: fingerprint)
+        XCTAssertEqual(
+            try JSONDecoder().decode(Session.self, from: JSONEncoder().encode(session)),
+            session
+        )
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let legacyRecord = Data("""
+            {"requestId":"s1","projectId":"p1","sessionId":"s1","createdAt":"2026-09-01T00:00:00Z"}
+            """.utf8)
+        XCTAssertNil(try decoder.decode(SessionCreationRecord.self, from: legacyRecord).creationFingerprint)
+        let record = SessionCreationRecord(
+            requestId: "s1", projectId: "p1", sessionId: "s1",
+            createdAt: Date(timeIntervalSince1970: 1_900_000_000),
+            creationFingerprint: fingerprint)
+        XCTAssertEqual(
+            try JSONDecoder().decode(SessionCreationRecord.self, from: JSONEncoder().encode(record)),
+            record
+        )
+    }
+
     func testSessionCreationLedgerRejectsMalformedAndNonFileState() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -6058,7 +6086,7 @@ final class AppLogicTests: XCTestCase {
         let project = Project(
             id: "p1", name: "First", cwd: "/tmp",
             sessions: [existing], selectedSessionId: existing.id)
-        var launches: [(String, String, String?, Bool)] = []
+        var launches: [(String, String?, String?, Bool)] = []
         let model = try makeRemoteCreateModel(
             root: root, projects: [project], selectedProjectId: project.id,
             reposDirectory: { nil },
@@ -6370,7 +6398,7 @@ final class AppLogicTests: XCTestCase {
         reposDirectory: @escaping () -> String?,
         backendAvailable: @escaping () -> Bool = { true },
         ledger: SessionCreationLedger,
-        onLaunch: @escaping (String, String, String?, Bool) -> Void
+        onLaunch: @escaping (String, String?, String?, Bool) -> Void
     ) throws -> AppModel {
         let repository = StateRepository(path: root.appendingPathComponent("state.json"))
         try repository.save(PersistedState(
@@ -6402,7 +6430,7 @@ final class AppLogicTests: XCTestCase {
             id: "p1", name: "First", cwd: "/tmp",
             sessions: [existing], selectedSessionId: "existing")
         let ledger = SessionCreationLedger(url: root.appendingPathComponent("ledger.json"))
-        var launches: [(sessionId: String, executable: String, prompt: String?, allowAll: Bool)] = []
+        var launches: [(sessionId: String, executable: String?, prompt: String?, allowAll: Bool)] = []
         let model = try makeRemoteCreateModel(
             root: root,
             projects: [project],
@@ -6435,6 +6463,8 @@ final class AppLogicTests: XCTestCase {
 
         // Idempotent replay: existing, no new session, no relaunch.
         XCTAssertEqual(model.createRemoteSession(request), .existing(expected))
+        XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+            requestId: requestId, projectId: "p1", kind: .copilot)), .existing(expected))
         XCTAssertEqual(
             model.project("p1")?.sessions.filter { $0.id == requestId.uuidString }.count, 1)
         XCTAssertEqual(launches.count, 1)
@@ -6470,6 +6500,12 @@ final class AppLogicTests: XCTestCase {
             model.project("p1")?.sessions.first { $0.id == request.requestId.uuidString }
         )
         XCTAssertNil(try ledger.record(for: request.requestId, now: now))
+        XCTAssertEqual(
+            model.createRemoteSession(RemoteCreateSessionRequest(
+                requestId: request.requestId, projectId: "p1", kind: .terminal), now: now),
+            .conflict
+        )
+        XCTAssertEqual(launches, 1)
 
         try FileManager.default.removeItem(at: stateURL)
         let expected = RemoteCreateSessionResponse(
@@ -6714,7 +6750,7 @@ final class AppLogicTests: XCTestCase {
         let ledger = SessionCreationLedger(
             url: root.appendingPathComponent("ledger.json")
         )
-        var launches: [(sessionId: String, executable: String, prompt: String?, allowAll: Bool)] = []
+        var launches: [(sessionId: String, executable: String?, prompt: String?, allowAll: Bool)] = []
         let model = try makeRemoteCreateModel(
             root: root,
             projects: [project],
@@ -6789,7 +6825,7 @@ final class AppLogicTests: XCTestCase {
         let ledger = SessionCreationLedger(
             url: root.appendingPathComponent("ledger.json")
         )
-        var launches: [(sessionId: String, executable: String, prompt: String?, allowAll: Bool)] = []
+        var launches: [(sessionId: String, executable: String?, prompt: String?, allowAll: Bool)] = []
         let model = try makeRemoteCreateModel(
             root: root,
             projects: [project],
@@ -6964,6 +7000,11 @@ final class AppLogicTests: XCTestCase {
                 RemoteCreateSessionRequest(requestId: requestId, projectId: "p1")),
             .gone
         )
+        XCTAssertEqual(
+            model.createRemoteSession(
+                RemoteCreateSessionRequest(requestId: requestId, projectId: "p1", kind: .terminal)),
+            .conflict
+        )
         XCTAssertTrue(model.project("p1")?.sessions.isEmpty == true)
         XCTAssertEqual(launches, 0)
     }
@@ -7071,6 +7112,11 @@ final class AppLogicTests: XCTestCase {
                 RemoteCreateSessionRequest(requestId: noBackendId, projectId: "p1")),
             .unavailable
         )
+        XCTAssertEqual(
+            noBackendModel.createRemoteSession(
+                RemoteCreateSessionRequest(requestId: noBackendId, projectId: "p1", kind: .terminal)),
+            .unavailable
+        )
         XCTAssertNil(try ledger.record(for: noBackendId))
 
         // Repos missing → unprocessable, nothing created.
@@ -7080,9 +7126,418 @@ final class AppLogicTests: XCTestCase {
             model.createRemoteSession(
                 RemoteCreateSessionRequest(requestId: invalidId, projectId: "p1")),
             .invalid)
+        copilot = nil
+        XCTAssertEqual(
+            model.createRemoteSession(
+                RemoteCreateSessionRequest(requestId: invalidId, projectId: "p1", kind: .terminal)),
+            .invalid)
         XCTAssertNil(try ledger.record(for: invalidId))
 
         XCTAssertTrue(model.project("p1")?.sessions.isEmpty == true)
+        XCTAssertEqual(launches, 0)
+    }
+
+    @MainActor
+    func testCreateRemoteConfiguredSessionUsesRequestedKindAndPrompt() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let repos = root.appendingPathComponent("Repos")
+        try FileManager.default.createDirectory(at: repos, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let existing = Session(id: "existing", title: "shell", cwd: root.path)
+        let project = Project(
+            id: "p1", name: "First", cwd: "/tmp",
+            sessions: [existing], selectedSessionId: existing.id)
+        var executable: String? = "/opt/copilot/bin/copilot"
+        var launches: [(id: String, executable: String?, prompt: String?, allowAll: Bool)] = []
+        let ledger = SessionCreationLedger(url: root.appendingPathComponent("ledger.json"))
+        let model = try makeRemoteCreateModel(
+            root: root, projects: [project], selectedProjectId: project.id,
+            copilotExecutable: { executable }, reposDirectory: { repos.path }, ledger: ledger,
+            onLaunch: { launches.append(($0, $1, $2, $3)) }
+        )
+        let cases: [(RemoteSessionKind?, String?)] = [
+            (nil, "  UNIQUE_STARTING_PROMPT; $(touch SHOULD_NOT_EXIST)\r\n100% literal  "),
+            (.copilot, nil),
+            (.terminal, nil),
+            (.copilot, String(repeating: "é", count: 4_096)),
+        ]
+        for (index, value) in cases.enumerated() {
+            let (kind, prompt) = value
+            executable = kind == .terminal ? nil : "/opt/copilot/bin/copilot"
+            let request = RemoteCreateSessionRequest(
+                requestId: UUID(), projectId: project.id, kind: kind, initialPrompt: prompt)
+            let response = RemoteCreateSessionResponse(
+                requestId: request.requestId, projectId: project.id,
+                sessionId: request.requestId.uuidString)
+            XCTAssertEqual(model.createRemoteSession(request), .created(response))
+            XCTAssertEqual(launches.count, index + 1)
+            XCTAssertEqual(launches.last?.id, response.sessionId)
+            XCTAssertEqual(launches.last?.executable, executable)
+            XCTAssertEqual(launches.last?.allowAll, kind != .terminal)
+            XCTAssertEqual(launches.last?.prompt, prompt?.replacingOccurrences(of: "\r\n", with: "\n"))
+            let session = try XCTUnwrap(model.project(project.id)?.sessions.last)
+            XCTAssertEqual(session.title, kind == .terminal ? "shell" : "Copilot")
+            XCTAssertEqual(session.cwd, repos.path)
+            XCTAssertEqual(session.creationFingerprint?.count, 64)
+            XCTAssertEqual(model.project(project.id)?.selectedSessionId, existing.id)
+            XCTAssertEqual(
+                try ledger.record(for: request.requestId)?.creationFingerprint,
+                session.creationFingerprint)
+            XCTAssertEqual(model.createRemoteSession(request), .existing(response))
+            XCTAssertEqual(launches.count, index + 1)
+        }
+        for file in ["state.json", "ledger.json"] {
+            XCTAssertFalse(try String(contentsOf: root.appendingPathComponent(file), encoding: .utf8)
+                .contains("UNIQUE_STARTING_PROMPT"))
+        }
+    }
+
+    @MainActor
+    func testCreateRemoteConfiguredSessionRejectsInvalidOptionsBeforeLedgerAccess() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let ledgerURL = root.appendingPathComponent("ledger.json")
+        let project = Project(id: "p1", name: "First", cwd: root.path)
+        var launches = 0
+        let model = try makeRemoteCreateModel(
+            root: root, projects: [project], selectedProjectId: project.id,
+            reposDirectory: { root.path }, ledger: SessionCreationLedger(url: ledgerURL),
+            onLaunch: { _, _, _, _ in launches += 1 }
+        )
+        try Data("{".utf8).write(to: ledgerURL)
+        for prompt in [
+            "", " \n\t", "\u{0}", "\u{1b}", "\u{7f}", "\u{85}",
+            String(repeating: "x", count: 8_193), String(repeating: "é", count: 4_097),
+        ] {
+            XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+                requestId: UUID(), projectId: project.id, kind: .copilot, initialPrompt: prompt)),
+                .badRequest)
+        }
+        for prompt in ["", "valid prompt"] {
+            XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+                requestId: UUID(), projectId: project.id, kind: .terminal, initialPrompt: prompt)),
+                .badRequest)
+        }
+        let reviewURL = "https://github.com/owner/repo/pull/12"
+        XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+            requestId: UUID(), projectId: project.id, pullRequestURL: reviewURL)), .badRequest)
+        for kind in [RemoteSessionKind.copilot, .terminal] {
+            XCTAssertEqual(model.createRemoteAdversarialReviewSession(RemoteCreateSessionRequest(
+                requestId: UUID(), projectId: project.id, pullRequestURL: reviewURL, kind: kind)),
+                .badRequest)
+        }
+        XCTAssertEqual(model.createRemoteAdversarialReviewSession(RemoteCreateSessionRequest(
+            requestId: UUID(), projectId: project.id,
+            pullRequestURL: reviewURL, initialPrompt: "replace the review")), .badRequest)
+        XCTAssertEqual(model.projects, [project])
+        XCTAssertEqual(launches, 0)
+    }
+
+    @MainActor
+    func testCreateRemoteConfiguredTerminalIgnoresStaleResumeMarkerInPTY() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = root.appendingPathComponent("foreground-backend")
+        let copilot = root.appendingPathComponent("fake-copilot")
+        let capturedArguments = root.appendingPathComponent("startup-arguments")
+        try ("#!/bin/sh\nshift 6\nprintf '%s\\0' \"$@\" > "
+            + TerminalController.shellSingleQuote(capturedArguments.path) + "\nexec \"$@\"\n")
+            .write(to: backend, atomically: true, encoding: .utf8)
+        try "#!/bin/sh\nexit 0\n".write(to: copilot, atomically: true, encoding: .utf8)
+        for file in [backend, copilot] {
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
+        }
+        let overrides = [
+            "SHELL": "/bin/sh",
+            "COPILOT_PROJECTS_STATE_DIR": root.path,
+            "COPILOT_PROJECTS_SOCKET": root.appendingPathComponent("control.sock").path,
+            "COPILOT_PROJECTS_DTACH": backend.path,
+            "COPILOT_PROJECTS_COPILOT": copilot.path,
+        ]
+        let previous = overrides.keys.map { ($0, ProcessInfo.processInfo.environment[$0]) }
+        defer {
+            for (key, value) in previous {
+                if let value { setenv(key, value, 1) } else { unsetenv(key) }
+            }
+        }
+        for (key, value) in overrides { setenv(key, value, 1) }
+        let request = RemoteCreateSessionRequest(requestId: UUID(), projectId: "p1", kind: .terminal)
+        for suffix in ["copilot-session", "copilot-allow-all"] {
+            try UUID().uuidString.write(
+                to: root.appendingPathComponent("\(request.requestId.uuidString).\(suffix)"),
+                atomically: true, encoding: .utf8)
+        }
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(
+            projects: [Project(id: "p1", name: "First", cwd: root.path)], selectedProjectId: "p1"))
+        let model = AppModel(
+            stateRepository: repository, isAppActive: { false },
+            agentActivityDirectory: root, resumeMarkerDirectory: root,
+            remoteCopilotExecutable: { nil }, remoteReposDirectory: { root.path },
+            sessionCreationLedger: SessionCreationLedger(url: root.appendingPathComponent("ledger.json")),
+            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("images"))
+        )
+        defer { model.detachAllClients() }
+        let orphanSocket = URL(fileURLWithPath: Paths.dtachSocketPath(sessionId: request.requestId.uuidString))
+        try FileManager.default.createDirectory(
+            at: orphanSocket.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data().write(to: orphanSocket)
+        XCTAssertEqual(model.createRemoteSession(request), .conflict)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: capturedArguments.path))
+        try FileManager.default.removeItem(at: orphanSocket)
+        XCTAssertEqual(model.createRemoteSession(request), .created(RemoteCreateSessionResponse(
+            requestId: request.requestId, projectId: "p1", sessionId: request.requestId.uuidString)))
+        for suffix in ["copilot-session", "copilot-allow-all"] {
+            XCTAssertFalse(FileManager.default.fileExists(atPath:
+                root.appendingPathComponent("\(request.requestId.uuidString).\(suffix)").path))
+        }
+        for _ in 0 ..< 200 {
+            if FileManager.default.fileExists(atPath: capturedArguments.path) { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let arguments = try Data(contentsOf: capturedArguments).split(separator: 0)
+            .map { String(decoding: $0, as: UTF8.self) }
+        XCTAssertEqual(arguments, ["/bin/sh", "-l"])
+        XCTAssertNil(model.startingPrompt(for: request.requestId.uuidString))
+
+        try FileManager.default.removeItem(at: capturedArguments)
+        let restoredId = UUID().uuidString
+        let recordedCopilot = UUID().uuidString
+        try recordedCopilot.write(
+            to: root.appendingPathComponent("\(restoredId).copilot-session"),
+            atomically: true, encoding: .utf8)
+        var projects = model.projects
+        projects[0].sessions.append(Session(id: restoredId, title: "Copilot", cwd: root.path))
+        try repository.save(PersistedState(projects: projects, selectedProjectId: "p1"))
+        let restoredModel = AppModel(
+            stateRepository: repository, isAppActive: { false },
+            agentActivityDirectory: root, resumeMarkerDirectory: root,
+            remoteCopilotExecutable: { copilot.path }, remoteReposDirectory: { root.path },
+            sessionCreationLedger: SessionCreationLedger(url: root.appendingPathComponent("ledger.json")),
+            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("restored-images"))
+        )
+        defer { restoredModel.detachAllClients() }
+        XCTAssertNotNil(restoredModel.controller(for: request.requestId.uuidString))
+        for _ in 0 ..< 200 {
+            if FileManager.default.fileExists(atPath: capturedArguments.path) { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let terminalAfterRestart = try Data(contentsOf: capturedArguments).split(separator: 0)
+            .map { String(decoding: $0, as: UTF8.self) }
+        XCTAssertEqual(terminalAfterRestart, ["/bin/sh", "-l"])
+        try FileManager.default.removeItem(at: capturedArguments)
+        XCTAssertNotNil(restoredModel.controller(for: restoredId))
+        for _ in 0 ..< 200 {
+            if FileManager.default.fileExists(atPath: capturedArguments.path) { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let restoredArguments = try Data(contentsOf: capturedArguments).split(separator: 0)
+            .map { String(decoding: $0, as: UTF8.self) }
+        XCTAssertEqual(restoredArguments, TerminalController.startupProgram(
+            shell: "/bin/sh", copilotSessionId: recordedCopilot,
+            copilotSessionAllowAll: false, resumeCopilotExecutable: copilot.path,
+            launchCopilotExecutable: nil))
+
+        try FileManager.default.removeItem(at: capturedArguments)
+        let legacyRequest = RemoteCreateSessionRequest(requestId: UUID(), projectId: "p1")
+        let legacyCopilot = UUID().uuidString
+        let legacyMarker = root.appendingPathComponent("\(legacyRequest.requestId.uuidString).copilot-session")
+        try legacyCopilot.write(to: legacyMarker, atomically: true, encoding: .utf8)
+        XCTAssertEqual(restoredModel.createRemoteSession(legacyRequest), .created(RemoteCreateSessionResponse(
+            requestId: legacyRequest.requestId, projectId: "p1", sessionId: legacyRequest.requestId.uuidString)))
+        for _ in 0 ..< 200 {
+            if FileManager.default.fileExists(atPath: capturedArguments.path) { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let legacyArguments = try Data(contentsOf: capturedArguments).split(separator: 0)
+            .map { String(decoding: $0, as: UTF8.self) }
+        XCTAssertEqual(legacyArguments, TerminalController.startupProgram(
+            shell: "/bin/sh", copilotSessionId: legacyCopilot,
+            copilotSessionAllowAll: true, resumeCopilotExecutable: copilot.path,
+            launchCopilotExecutable: copilot.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: legacyMarker.path))
+    }
+
+    @MainActor
+    func testCreateRemoteConfiguredSessionFailsClosedWhenStaleMarkerIsNotAFile() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let request = RemoteCreateSessionRequest(requestId: UUID(), projectId: "p1", kind: .terminal)
+        let marker = root.appendingPathComponent("\(request.requestId.uuidString).copilot-session")
+        try FileManager.default.createDirectory(at: marker, withIntermediateDirectories: false)
+        let sentinel = marker.appendingPathComponent("keep")
+        try Data("keep".utf8).write(to: sentinel)
+        var launches = 0
+        let ledger = SessionCreationLedger(url: root.appendingPathComponent("ledger.json"))
+        let model = try makeRemoteCreateModel(
+            root: root, projects: [Project(id: "p1", name: "First", cwd: root.path)],
+            selectedProjectId: "p1", copilotExecutable: { nil }, reposDirectory: { root.path },
+            ledger: ledger, onLaunch: { _, _, _, _ in launches += 1 }
+        )
+        XCTAssertEqual(model.createRemoteSession(request), .persistenceUnavailable)
+        XCTAssertEqual(launches, 0)
+        XCTAssertTrue(model.project("p1")?.sessions.isEmpty == true)
+        XCTAssertNil(try ledger.record(for: request.requestId))
+        XCTAssertEqual(try Data(contentsOf: sentinel), Data("keep".utf8))
+    }
+
+    @MainActor
+    func testCreateRemoteSessionRejectsChangedIntentWithoutRelaunching() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var launches = 0
+        let model = try makeRemoteCreateModel(
+            root: root, projects: [Project(id: "p1", name: "First", cwd: root.path)],
+            selectedProjectId: "p1", reposDirectory: { root.path },
+            ledger: SessionCreationLedger(url: root.appendingPathComponent("ledger.json")),
+            onLaunch: { _, _, _, _ in launches += 1 }
+        )
+        let id = UUID()
+        let response = RemoteCreateSessionResponse(requestId: id, projectId: "p1", sessionId: id.uuidString)
+        XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+            requestId: id, projectId: "p1", initialPrompt: "first\r\nsecond")), .created(response))
+        XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+            requestId: id, projectId: "p1", kind: .copilot, initialPrompt: "first\nsecond")), .existing(response))
+        for request in [
+            RemoteCreateSessionRequest(requestId: id, projectId: "p1", kind: .terminal),
+            RemoteCreateSessionRequest(requestId: id, projectId: "p1"),
+            RemoteCreateSessionRequest(requestId: id, projectId: "p1", initialPrompt: "different"),
+            RemoteCreateSessionRequest(requestId: id, projectId: "p2", initialPrompt: "first\nsecond"),
+        ] {
+            XCTAssertEqual(model.createRemoteSession(request), .conflict)
+        }
+        XCTAssertEqual(model.createRemoteAdversarialReviewSession(RemoteCreateSessionRequest(
+            requestId: id, projectId: "p1", pullRequestURL: "https://github.com/owner/repo/pull/12")),
+            .conflict)
+        XCTAssertEqual(launches, 1)
+
+        let reviewId = UUID()
+        let review = RemoteCreateSessionRequest(
+            requestId: reviewId, projectId: "p1", pullRequestURL: "https://github.com/owner/repo/pull/12")
+        XCTAssertEqual(model.createRemoteAdversarialReviewSession(review), .created(
+            RemoteCreateSessionResponse(requestId: reviewId, projectId: "p1", sessionId: reviewId.uuidString)))
+        XCTAssertEqual(model.createRemoteAdversarialReviewSession(RemoteCreateSessionRequest(
+            requestId: reviewId, projectId: "p1", pullRequestURL: "https://github.com/owner/repo/pull/13")),
+            .conflict)
+        XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+            requestId: reviewId, projectId: "p1")), .conflict)
+        XCTAssertEqual(launches, 2)
+    }
+
+    @MainActor
+    func testCreateRemoteSessionFingerprintSurvivesRestartWithoutLedgerAfterMove() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let ledgerURL = root.appendingPathComponent("ledger.json")
+        var launches = 0
+        let model = try makeRemoteCreateModel(
+            root: root,
+            projects: [
+                Project(id: "p1", name: "First", cwd: root.path),
+                Project(id: "p2", name: "Second", cwd: root.path),
+            ],
+            selectedProjectId: "p1", reposDirectory: { root.path },
+            ledger: SessionCreationLedger(url: ledgerURL),
+            onLaunch: { _, _, _, _ in
+                launches += 1
+                do {
+                    try FileManager.default.createDirectory(at: ledgerURL, withIntermediateDirectories: false)
+                } catch {
+                    XCTFail("Could not inject the ledger write failure: \(error)")
+                }
+            }
+        )
+        let request = RemoteCreateSessionRequest(
+            requestId: UUID(), projectId: "p1", kind: .copilot, initialPrompt: "UNIQUE_RESTART_PROMPT")
+        XCTAssertEqual(model.createRemoteSession(request), .persistenceUnavailable)
+        XCTAssertEqual(launches, 1)
+        XCTAssertEqual(model.moveRemoteSession(sessionId: request.requestId.uuidString, toProjectId: "p2"), .moved)
+        try FileManager.default.removeItem(at: ledgerURL)
+
+        let ledger = SessionCreationLedger(url: ledgerURL)
+        let restarted = AppModel(
+            stateRepository: StateRepository(path: root.appendingPathComponent("state.json")),
+            isAppActive: { false }, agentActivityDirectory: root, resumeMarkerDirectory: root,
+            remoteCopilotExecutable: { "/opt/copilot/bin/copilot" },
+            remoteReposDirectory: { root.path }, remoteSessionBackendAvailable: { true },
+            remoteSessionLauncher: { _, _, _, _ in launches += 1 },
+            sessionCreationLedger: ledger,
+            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("images"))
+        )
+        for changed in [
+            RemoteCreateSessionRequest(requestId: request.requestId, projectId: "p1", kind: .terminal),
+            RemoteCreateSessionRequest(
+                requestId: request.requestId, projectId: "p1", initialPrompt: "changed"),
+            RemoteCreateSessionRequest(
+                requestId: request.requestId, projectId: "p2", initialPrompt: request.initialPrompt),
+        ] {
+            XCTAssertEqual(restarted.createRemoteSession(changed), .conflict)
+        }
+        XCTAssertEqual(restarted.createRemoteSession(request), .existing(RemoteCreateSessionResponse(
+            requestId: request.requestId, projectId: "p2", sessionId: request.requestId.uuidString)))
+        XCTAssertEqual(launches, 1)
+        XCTAssertNotNil(try ledger.record(for: request.requestId)?.creationFingerprint)
+        for file in ["state.json", "ledger.json"] {
+            XCTAssertFalse(try String(contentsOf: root.appendingPathComponent(file), encoding: .utf8)
+                .contains("UNIQUE_RESTART_PROMPT"))
+        }
+    }
+
+    @MainActor
+    func testCreateRemoteSessionTombstoneChecksIntentBeforeReturningGone() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let ledger = SessionCreationLedger(url: root.appendingPathComponent("ledger.json"))
+        try ledger.remember(SessionCreationRecord(
+            requestId: id.uuidString, projectId: "p1", sessionId: id.uuidString, createdAt: Date(),
+            creationFingerprint: SessionCreationRecord.fingerprint(
+                projectId: "p1", kind: .terminal, initialPrompt: nil, pullRequestURL: nil)))
+        var launches = 0
+        let model = try makeRemoteCreateModel(
+            root: root, projects: [Project(id: "p1", name: "First", cwd: root.path)],
+            selectedProjectId: "p1", reposDirectory: { root.path }, ledger: ledger,
+            onLaunch: { _, _, _, _ in launches += 1 }
+        )
+        XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+            requestId: id, projectId: "p1", kind: .terminal)), .gone)
+        XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+            requestId: id, projectId: "p1", kind: .copilot)), .conflict)
+        XCTAssertEqual(launches, 0)
+    }
+
+    @MainActor
+    func testCreateRemoteSessionPreservesUnboundLegacyReplayWithoutTrustingNewOptions() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let oldSession = Session(id: id.uuidString, title: "old", cwd: root.path)
+        let ledger = SessionCreationLedger(url: root.appendingPathComponent("ledger.json"))
+        try ledger.remember(SessionCreationRecord(
+            requestId: id.uuidString, projectId: "p1", sessionId: id.uuidString, createdAt: Date()))
+        var launches = 0
+        let model = try makeRemoteCreateModel(
+            root: root,
+            projects: [Project(id: "p2", name: "Moved", cwd: root.path, sessions: [oldSession])],
+            selectedProjectId: "p2", reposDirectory: { root.path }, ledger: ledger,
+            onLaunch: { _, _, _, _ in launches += 1 }
+        )
+        let legacy = RemoteCreateSessionRequest(requestId: id, projectId: "p1")
+        XCTAssertEqual(model.createRemoteSession(legacy), .existing(
+            RemoteCreateSessionResponse(requestId: id, projectId: "p2", sessionId: id.uuidString)))
+        for kind in [RemoteSessionKind.copilot, .terminal] {
+            XCTAssertEqual(model.createRemoteSession(RemoteCreateSessionRequest(
+                requestId: id, projectId: "p1", kind: kind)), .conflict)
+        }
+        XCTAssertNil(model.project("p2")?.sessions.first?.creationFingerprint)
+        XCTAssertNil(try ledger.record(for: id)?.creationFingerprint)
         XCTAssertEqual(launches, 0)
     }
 

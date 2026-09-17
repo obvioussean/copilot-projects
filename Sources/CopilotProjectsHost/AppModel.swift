@@ -151,14 +151,14 @@ public enum RemoteSessionCreationOutcome: Equatable, Sendable {
     /// The request is well-formed but cannot be honored — the required `$HOME/Repos`
     /// working directory is missing. Nothing was created. (422)
     case invalid
-    /// The request does not match the endpoint or contains an invalid PR URL. (400)
+    /// The request contains invalid or conflicting launch options or an invalid PR URL. (400)
     case badRequest
-    /// The deterministic session id already exists in a DIFFERENT project. (409)
+    /// The request id is already bound to a different project or launch intent. (409)
     case conflict
     /// The ledger shows this request was already processed but the session is gone;
     /// it is deliberately not recreated. (410)
     case gone
-    /// The Copilot executable could not be resolved, so no session was created. (503)
+    /// A required executable or backend is unavailable, so no session was created. (503)
     case unavailable
     /// The workspace or creation ledger could not be read or durably written.
     /// The client must retry with the same request id. (503)
@@ -460,7 +460,7 @@ final class AppModel: ObservableObject {
     /// record it instead of spawning a real terminal). Nil in production, where the
     /// real cached terminal controller is created with a one-shot Copilot launch.
     private let remoteSessionLauncher:
-        ((_ sessionId: String, _ copilotExecutable: String,
+        ((_ sessionId: String, _ copilotExecutable: String?,
           _ initialPrompt: String?, _ allowAll: Bool) -> Void)?
     /// Persistent idempotency/tombstone store behind remote session creation.
     private let sessionCreationLedger: SessionCreationLedger
@@ -511,7 +511,7 @@ final class AppModel: ObservableObject {
         remoteSessionBackendAvailable: @escaping () -> Bool = {
             Paths.dtachExecutable != nil
         },
-        remoteSessionLauncher: ((String, String, String?, Bool) -> Void)? = nil,
+        remoteSessionLauncher: ((String, String?, String?, Bool) -> Void)? = nil,
         sessionCreationLedger: SessionCreationLedger = SessionCreationLedger(),
         agentActivityRefreshThrottle: TimeInterval = 0.5,
         agentActivityCooldownScheduler: @escaping (
@@ -664,13 +664,14 @@ final class AppModel: ObservableObject {
 
     /// Returns (creating if needed) the live terminal for a session. A cached
     /// controller is always returned as-is, so a duplicate create request can never
-    /// relaunch an existing session. `launchCopilotIfCreated` + `copilotExecutable`
-    /// are honored ONLY when a controller is created here (a fresh remote session);
-    /// a recorded resume marker still takes precedence inside the controller.
+    /// relaunch an existing session. `copilotExecutable` is honored ONLY when a
+    /// controller is created here (a fresh remote session).
+    /// Ordinary restoration keeps recorded resume behavior; configured remote
+    /// launches ignore stale markers left behind for a recycled session id.
     @discardableResult
     func controller(
         for sessionId: String,
-        launchCopilotIfCreated: Bool = false,
+        resumeRecordedSession: Bool = true,
         copilotExecutable: String? = nil,
         launchWithAllowAll: Bool = false,
         launchCopilotInitialPrompt: String? = nil
@@ -701,7 +702,7 @@ final class AppModel: ObservableObject {
             directory: resumeMarkerDirectory
         )
         let recordedCopilot = rawRecordedCopilot.flatMap { candidate -> String? in
-            guard ownerAllowsResume else { return nil }
+            guard resumeRecordedSession, ownerAllowsResume else { return nil }
             return TranscriptController.isCopilotSessionQuarantined(
                 sessionId: sessionId,
                 copilotSessionId: candidate,
@@ -724,7 +725,7 @@ final class AppModel: ObservableObject {
             dtachSocket: socket,
             copilotSessionId: (recordedCopilot?.isEmpty == false) ? recordedCopilot : nil,
             copilotSessionAllowAll: resumeWithAllowAll || launchWithAllowAll,
-            launchCopilotExecutable: launchCopilotIfCreated ? copilotExecutable : nil,
+            launchCopilotExecutable: copilotExecutable,
             launchCopilotInitialPrompt: launchCopilotInitialPrompt,
             kittyImageDiskStore: kittyImageDiskStore
         )
@@ -975,7 +976,7 @@ final class AppModel: ObservableObject {
         projects[pi].selectedSessionId = session.id
         // No modal or suspension between appending and creating the launch controller:
         // a view update must not lazily create a plain shell for this tab.
-        launchCopilotSession(session.id, executable: executable, initialPrompt: prompt, allowAll: true)
+        launchSession(session.id, executable: executable, initialPrompt: prompt, allowAll: true)
         if remoteSessionLauncher == nil, controllers[session.id]?.terminalView.process?.running != true {
             controllers[session.id] = nil
             projects[pi].sessions.removeAll { $0.id == session.id }
@@ -1044,7 +1045,7 @@ final class AppModel: ObservableObject {
         projects[pi].sessions.append(session)
         projects[pi].selectedSessionId = session.id
         let prompt = Self.adversarialReviewPrompt(for: target)
-        launchCopilotSession(
+        launchSession(
             session.id,
             executable: copilotExecutable,
             initialPrompt: prompt,
@@ -1055,18 +1056,19 @@ final class AppModel: ObservableObject {
         return session.id
     }
 
-    private func launchCopilotSession(
+    private func launchSession(
         _ sessionId: String,
-        executable: String,
+        executable: String?,
         initialPrompt: String?,
-        allowAll: Bool
+        allowAll: Bool,
+        resumeRecordedSession: Bool = true
     ) {
         if let remoteSessionLauncher {
             remoteSessionLauncher(sessionId, executable, initialPrompt, allowAll)
         } else {
             controller(
                 for: sessionId,
-                launchCopilotIfCreated: true,
+                resumeRecordedSession: resumeRecordedSession,
                 copilotExecutable: executable,
                 launchWithAllowAll: allowAll,
                 launchCopilotInitialPrompt: initialPrompt
@@ -1105,10 +1107,20 @@ final class AppModel: ObservableObject {
         now: Date = Date()
     ) -> RemoteSessionCreationOutcome {
         guard request.pullRequestURL == nil else { return .badRequest }
+        let kind = request.kind ?? .copilot
+        if let prompt = request.initialPrompt {
+            guard kind == .copilot, SessionInputValidation.isValidPrompt(prompt) else {
+                return .badRequest
+            }
+        }
+        let prompt = request.initialPrompt?
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
         return createRemoteSession(
             request,
-            title: "Copilot",
-            initialPrompt: nil,
+            kind: kind,
+            title: kind == .terminal ? "shell" : "Copilot",
+            initialPrompt: prompt,
             now: now
         )
     }
@@ -1117,13 +1129,15 @@ final class AppModel: ObservableObject {
         _ request: RemoteCreateSessionRequest,
         now: Date = Date()
     ) -> RemoteSessionCreationOutcome {
-        guard let rawURL = request.pullRequestURL,
+        guard request.kind == nil, request.initialPrompt == nil,
+              let rawURL = request.pullRequestURL,
               let target = PullRequestReviewTarget.parse(rawURL),
               rawURL == target.url else {
             return .badRequest
         }
         return createRemoteSession(
             request,
+            kind: .copilot,
             title: target.title,
             initialPrompt: Self.adversarialReviewPrompt(for: target),
             now: now
@@ -1132,6 +1146,7 @@ final class AppModel: ObservableObject {
 
     private func createRemoteSession(
         _ request: RemoteCreateSessionRequest,
+        kind: RemoteSessionKind,
         title: String,
         initialPrompt: String?,
         now: Date
@@ -1142,6 +1157,13 @@ final class AppModel: ObservableObject {
             return .persistenceUnavailable
         }
         let sessionId = request.requestId.uuidString
+        let fingerprint = SessionCreationRecord.fingerprint(
+            projectId: request.projectId,
+            kind: kind,
+            initialPrompt: request.pullRequestURL == nil ? initialPrompt : nil,
+            pullRequestURL: request.pullRequestURL
+        )
+        let isLegacyRequest = request.kind == nil && request.initialPrompt == nil
         let creationRecord: SessionCreationRecord?
         do {
             creationRecord = try sessionCreationLedger.record(
@@ -1156,6 +1178,9 @@ final class AppModel: ObservableObject {
             )
             return .persistenceUnavailable
         }
+        if let bound = creationRecord?.creationFingerprint, bound != fingerprint {
+            return .conflict
+        }
 
         // A live deterministic session answers replays directly and covers the
         // failure window where the session launched but workspace or ledger
@@ -1163,6 +1188,12 @@ final class AppModel: ObservableObject {
         // success, without launching the already-live session again.
         if let loc = locateIndex(sessionId) {
             let owningProjectId = projects[loc.p].id
+            let sessionFingerprint = projects[loc.p].sessions[loc.s].creationFingerprint
+            if let sessionFingerprint, sessionFingerprint != fingerprint {
+                return .conflict
+            }
+            let boundFingerprint = creationRecord?.creationFingerprint ?? sessionFingerprint
+            guard boundFingerprint != nil || isLegacyRequest else { return .conflict }
             let response = RemoteCreateSessionResponse(
                 requestId: request.requestId,
                 projectId: owningProjectId,
@@ -1173,11 +1204,13 @@ final class AppModel: ObservableObject {
                       record.sessionId == sessionId else {
                     return .conflict
                 }
-            } else {
+            } else if boundFingerprint == nil {
                 guard owningProjectId == request.projectId else { return .conflict }
             }
+            projects[loc.p].sessions[loc.s].creationFingerprint = boundFingerprint
             guard persistRemoteCreation(
                 request: request,
+                creationFingerprint: boundFingerprint,
                 existingRecord: creationRecord,
                 now: now
             ) else {
@@ -1187,16 +1220,43 @@ final class AppModel: ObservableObject {
         }
 
         // Processed before, but the session is gone: it is a tombstone, never resurrect it.
-        if creationRecord != nil {
+        if let creationRecord {
+            guard creationRecord.creationFingerprint != nil || isLegacyRequest else {
+                return .conflict
+            }
             return .gone
         }
 
         guard let pi = projectIndex(request.projectId) else { return .unknownProject }
         guard remoteSessionBackendAvailable() else { return .unavailable }
-        guard let copilotExecutable = remoteCopilotExecutable() else { return .unavailable }
+        let copilotExecutable: String?
+        if kind == .copilot {
+            guard let executable = remoteCopilotExecutable() else { return .unavailable }
+            copilotExecutable = executable
+        } else {
+            copilotExecutable = nil
+        }
         guard let cwd = remoteReposDirectory() else { return .invalid }
 
-        let session = Session(id: sessionId, title: title, cwd: cwd)
+        if !isLegacyRequest {
+            // An orphaned terminal has no trustworthy intent binding to replay.
+            guard !FileManager.default.fileExists(atPath: Paths.dtachSocketPath(sessionId: sessionId)) else {
+                return .conflict
+            }
+            for suffix in ["copilot-session", "copilot-allow-all"] {
+                let marker = resumeMarkerDirectory.appendingPathComponent("\(sessionId).\(suffix)")
+                if unlink(marker.path) == 0 { continue }
+                let code = errno
+                guard code == ENOENT else {
+                    NSLog("copilot-projects: could not clear stale resume marker for remote session "
+                        + "\(sessionId) (\(suffix), errno \(code))")
+                    return .persistenceUnavailable
+                }
+            }
+        }
+
+        let session = Session(
+            id: sessionId, title: title, cwd: cwd, creationFingerprint: fingerprint)
         projects[pi].sessions.append(session)
         // Do NOT steal the Mac's selected tab: only adopt the new session when the
         // project currently has no selection.
@@ -1204,14 +1264,14 @@ final class AppModel: ObservableObject {
             projects[pi].selectedSessionId = sessionId
         }
 
-        // Bring up the terminal with a one-shot Copilot launch on its fresh master.
-        // Remote (phone/web) sessions start in allow-all so they run unattended
+        // Remote Copilot sessions start in allow-all so they run unattended
         // without tool-approval prompts nobody is at the Mac to answer.
-        launchCopilotSession(
+        launchSession(
             sessionId,
             executable: copilotExecutable,
             initialPrompt: initialPrompt,
-            allowAll: true
+            allowAll: kind == .copilot,
+            resumeRecordedSession: isLegacyRequest
         )
         refreshSelectedTranscriptController()
 
@@ -1221,6 +1281,7 @@ final class AppModel: ObservableObject {
         // repair state without relaunching it.
         guard persistRemoteCreation(
             request: request,
+            creationFingerprint: fingerprint,
             now: now
         ) else {
             return .persistenceUnavailable
@@ -1235,6 +1296,7 @@ final class AppModel: ObservableObject {
 
     private func persistRemoteCreation(
         request: RemoteCreateSessionRequest,
+        creationFingerprint: String?,
         existingRecord: SessionCreationRecord? = nil,
         now: Date
     ) -> Bool {
@@ -1250,14 +1312,17 @@ final class AppModel: ObservableObject {
             )
             return false
         }
-        guard existingRecord == nil else { return true }
+        if let existingRecord, existingRecord.creationFingerprint == creationFingerprint {
+            return true
+        }
         do {
             try sessionCreationLedger.remember(
                 SessionCreationRecord(
                     requestId: request.requestId.uuidString,
                     projectId: request.projectId,
                     sessionId: request.requestId.uuidString,
-                    createdAt: now
+                    createdAt: existingRecord?.createdAt ?? now,
+                    creationFingerprint: creationFingerprint
                 ),
                 now: now
             )

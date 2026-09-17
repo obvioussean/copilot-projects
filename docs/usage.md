@@ -311,6 +311,50 @@ An integrating app can reuse `scripts/build-app.sh` with `--binary`, `--resource
 and `--output`; its executable must include its additional assets in `check-assets`.
 The normal build and release do not resolve or bundle optional integrations.
 
+#### Configured remote session creation
+
+An integrating gateway can expose `RemoteSessionContract.configuredCreatePath`
+(`sessions/create-configured`) and pass its decoded `RemoteCreateSessionRequest`
+to `SessionHost.createSession`. In addition to `requestId` and `projectId`, the
+request accepts optional `kind` (`copilot` or `terminal`) and `initialPrompt`.
+Omitted kind means Copilot; omitted prompt means an unprompted session. Copilot
+uses `--allow-all`; a terminal opens a plain shell without requiring Copilot.
+Both retain the remote `~/Repos` working-directory and desktop-selection policy.
+
+A supplied prompt must be nonempty after whitespace trimming, at most 8,192
+UTF-8 bytes after CRLF/CR normalization to LF, and free of terminal control
+characters other than line breaks and tabs. Terminal requests cannot carry a
+prompt. Configured creation rejects `pullRequestURL`; the separate review route
+accepts its canonical PR URL and rejects `kind` and `initialPrompt`.
+
+Gateways must reject launch options on the legacy `sessions/create` route and
+expose the configured route only when the host advertises the
+`configured-session-creation` protocol capability. Clients must not
+fall back to the legacy endpoint when configured creation is unsupported: older
+hosts ignore unknown JSON fields and could otherwise silently drop the prompt
+or launch Copilot instead of a terminal. Allow enough JSON body space for an
+escaped maximum-size prompt.
+Custom `SessionHost` implementations that do not honor these options must
+publish protocol metadata without `configured-session-creation`.
+
+Keep an immutable request body and UUID for an explicit retry after a network
+or 5xx error. Do not automatically resubmit prompts, reuse a UUID after changing
+the project or launch options, or retain pending retries indefinitely. A matching
+retry returns the original session, even if it moved projects; a changed intent
+returns 409. Historical sessions without an intent fingerprint accept only
+legacy-shaped retries, not new launch options. The host persists intent hashes,
+not starting-prompt text.
+An existing terminal socket without a stored intent cannot satisfy a configured
+create, even if its master may have exited; it returns 409 rather than assuming
+the requested intent is safe to repeat. Fresh configured
+launches clear stale Copilot resume markers before creating a terminal.
+
+Binding survives workspace or ledger repair while either retains the intent.
+Closed-session tombstones remain bounded to seven days and 512 records; after
+expiry or eviction a UUID can create again. Launch still precedes workspace and
+ledger persistence, so this is not an exactly-once guarantee across a crash that
+loses all creation evidence and the terminal master.
+
 ### Notification deep links
 
 External notifications can focus an existing project or session through the
