@@ -6154,6 +6154,8 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(composer.alert.buttons[0].keyEquivalent, "\r")
         XCTAssertEqual(composer.alert.buttons[0].keyEquivalentModifierMask, .command)
         XCTAssertEqual(composer.alert.buttons[1].keyEquivalent, "\u{1b}")
+        XCTAssertEqual(composer.alert.buttons[2].keyEquivalent, "")
+        XCTAssertTrue(composer.alert.buttons[2].isHidden)
         for (text, enabled) in [
             ("", false), (" \n\t", false), ("line one\nline two", true),
             (String(repeating: "x", count: 8_192), true),
@@ -6175,12 +6177,13 @@ final class AppLogicTests: XCTestCase {
         let draft = "  Don't lose this\nsecond line  "
         composer.textView.string = draft
         var attempts = 0
-        composer.run(present: { _ in .alertSecondButtonReturn }) { _ in attempts += 1 }
+        let cancelled = composer.run(present: { _ in .alertSecondButtonReturn }) { _ in attempts += 1 }
+        XCTAssertEqual(cancelled, .cancelled)
         XCTAssertEqual(attempts, 0)
         XCTAssertEqual(composer.textView.string, draft)
 
         var presentations = 0
-        composer.run(present: { alert in
+        let started = composer.run(present: { alert in
             presentations += 1
             XCTAssertTrue(alert.window.initialFirstResponder === composer.textView)
             XCTAssertEqual(composer.textView.string, draft)
@@ -6194,9 +6197,74 @@ final class AppLogicTests: XCTestCase {
             XCTAssertEqual(prompt, draft)
             if attempts == 1 { throw AppModel.CopilotSessionStartError.copilotUnavailable }
         }
+        XCTAssertEqual(started, .started)
         XCTAssertEqual(attempts, 2)
         XCTAssertEqual(presentations, 2)
         XCTAssertEqual(composer.textView.string, draft)
+    }
+
+    @MainActor
+    func testCopilotPromptComposerOffersTerminalAfterUnavailableFailure() {
+        for error in [AppModel.CopilotSessionStartError.copilotUnavailable, .backendUnavailable] {
+            let composer = CopilotPromptComposer()
+            let draft = "Keep this prompt\nsecond line"
+            composer.textView.string = draft
+            var presentations = 0
+            var attempts = 0
+            let outcome = composer.run(present: { alert in
+                presentations += 1
+                XCTAssertEqual(alert.buttons.count, 3)
+                XCTAssertEqual(composer.textView.string, draft)
+                if presentations == 1 {
+                    XCTAssertTrue(alert.buttons[2].isHidden)
+                    return .alertFirstButtonReturn
+                }
+                XCTAssertFalse(alert.buttons[2].isHidden)
+                XCTAssertEqual(alert.informativeText, error.localizedDescription)
+                composer.textView.string += "\nedited"
+                composer.textDidChange(Notification(name: NSText.didChangeNotification))
+                XCTAssertFalse(alert.buttons[2].isHidden)
+                return .alertThirdButtonReturn
+            }) { prompt in
+                attempts += 1
+                XCTAssertEqual(prompt, draft)
+                throw error
+            }
+            XCTAssertEqual(outcome, .newTerminal)
+            XCTAssertEqual(attempts, 1)
+            XCTAssertEqual(presentations, 2)
+            XCTAssertEqual(composer.textView.string, draft + "\nedited")
+        }
+    }
+
+    @MainActor
+    func testCopilotPromptComposerOnlyOffersTerminalForUnavailableFailures() {
+        let composer = CopilotPromptComposer()
+        XCTAssertEqual(composer.run(present: { _ in .alertThirdButtonReturn }) { _ in
+            XCTFail("A hidden terminal action must not start Copilot")
+        }, .cancelled)
+
+        for error in [
+            AppModel.CopilotSessionStartError.invalidPrompt, .projectUnavailable,
+            .shuttingDown, .terminalUnavailable, .workingDirectoryUnavailable("/missing"),
+        ] {
+            composer.textView.string = "Retain this draft"
+            var attempts = 0
+            var presentations = 0
+            let outcome = composer.run(present: { alert in
+                presentations += 1
+                XCTAssertEqual(composer.textView.string, "Retain this draft")
+                XCTAssertEqual(alert.buttons[2].isHidden, presentations != 2)
+                return presentations < 3 ? .alertFirstButtonReturn : .alertThirdButtonReturn
+            }) { _ in
+                attempts += 1
+                if attempts == 1 { throw AppModel.CopilotSessionStartError.copilotUnavailable }
+                throw error
+            }
+            XCTAssertEqual(outcome, .cancelled)
+            XCTAssertEqual(attempts, 2)
+            XCTAssertEqual(presentations, 3)
+        }
     }
 
     func testPromptedCopilotCommandExecutesLiteralInteractiveArgumentAndFallsBack() throws {

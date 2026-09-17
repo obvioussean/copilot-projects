@@ -76,9 +76,11 @@ created with `⌘N` also start with Copilot. All new desktop Copilot sessions us
 `--allow-all`, with or without a starting prompt.
 
 In the composer, Return adds a line, `⌘Return` starts Copilot, and Cancel creates
-no tab. Failed preflight checks keep your draft. If startup fails after a tab
-opens, right-click that tab and choose **Copy Starting Prompt** before closing
-it or quitting the app. This in-memory copy is never automatically resubmitted.
+no tab. Failed preflight checks keep your draft. If Copilot or its backend becomes
+unavailable, choosing **New Terminal** discards the draft and opens a plain shell
+without submitting it. If startup fails after a tab opens, right-click that tab
+and choose **Copy Starting Prompt** before closing it or quitting the app. This
+in-memory copy is never automatically resubmitted.
 
 **Closing a tab ends that session. Quitting the app does not**, when the bundled
 `dtach` backend is available. Closing the last window quits by default; enable

@@ -2,6 +2,10 @@ import AppKit
 
 @MainActor
 final class CopilotPromptComposer: NSObject, NSTextViewDelegate {
+    enum Outcome {
+        case started, cancelled, newTerminal
+    }
+
     let alert = NSAlert()
     let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 440, height: 180))
     private let instructions = "Write the first prompt for an interactive Copilot session. "
@@ -13,6 +17,9 @@ final class CopilotPromptComposer: NSObject, NSTextViewDelegate {
         alert.messageText = "Start Copilot with a Prompt"
         alert.addButton(withTitle: "Start Copilot")
         alert.addButton(withTitle: "Cancel")
+        let terminalButton = alert.addButton(withTitle: "New Terminal")
+        terminalButton.isHidden = true
+        terminalButton.keyEquivalent = ""
         alert.buttons[0].keyEquivalent = "\r"
         alert.buttons[0].keyEquivalentModifierMask = .command
         alert.buttons[1].keyEquivalent = "\u{1b}"
@@ -56,17 +63,29 @@ final class CopilotPromptComposer: NSObject, NSTextViewDelegate {
     func run(
         present: @MainActor (NSAlert) -> NSApplication.ModalResponse = { $0.runModal() },
         start: @MainActor (String) throws -> Void
-    ) {
+    ) -> Outcome {
+        var offersTerminal = false
         while true {
+            alert.buttons[2].isHidden = !offersTerminal
             alert.layout()
             alert.window.initialFirstResponder = textView
-            guard present(alert) == .alertFirstButtonReturn else { return }
+            let response = present(alert)
+            if response == .alertThirdButtonReturn, offersTerminal {
+                return .newTerminal
+            }
+            guard response == .alertFirstButtonReturn else { return .cancelled }
             do {
                 try start(textView.string)
-                return
+                return .started
             } catch {
                 // Keep the same editor and its text on synchronous launch failures.
                 alert.informativeText = error.localizedDescription
+                switch error as? AppModel.CopilotSessionStartError {
+                case .copilotUnavailable, .backendUnavailable:
+                    offersTerminal = true
+                default:
+                    offersTerminal = false
+                }
             }
         }
     }

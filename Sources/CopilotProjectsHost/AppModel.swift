@@ -925,8 +925,11 @@ final class AppModel: ObservableObject {
         do {
             _ = try copilotSessionExecutable(toProjectId: pid)
             if withPrompt {
-                CopilotPromptComposer().run { prompt in
+                let outcome = CopilotPromptComposer().run { prompt in
                     try self.addCopilotSession(toProjectId: pid, initialPrompt: prompt)
+                }
+                if outcome == .newTerminal, !isTerminating {
+                    addSession(toProjectId: pid)
                 }
             } else {
                 try addCopilotSession(toProjectId: pid)
