@@ -72,7 +72,8 @@ The **+ Copilot** button starts an interactive Copilot CLI session immediately,
 inheriting the current session's working directory. Its dropdown offers
 **Start with Prompt…** (a multiline composer) and **New Terminal** (just a shell).
 The Session menu and project context menus offer the same choices. New projects
-created with `⌘N` also start with Copilot; these launches do not add `--allow-all`.
+created with `⌘N` also start with Copilot. All new desktop Copilot sessions use
+`--allow-all`, with or without a starting prompt.
 
 In the composer, Return adds a line, `⌘Return` starts Copilot, and Cancel creates
 no tab. Failed preflight checks keep your draft. If startup fails after a tab

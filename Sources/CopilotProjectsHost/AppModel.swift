@@ -972,7 +972,7 @@ final class AppModel: ObservableObject {
         projects[pi].selectedSessionId = session.id
         // No modal or suspension between appending and creating the launch controller:
         // a view update must not lazily create a plain shell for this tab.
-        launchCopilotSession(session.id, executable: executable, initialPrompt: prompt, allowAll: false)
+        launchCopilotSession(session.id, executable: executable, initialPrompt: prompt, allowAll: true)
         if remoteSessionLauncher == nil, controllers[session.id]?.terminalView.process?.running != true {
             controllers[session.id] = nil
             projects[pi].sessions.removeAll { $0.id == session.id }

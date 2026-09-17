@@ -29,7 +29,8 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
   an interactive session (not a one-shot/headless command). Cancel creates no tab.
   Startup checks retain the draft on failure; after a tab opens, **Copy Starting Prompt**
   in its context menu recovers the prompt until that tab closes or the app quits.
-  Prompts are never retried automatically. Normal desktop launches do not add `--allow-all`.
+  Prompts are never retried automatically. All new desktop Copilot sessions use
+  `--allow-all`, with or without a starting prompt.
 - **Local PR reviews:** the shield button beside **+ Copilot** accepts a GitHub pull request
   URL and opens a new Copilot CLI tab with a local adversarial-review prompt.
 - **Status:** each session reports `idle` / `running` / `waiting`. Running and waiting

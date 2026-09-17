@@ -6050,7 +6050,7 @@ final class AppLogicTests: XCTestCase {
     // MARK: - Desktop Copilot session creation
 
     @MainActor
-    func testDesktopCopilotSessionLaunchesWithNormalPermissionsAndInheritedDirectory() throws {
+    func testDesktopCopilotSessionLaunchesWithAllowAllAndInheritedDirectory() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -6071,7 +6071,7 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(launches[0].0, id)
         XCTAssertEqual(launches[0].1, "/opt/copilot/bin/copilot")
         XCTAssertEqual(launches[0].2, prompt.replacingOccurrences(of: "\r\n", with: "\n"))
-        XCTAssertFalse(launches[0].3)
+        XCTAssertTrue(launches[0].3)
         XCTAssertEqual(model.project(project.id)?.sessions.last?.title, "Copilot")
         XCTAssertEqual(model.project(project.id)?.sessions.last?.cwd, root.path)
         XCTAssertEqual(model.project(project.id)?.selectedSessionId, id)
@@ -6084,7 +6084,7 @@ final class AppLogicTests: XCTestCase {
         model.addSessionToSelected()
         model.newInActiveContext()
         XCTAssertEqual(launches.count, 3)
-        XCTAssertTrue(launches.dropFirst().allSatisfy { $0.2 == nil && !$0.3 })
+        XCTAssertTrue(launches.dropFirst().allSatisfy { $0.2 == nil && $0.3 })
     }
 
     @MainActor
